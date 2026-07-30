@@ -21,7 +21,7 @@ podman build --no-cache -t <镜像名:版本号> -f <镜像构建脚本> .
 ### 二、创建容器
 
 ```bash
-podman create -v "$PWD":/workspace --name <容器名称> <镜像名称>
+podman create -it -v "$PWD":/workspace --name <容器名称> <镜像名称>
 ```
 
 ### 三、运行容器
