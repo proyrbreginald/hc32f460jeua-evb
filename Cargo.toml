@@ -1,0 +1,19 @@
+[package]
+name = "hc32f460jeua-evb"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hc32f460"    # 这里决定了编译出来的文件名
+path = "src/main.rs" # 程序的入口文件路径
+test = false         # 禁用默认测试
+doctest = false      # 禁用文档测试
+bench = false        # 禁用基准测试
+
+[dependencies]
+
+[profile.dev]
+panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开
+
+[profile.release]
+panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开

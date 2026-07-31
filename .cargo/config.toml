@@ -1,0 +1,11 @@
+[target.thumbv7em-none-eabihf]
+rustflags = [
+  "-C",
+  "link-arg=-Tlink.ld",                                    # 使用自定义链接脚本
+  "-C",
+  "link-arg=-Map=target/thumbv7em-none-eabihf/output.map", # 生成链接映射文件
+]
+
+[build]
+# 默认编译目标
+target = "thumbv7em-none-eabihf"

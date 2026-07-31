@@ -43,3 +43,67 @@ podman stop <容器名称>
 podman rm <容器名称>
 podman rmi <镜像名称>
 ```
+
+## Python 虚拟环境与 pyOCD
+
+### 一、创建 Python 虚拟环境
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 二、安装 pyOCD
+
+在虚拟环境中安装 `pyocd`:
+
+```bash
+pip install pyocd
+```
+
+### 三、连接调试器与检测目标
+
+将调试器（如 DAPLink、ST-Link、J-Link）通过 SWD 接口连接到目标板，然后检测芯片：
+
+```bash
+pyocd list # 列出可用调试器
+```
+
+### 四、烧录固件
+
+```bash
+pyocd flash -u <调试器ID> --target hc32f460xe target/thumbv7em-none-eabihf/debug/hc32f460.elf
+```
+
+参数说明：
+- `--target hc32f460xe`  指定目标芯片型号
+- `--base-address 0x00000000`  可选，指定烧录起始地址
+- `--erase auto`  可选，自动选择擦除策略（sector / chip）
+
+### 五、调试
+
+#### 启动 GDB 服务器
+
+```bash
+pyocd gdbserver --target hc32f460xe
+```
+
+默认监听端口 `3333`，可用 `--port` 指定其他端口。
+
+#### 连接 GDB
+
+在另一个终端中启动 GDB 并连接：
+
+```bash
+arm-none-eabi-gdb -q target/thumbv7em-none-eabihf/debug/hc32f460.elf
+target extended-remote localhost:3333
+monitor reset halt   # 复位并暂停
+load                 # 烧录当前 ELF
+continue             # 运行
+```
+
+### 六、退出虚拟环境
+
+```bash
+deactivate
+```
