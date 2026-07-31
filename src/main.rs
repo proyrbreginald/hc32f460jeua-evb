@@ -68,39 +68,27 @@ fn delay(iterations: u32) {
 }
 
 fn blink_loop() -> ! {
-    // 上电后延迟约 1 秒，给调试器留出 SWD 连接窗口
-    // 防止因过早操作 GPIO 配置而抢占 SWD 引脚导致无法再次烧录
-    delay(2_000_000);
-
     const GPIO: *mut u32 = 0x40053800 as *mut u32;
 
     unsafe {
-        // 解除 GPIO 写保护 (PWPR.WP = 0x5A, PWPR.WE = 1)
-        core::ptr::write_volatile(GPIO.byte_add(0x3FC) as *mut u16, 0x5A01u16);
+        // 解除 GPIO 写保护 (PWPR.WP = 0xA501, PWPR.WE = 1)
+        core::ptr::write_volatile(GPIO.byte_add(0x3FC) as *mut u16, 0xA501u16);
 
         // 配置 PC13 为 GPIO 功能 (PFSRC13.FSEL = 0)
         core::ptr::write_volatile(GPIO.byte_add(0x4B6) as *mut u16, 0u16);
 
-        // 配置 PC13 为输出 (PCRC13.POUTE = 1)
-        core::ptr::write_volatile(GPIO.byte_add(0x4B4) as *mut u16, 1u16 << 1);
+        // 配置 PC13 为输出 (POERC = 1)
+        core::ptr::write_volatile(GPIO.byte_add(0x26) as *mut u16, 1u16);
 
         // 解除 PWPR 写保护后不再锁定，否则后续 POSRC/PORRC 写入也将被忽略
     }
 
     loop {
-        // 约 500ms 延时 (8MHz * 0.5 / 5 ≈ 800000)
-        delay(800_000);
+        delay(8_000_000);
 
         unsafe {
             // 置位 PC13，输出高电平
-            core::ptr::write_volatile(GPIO.byte_add(0x28) as *mut u16, 1u16 << 13);
-        }
-
-        delay(800_000);
-
-        unsafe {
-            // 复位 PC13，输出低电平
-            core::ptr::write_volatile(GPIO.byte_add(0x2A) as *mut u16, 1u16 << 13);
+            core::ptr::write_volatile(GPIO.byte_add(0x2C) as *mut u16, 1u16);
         }
     }
 }

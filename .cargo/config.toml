@@ -1,3 +1,6 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
 [target.thumbv7em-none-eabihf]
 rustflags = [
   "-C",
@@ -5,7 +8,3 @@ rustflags = [
   "-C",
   "link-arg=-Map=target/thumbv7em-none-eabihf/output.map", # 生成链接映射文件
 ]
-
-[build]
-# 默认编译目标
-target = "thumbv7em-none-eabihf"
