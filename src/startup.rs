@@ -43,6 +43,13 @@ pub unsafe extern "C" fn reset_handler() -> ! {
         core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x76);
     }
 
+    // ---- EFM 初始化: FLASH 读等待周期 (参考手册表 7-1) ----
+    //
+    // 复位后系统时钟为 MRC 8MHz → FLWT=0 (无等待)。
+    // 逻辑见 `clk::set_flash_wait_cycle` (表 7-1 全频段映射);
+    // 切换外部晶振/更高时钟时由 `clk::switch_to_xtal` 在切换前重新配置。
+    crate::clk::set_flash_wait_cycle(crate::clk::MRC_HZ);
+
     // 开启 FPU (CPACR: 使能 CP10 和 CP11 的完全访问权限)
     unsafe {
         let cpacr = 0xE000ED88 as *mut u32;

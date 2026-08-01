@@ -8,10 +8,11 @@
 //! 四个 USART 的寄存器布局、时钟域 (PCLK1) 与初始化序列完全一致,
 //! 仅基址与 FCG1 时钟门控位不同 (USART_BASES / [`fcg1_usart_bit`])。
 //!
-//! # 时钟链 (复位默认配置)
+//! # 时钟链
 //!
-//! MRC 8MHz → PCLK1 (SCFGR.PCLK1S=0, 无分频) → USART_PR.PSC 预分频
-//! (÷1/÷4/÷16/÷64) → 波特率发生器。
+//! 系统时钟 (MRC 8MHz 或外部晶振 [`crate::clk::XTAL_HZ`]) → PCLK1
+//! (SCFGR.PCLK1S 分频, 运行时经 [`crate::clk::pclk1_hz`] 查询)
+//! → USART_PR.PSC 预分频 (÷1/÷4/÷16/÷64) → 波特率发生器。
 //! **USART 时钟 = PCLK1 / 2^(2·PSC)**。
 //!
 //! # 引脚 (JEUA 48pin, 用户确认)
@@ -71,10 +72,6 @@ impl Reg {
 const USART_BASES: [usize; 4] = [0x4001_D000, 0x4001_D400, 0x4002_1000, 0x4002_1400];
 /// PWC 外设基址 (FCG 时钟门控)
 const PWC_BASE: usize = 0x4004_8000;
-
-/// PCLK1 频率 (Hz)。复位默认: MRC 8MHz, SCFGR.PCLK1S=0 无分频。
-/// 切换系统时钟后需同步更新 (与 `systick::HCLK_HZ` 同理)。
-pub const PCLK1_HZ: u32 = 8_000_000;
 
 /// FCG1.USARTn 时钟门控位 (清位 = 使能): USART1=bit24 ... USART4=bit27
 const fn fcg1_usart_bit(unit: u8) -> u32 {
@@ -246,8 +243,8 @@ impl<const U: u8> Uart<U> {
         let fcg1 = Reg::new(PWC_BASE + 0x04);
         fcg1.modify(|v| v & !fcg1_usart_bit(U));
 
-        // 2. 计算波特率 (USART 时钟 = PCLK1 / 预分频)
-        let usart_clk = PCLK1_HZ / config.clock_div.divisor();
+        // 2. 计算波特率 (USART 时钟 = PCLK1 / 预分频, PCLK1 运行时查询)
+        let usart_clk = crate::clk::pclk1_hz() / config.clock_div.divisor();
         let (div_int, div_frac, fbme) = calc_brr(usart_clk, config.baudrate, config.oversample)?;
 
         // 3. 控制寄存器: UART 模式 (MS=0), 8 位 (M=0), 无校验, LSB 先, 下降沿,

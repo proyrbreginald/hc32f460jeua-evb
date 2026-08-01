@@ -3,6 +3,7 @@
 // 禁用操作系统默认的标准入口
 #![no_main]
 
+mod clk;
 mod console;
 mod gpio;
 mod icg;
@@ -14,8 +15,6 @@ mod vector_table;
 
 use gpio::{Config, Drive, Gpio, Level, Mode, Pin, PortA, PortC};
 use uart::{Uart1, UartConfig};
-
-use crate::panic::fault_handler;
 
 /// SysTick 中断频率 (Hz)
 const SYSTICK_FREQ_HZ: u32 = 1;
@@ -39,6 +38,11 @@ pub extern "C" fn sys_tick_handler() {
 
 /// 应用入口: 由 [`startup::reset_handler`] 在完成硬件与内存初始化后调用
 pub(crate) fn main() -> ! {
+    // 切换系统时钟源到外部晶振 (失败则回退 MRC, 不阻塞启动)
+    if clk::xtal_init().is_ok() {
+        clk::switch_to_xtal();
+    }
+
     // 获取 GPIO 句柄
     let gpio = Gpio::take();
 
@@ -62,8 +66,22 @@ pub(crate) fn main() -> ! {
     let uart = Uart1::take();
     uart.init(UartConfig::default()).expect("UART 初始化失败");
 
-    // 控制台输出验证
+    // 输出通道就绪: 报告时钟配置结果 (含外部晶振失败记录)
     println!("HC32F460 console ready!");
+    match clk::xtal_status() {
+        clk::XtalStatus::Active => {
+            println!("XTAL active: system clock = {} Hz", clk::system_clock_hz());
+        }
+        clk::XtalStatus::Failed => {
+            println!(
+                "WARNING: XTAL init failed! fallback MRC, system clock = {} Hz",
+                clk::system_clock_hz()
+            );
+        }
+        clk::XtalStatus::NotAttempted => {
+            println!("XTAL not attempted: system clock = {} Hz", clk::system_clock_hz());
+        }
+    }
     println!("console uart = {}", stringify!(Uart1));
 
     // 主循环: 周期性输出计数

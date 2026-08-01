@@ -1,19 +1,15 @@
-//! SysTick 系统节拍驱动
+//! SysTick 节拍驱动
 //!
 //! 对齐 DDL `hc32_ll_utility.c` 的 SysTick 驱动:
 //! [`init`](SysTick_Init) / [`on_tick`](SysTick_IncTick) /
 //! [`get_tick_ms`](SysTick_GetTick) / [`delay_ms`](SysTick_Delay) /
 //! [`suspend`](SysTick_Suspend) / [`resume`](SysTick_Resume)。
 //!
-//! # 设计分层
+//! # 时钟源
 //!
-//! | 层 | 内容 |
-//! |----|------|
-//! | 寄存器 | [`Reg`]: 绝对地址易失性寄存器, 与 `gpio` 模块风格一致 |
-//! | 配置 | [`init`]: 可配置中断频率, 计算 24 位重装载值与毫秒步进 |
-//! | 节拍 | [`on_tick`](中断调用) / [`get_tick_ms`](查询) |
-//! | 延时 | [`delay_ms`]: 基于节拍计数的忙等待 |
-//! | 控制 | [`suspend`] / [`resume`]: 暂停/恢复中断, 计数器继续运行 |
+//! SysTick 时钟 = HCLK = 当前系统时钟, 运行时通过
+//! [`crate::clk::system_clock_hz`] 查询 —— 支持切换外部晶振时钟源后
+//! 自动适配 (无需修改本模块)。
 //!
 //! # 时序
 //!
@@ -37,16 +33,6 @@
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
-
-/// 内核时钟频率 (Hz)
-///
-/// 复位后系统时钟源为**内部中速 RC (MRC) 8MHz**, HCLK 无分频:
-/// - CMU_CKSWR.CKSW 复位值 = 1, 即选择 MRC (见 SVD, 与 DDL
-///   `system_hc32f460.c` 的 `SystemCoreClockUpdate` case 0x01 对应);
-/// - ICG 配置 (0xFFFFFFFF) 不会开启 HRC, 因此不能假定 16MHz 的 HRC。
-///
-/// 若应用切换时钟源或修改分频, 需同步更新此常量。
-pub const HCLK_HZ: u32 = 8_000_000;
 
 /// SysTick 外设基地址 (Cortex-M4 内核外设)
 const SYST_BASE: usize = 0xE000_E010;
@@ -119,8 +105,9 @@ pub fn init(freq_hz: u32) -> Result<(), SystickError> {
         return Err(SystickError::InvalidFrequency);
     }
 
-    // 每次中断间隔的 HCLK 周期数
-    let ticks = HCLK_HZ / freq_hz;
+    // 每次中断间隔的 HCLK 周期数 (系统时钟运行时查询, 支持切时钟源)
+    let hclk = crate::clk::system_clock_hz();
+    let ticks = hclk / freq_hz;
     if ticks == 0 || ticks > RELOAD_MASK + 1 {
         return Err(SystickError::FrequencyOutOfRange);
     }
