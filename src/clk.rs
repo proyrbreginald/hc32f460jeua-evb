@@ -1,20 +1,31 @@
-//! 时钟管理: 外部高速晶振 (XTAL) 支持与系统时钟源
+//! 时钟管理: 系统时钟源 (MRC/XTAL/PLL) 配置与切换
 //!
-//! 参考 DDL `CLK_XtalInit` / `CLK_XtalCmd` / `CLK_SetSysClockSrc` 与
-//! `BSP_CLK_Init`, 参考手册 CMU 章节 (XTAL 频率范围 4~25MHz)。
+//! 参考 DDL `CLK_XtalInit` / `CLK_PLLInit` / `CLK_SetSysClockSrc` 与
+//! `BSP_CLK_Init`, 参考手册 CMU/SRAMC/EFM 章节。
 //!
-//! # 时钟链 (配置后)
+//! # 时钟链 (200MHz 方案)
 //!
-//! XTAL (默认 8MHz, 修改 [`XTAL_HZ`]) → 系统时钟 (CKSWR.CKSW=3)
-//! → HCLK / PCLK0~4 (SCFGR 无分频, 复位默认)
+//! XTAL 8MHz → MPLL (÷1 ×50 ÷2) → 200MHz 系统时钟
+//! ```text
+//!                ┌─ HCLK  ÷1 → 200MHz (CPU / SysTick)
+//! 200MHz SYSCLK ─┼─ PCLK0 ÷1 → 200MHz
+//!                ├─ PCLK1 ÷2 → 100MHz (UART)
+//!                ├─ PCLK2/3 ÷4 → 50MHz
+//!                └─ PCLK4/EXCLK ÷2 → 100MHz
+//! ```
 //!
-//! # 使用流程
+//! # 使用
 //!
-//! 1. [`xtal_init`]: 配置 PH0/PH1 模拟功能 → 配置/启动晶振 → 等待稳定;
-//! 2. [`switch_to_xtal`]: 按新频率配置 FLASH 等待周期 (表 7-1) 后切换时钟源。
+//! 一键完成全部时钟配置: [`init(ClockSource::Pll200)`]—— 晶振启动、
+//! 总线分频、PLL 锁定、FLASH/SRAM/GPIO 等待周期、高性能电源、
+//! 时钟源切换。任一步失败自动回退, 结果经 [`xtal_status`] 查询。
 //!
-//! 切换后各外设通过 [`system_clock_hz`] / [`pclk1_hz`] 查询实际频率
+//! 各外设通过 [`system_clock_hz`] / [`pclk1_hz`] 查询实际频率
 //! (systick/uart 模块已接入)。
+//!
+//! # 限制
+//!
+//! 本模块仅应在启动阶段 (中断使能前) 调用, 未做中断安全保护。
 //!
 //! 部分位掩码常量仅作寄存器位定义文档用途, 忽略死代码警告。
 #![allow(dead_code)]
@@ -50,6 +61,7 @@ const FPRC_LOCK: u16 = 0xA500;
 const CMU_CKSWR: usize = 0x26; // 系统时钟源选择 (8 位)
 const CMU_XTALCR: usize = 0x32; // XTAL 控制 (8 位)
 const CMU_OSCSTBSR: usize = 0x3C; // 振荡器稳定状态 (8 位)
+const CMU_PLLCR: usize = 0x2A; // MPLL 控制 (8 位)
 const CMU_SCFGR: usize = 0x20; // 总线时钟分频 (32 位)
 const CMU_XTALSTBCR: usize = 0xA2; // XTAL 稳定时间 (8 位)
 const CMU_XTALCFGR: usize = 0x410; // XTAL 配置 (8 位)
@@ -64,7 +76,17 @@ pub const CLK_SRC_XTAL32: u32 = 4;
 pub const CLK_SRC_PLL: u32 = 5;
 
 /// OSCSTBSR 位
+const OSCSTBSR_HRCSTBF: u32 = 1 << 0; // HRC 稳定标志
 const OSCSTBSR_XTALSTBF: u32 = 1 << 3; // XTAL 稳定标志
+const OSCSTBSR_MPLLSTBF: u32 = 1 << 5; // MPLL 稳定标志
+
+/// PLLCFGR 位
+const PLLCFGR_MPLLM_POS: u32 = 0; // [4:0] 输入分频 (÷(M+1))
+const PLLCFGR_PLLSRC_POS: u32 = 7; // [7] 时钟源: 0=XTAL, 1=HRC
+const PLLCFGR_MPLLN_POS: u32 = 8; // [16:8] 倍频 (×(N+1))
+const PLLCFGR_MPLLR_POS: u32 = 20; // [23:20] R 输出分频 (÷(R+1))
+const PLLCFGR_MPLLQ_POS: u32 = 24; // [27:24] Q 输出分频 (÷(Q+1))
+const PLLCFGR_MPLLP_POS: u32 = 28; // [31:28] P 输出分频 (÷(P+1))
 
 /// XTALSTBCR 位
 const XTALSTBCR_XTALSTB_MASK: u32 = 0x0F; // 稳定时间选择
@@ -74,7 +96,18 @@ const XTALCFGR_XTALDRV_POS: u32 = 4; // [5:4] 驱动能力
 const XTALCFGR_SUPDRV: u32 = 1 << 7; // 超强驱动
 
 /// SCFGR 位
+const SCFGR_PCLK0S_POS: u32 = 0; // [2:0] PCLK0 分频
 const SCFGR_PCLK1S_POS: u32 = 4; // [6:4] PCLK1 分频
+const SCFGR_PCLK2S_POS: u32 = 8; // [10:8] PCLK2 分频
+const SCFGR_PCLK3S_POS: u32 = 12; // [14:12] PCLK3 分频
+const SCFGR_PCLK4S_POS: u32 = 16; // [18:16] PCLK4 分频
+const SCFGR_EXCKS_POS: u32 = 20; // [22:20] EXCLK 分频
+const SCFGR_HCLKS_POS: u32 = 24; // [26:24] HCLK 分频
+
+/// 总线分频编码 (SCFGR): 0=÷1, 1=÷2, 2=÷4, 3=÷8, 4=÷16
+const CLK_DIV1: u32 = 0;
+const CLK_DIV2: u32 = 1;
+const CLK_DIV4: u32 = 2;
 
 /// 稳定时间: 约 2ms (对齐 DDL CLK_XTAL_STB_2MS)
 const XTAL_STABLE_TIME: u32 = 0x05;
@@ -83,11 +116,53 @@ const XTAL_DRV: u32 = 0x03 << XTALCFGR_XTALDRV_POS;
 /// 振荡模式 (对齐 DDL CLK_XTAL_MD_OSC)
 const XTAL_MODE_OSC: u32 = 0x00;
 
+/// 系统时钟方案 (由 [`init`] 统一编排)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClockSource {
+    /// 内部中速 RC 8MHz (复位默认, 无需配置)
+    Mrc,
+    /// 外部晶振直通 (频率 [`XTAL_HZ`])
+    Xtal,
+    /// 外部晶振 + MPLL 倍频至 200MHz
+    Pll200,
+}
+
+/// 时钟初始化编排: 启动时钟源并切换系统时钟
+///
+/// 任一步失败自动回退并记录状态 (经 [`xtal_status`] 查询):
+/// - [`ClockSource::Mrc`]: 无操作 (复位默认);
+/// - [`ClockSource::Xtal`]: 晶振启动 → FLASH/SRAM 等待 → 切换;
+/// - [`ClockSource::Pll200`]: 晶振 → 总线分频 → PLL 锁定 → FLASH/SRAM/
+///   GPIO 等待 + 高性能电源 → 切换。
+pub fn init(src: ClockSource) -> Result<(), ClkError> {
+    match src {
+        ClockSource::Mrc => Ok(()),
+        ClockSource::Xtal => {
+            xtal_init()?;
+            switch_to_xtal();
+            Ok(())
+        }
+        ClockSource::Pll200 => {
+            xtal_init()?;
+            set_bus_clock_div();
+            if pll_init(pll_200mhz_config()).is_ok() {
+                switch_to_pll();
+            } else {
+                // PLL 锁定失败: 降级为晶振直通 (总线分频在低频下无害)
+                switch_to_xtal();
+            }
+            Ok(())
+        }
+    }
+}
+
 /// 时钟配置失败原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClkError {
     /// 晶振起振超时 (检查电路/引脚/稳定时间)
     XtalStableTimeout,
+    /// MPLL 锁定超时 (检查倍频/分频参数与 VCO 范围)
+    PllStableTimeout,
 }
 
 /// 外部晶振状态 (由 [`xtal_init`] / [`switch_to_xtal`] 更新, [`xtal_status`] 查询)
@@ -117,6 +192,201 @@ pub fn xtal_status() -> XtalStatus {
         STATUS_FAILED => XtalStatus::Failed,
         _ => XtalStatus::NotAttempted,
     }
+}
+
+/// MPLL 配置 (对齐 DDL stc_clock_pll_init_t 的 PLLCFGR 位域)
+#[derive(Clone, Copy, Debug)]
+pub struct PllConfig {
+    /// 时钟源: 0=XTAL, 1=HRC (PLLSRC)
+    pub src: u32,
+    /// 输入分频 ÷(M+1)
+    pub m: u32,
+    /// 倍频 ×(N+1), 合法范围 20~480 (参考手册)
+    pub n: u32,
+    /// P 输出分频 ÷(P+1), 合法范围 2~16
+    pub p: u32,
+    /// Q 输出分频 ÷(Q+1)
+    pub q: u32,
+    /// R 输出分频 ÷(R+1)
+    pub r: u32,
+}
+
+/// 默认 200MHz 配置: XTAL 8MHz ÷1 ×50 ÷2 = 200MHz
+///
+/// VCO = 8M×50 = 400MHz ∈ [240, 480]MHz, 倍频 50 ∈ [20, 480],
+/// 分频 2 ∈ [2, 16] —— 全部合法 (参考手册), 对齐 DDL BSP_CLK_Init。
+pub const fn pll_200mhz_config() -> PllConfig {
+    PllConfig {
+        src: 0, // XTAL
+        m: 0,
+        n: 49,
+        p: 1,
+        q: 1,
+        r: 1,
+    }
+}
+
+/// 启动 MPLL 并等待锁定 (对齐 DDL CLK_PLLInit + CLK_PLLCmd)
+///
+/// 前置条件: 时钟源 ([`PllConfig::src`] 选择的 XTAL/HRC) 必须已启动稳定。
+/// 序列: CMU 解锁 → PLLCFGR 写入 → 确认源稳定 → PLLCR 开启
+/// → 等待 OSCSTBSR.MPLLSTBF。
+pub fn pll_init(cfg: PllConfig) -> Result<(), ClkError> {
+    cmu_unlock();
+
+    // PLLCFGR: MPLLM[4:0] | PLLSRC[7] | MPLLN[16:8] | MPLLR[23:20] | MPLLQ[27:24] | MPLLP[31:28]
+    let pllcfgr = (cfg.m & 0x1F)
+        | ((cfg.src & 0x1) << PLLCFGR_PLLSRC_POS)
+        | ((cfg.n & 0x1FF) << PLLCFGR_MPLLN_POS)
+        | ((cfg.r & 0xF) << PLLCFGR_MPLLR_POS)
+        | ((cfg.q & 0xF) << PLLCFGR_MPLLQ_POS)
+        | ((cfg.p & 0xF) << PLLCFGR_MPLLP_POS);
+    write32(CMU_BASE + CMU_PLLCFGR, pllcfgr);
+
+    // 开启前确认时钟源稳定 (对齐 CLK_PLLCmd 的 WaitStable)
+    let src_flag = if cfg.src == 0 {
+        OSCSTBSR_XTALSTBF
+    } else {
+        OSCSTBSR_HRCSTBF
+    };
+    if !wait_stable(src_flag) {
+        cmu_lock();
+        return Err(ClkError::XtalStableTimeout);
+    }
+
+    // 开启 MPLL (MPLLOFF=0) 并等待锁定
+    write8(CMU_BASE + CMU_PLLCR, 0);
+    if !wait_stable(OSCSTBSR_MPLLSTBF) {
+        cmu_lock();
+        return Err(ClkError::PllStableTimeout);
+    }
+
+    cmu_lock();
+    Ok(())
+}
+
+/// 切换系统时钟源到 MPLL (200MHz)
+///
+/// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1)、
+/// GPIO 读等待 (PCCR.RDWT) 并切换到高性能电源模式 (200MHz 必需),
+/// 顺序不可颠倒 (高时钟下取指/栈/IO 采样必须先行满足时序)。
+pub fn switch_to_pll() {
+    // 目标频率 = 已配置 PLLCFGR 的实际输出 (运行时计算)
+    let target = pll_hz();
+
+    set_flash_wait_cycle(target);
+    set_sram_wait_cycle(target);
+    // 126~200MHz 输入采样需 3 个读等待周期 (对齐 BSP_CLK_Init)
+    set_gpio_read_wait(GPIO_RD_WAIT_200MHZ);
+    // 高性能电源模式 (200MHz 必需)
+    pwc_high_performance();
+
+    cmu_unlock();
+    write8(CMU_BASE + CMU_CKSWR, CLK_SRC_PLL);
+    delay_short();
+    cmu_lock();
+    // 晶振作为 PLL 源仍在工作
+    XTAL_STATUS.store(STATUS_ACTIVE, Ordering::Relaxed);
+}
+
+/// 总线时钟分频配置 (SCFGR), 对齐 BSP_CLK_Init 的 200MHz 方案:
+///
+/// | 总线 | 分频 | 频率 |
+/// |---|---|---|
+/// | HCLK | ÷1 | 200MHz |
+/// | PCLK0 | ÷1 | 200MHz |
+/// | PCLK1 | ÷2 | 100MHz |
+/// | PCLK2 | ÷4 | 50MHz |
+/// | PCLK3 | ÷4 | 50MHz |
+/// | PCLK4 | ÷2 | 100MHz |
+/// | EXCLK | ÷2 | 100MHz |
+///
+/// **200MHz 下外设总线必须分频**: PCLK1 等最大允许 100MHz, 不分频时
+/// UART/定时器等外设全部失效。
+///
+/// 调用时机: PLL 启动后、CKSWR 切换前 (此时非 PLL 时钟源, 无需 FCG
+/// 备份, 对齐 DDL SetSysClockDiv 的 PLL 分支条件)。
+pub fn set_bus_clock_div() {
+    let scfgr = (CLK_DIV1 << SCFGR_PCLK0S_POS) // PCLK0 ÷1
+        | (CLK_DIV2 << SCFGR_PCLK1S_POS) // PCLK1 ÷2
+        | (CLK_DIV4 << SCFGR_PCLK2S_POS) // PCLK2 ÷4
+        | (CLK_DIV4 << SCFGR_PCLK3S_POS) // PCLK3 ÷4
+        | (CLK_DIV2 << SCFGR_PCLK4S_POS) // PCLK4 ÷2
+        | (CLK_DIV2 << SCFGR_EXCKS_POS) // EXCLK ÷2
+        | (CLK_DIV1 << SCFGR_HCLKS_POS); // HCLK ÷1
+
+    cmu_unlock();
+    write32(CMU_BASE + CMU_SCFGR, scfgr);
+    delay_short(); // 对齐 DDL CLK_SYSCLK_SW_STB
+    cmu_lock();
+}
+
+/// GPIO 读等待周期: 126~200MHz 输入采样需要 3 个等待周期
+/// (对齐 BSP_CLK_Init 的 GPIO_RD_WAIT3, 参考手册 GPIO 章节)
+const GPIO_RD_WAIT_200MHZ: u32 = 3;
+
+/// GPIO 外设基址与关键寄存器偏移 (SVD)
+const GPIO_BASE_ADDR: usize = 0x4005_3800;
+const GPIO_PWPR: usize = GPIO_BASE_ADDR + 0x3FC; // 写保护
+const GPIO_PCCR: usize = GPIO_BASE_ADDR + 0x3F8; // 读等待等
+const PCCR_RDWT_MASK: u16 = 0x3 << 14; // RDWT[15:14]
+
+/// 配置 GPIO 读等待周期 (PCCR.RDWT[15:14])
+///
+/// 高系统时钟下单周期无法正确采样输入电平 (参考手册 GPIO 章节),
+/// 需插入读等待。PCCR 受 PWPR 写保护 (0xA501 解锁 / 0xA500 锁定)。
+fn set_gpio_read_wait(wait: u32) {
+    unsafe {
+        core::ptr::write_volatile(GPIO_PWPR as *mut u16, 0xA501);
+        let pccr = core::ptr::read_volatile(GPIO_PCCR as *const u16);
+        core::ptr::write_volatile(
+            GPIO_PCCR as *mut u16,
+            (pccr & !PCCR_RDWT_MASK) | ((wait as u16 & 0x3) << 14),
+        );
+        core::ptr::write_volatile(GPIO_PWPR as *mut u16, 0xA500);
+    }
+}
+
+/// PWC 寄存器偏移 (SVD)
+const PWC_PWRC2: usize = 0x4004_8000 + 0xC402; // 电源/驱动控制 (8 位)
+const PWC_MDSWCR: usize = 0x4004_8000 + 0xC40F; // 模式切换命令 (8 位)
+
+/// PWRC2 位
+const PWRC2_DDAS: u8 = 0x0F; // [3:0] 数字驱动能力全速
+const PWRC2_DVS: u8 = 0x30; // [6:4] 驱动电压选择
+
+/// 模式切换命令 (对齐 DDL PWC_MD_SWITCH_CMD)
+const MD_SWITCH_CMD: u8 = 0x10;
+
+/// 切换到高性能电源模式 (对齐 DDL PWC_HighSpeedToHighPerformance)
+///
+/// PWRC2: DDAS=0xF (全速), DVS=0; MDSWCR=0x10 (模式切换命令),
+/// 随后延时 ~30us 等待切换完成。PWC 寄存器由 FPRC CODE1 解锁
+/// (cmu_unlock 已含 CODE0|CODE1)。
+fn pwc_high_performance() {
+    unsafe {
+        let pwrc2 = core::ptr::read_volatile(PWC_PWRC2 as *const u8);
+        core::ptr::write_volatile(
+            PWC_PWRC2 as *mut u8,
+            (pwrc2 & !(PWRC2_DDAS | PWRC2_DVS)) | PWRC2_DDAS,
+        );
+        core::ptr::write_volatile(PWC_MDSWCR as *mut u8, MD_SWITCH_CMD);
+    }
+    // 等待模式切换完成 (~30us @ 8MHz)
+    delay_short();
+    delay_short();
+}
+
+/// 等待振荡器稳定标志置位 (带超时)
+fn wait_stable(flag: u32) -> bool {
+    let mut timeout = 0u32;
+    while read8(CMU_BASE + CMU_OSCSTBSR) & flag == 0 {
+        timeout += 1;
+        if timeout > 1_000_000 {
+            return false;
+        }
+    }
+    true
 }
 
 /// 启动外部高速晶振并等待稳定 (对齐 DDL CLK_XtalInit + CLK_XtalCmd)
@@ -151,15 +421,11 @@ pub fn xtal_init() -> Result<(), ClkError> {
     write8(CMU_BASE + CMU_XTALCR, 0);
 
     // 6. 等待稳定 (带超时)
-    let mut timeout = 0u32;
-    while read8(CMU_BASE + CMU_OSCSTBSR) & OSCSTBSR_XTALSTBF == 0 {
-        timeout += 1;
-        if timeout > 1_000_000 {
-            cmu_lock();
-            // 记录失败状态: 应用在输出通道就绪后报告
-            XTAL_STATUS.store(STATUS_FAILED, Ordering::Relaxed);
-            return Err(ClkError::XtalStableTimeout);
-        }
+    if !wait_stable(OSCSTBSR_XTALSTBF) {
+        cmu_lock();
+        // 记录失败状态: 应用在输出通道就绪后报告
+        XTAL_STATUS.store(STATUS_FAILED, Ordering::Relaxed);
+        return Err(ClkError::XtalStableTimeout);
     }
 
     // 7. 恢复写保护
@@ -328,7 +594,11 @@ fn pll_hz() -> u32 {
     let m = (r >> 0) & 0x1F;
     let n = (r >> 8) & 0x1FF;
     let p = (r >> 28) & 0xF;
-    let src = if r & (1 << 7) != 0 { hrc_hz() } else { XTAL_HZ };
+    let src = if r & (1 << PLLCFGR_PLLSRC_POS) != 0 {
+        hrc_hz()
+    } else {
+        XTAL_HZ
+    };
     src / (m + 1) * (n + 1) / (p + 1)
 }
 
@@ -342,6 +612,10 @@ fn write8(addr: usize, value: u32) {
 
 fn read32(addr: usize) -> u32 {
     unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+
+fn write32(addr: usize, value: u32) {
+    unsafe { core::ptr::write_volatile(addr as *mut u32, value) }
 }
 
 /// 短延时 (时钟源切换稳定等待)
