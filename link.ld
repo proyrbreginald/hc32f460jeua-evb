@@ -37,6 +37,8 @@ SECTIONS
         . = ALIGN(4);
         *(.text*);
         *(.rodata*);
+        /* panic 处理器: 固定保留, 便于 gdb 定位 */
+        KEEP(*(.text.panic_handler));
     } > FLASH
 
     _data_load_addr = LOADADDR(.data);

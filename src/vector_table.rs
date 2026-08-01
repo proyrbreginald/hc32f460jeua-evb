@@ -31,6 +31,9 @@ pub unsafe extern "C" fn default_handler() {
 pub static RESET_VECTOR: unsafe extern "C" fn() -> ! = crate::startup::reset_handler;
 
 /// 系统异常向量表 (异常 2~15)
+///
+/// 硬件 fault (MemManage/BusFault/UsageFault/HardFault) 指向
+/// [`crate::panic::fault_handler`], 输出 SCB 诊断信息后按策略停机/复位。
 #[unsafe(link_section = ".vector_table.exceptions")]
 #[unsafe(no_mangle)]
 pub static EXCEPTIONS: [Vector; 14] = [
@@ -38,16 +41,16 @@ pub static EXCEPTIONS: [Vector; 14] = [
         handler: default_handler,
     }, // 2: NMI
     Vector {
-        handler: default_handler,
+        handler: crate::panic::fault_handler,
     }, // 3: HardFault
     Vector {
-        handler: default_handler,
+        handler: crate::panic::fault_handler,
     }, // 4: MemManage
     Vector {
-        handler: default_handler,
+        handler: crate::panic::fault_handler,
     }, // 5: BusFault
     Vector {
-        handler: default_handler,
+        handler: crate::panic::fault_handler,
     }, // 6: UsageFault
     Vector { reserved: 0 }, // 7: 预留
     Vector { reserved: 0 }, // 8: 预留

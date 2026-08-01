@@ -6,21 +6,16 @@
 mod console;
 mod gpio;
 mod icg;
+mod panic;
 mod startup;
 mod systick;
 mod uart;
 mod vector_table;
 
-// print!/println! 由 console 模块通过 #[macro_export] 导出, 直接可用
-
 use gpio::{Config, Drive, Gpio, Level, Mode, Pin, PortA, PortC};
 use uart::{Uart1, UartConfig};
 
-// 设置 panic 处理函数
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+use crate::panic::fault_handler;
 
 /// SysTick 中断频率 (Hz)
 const SYSTICK_FREQ_HZ: u32 = 1;

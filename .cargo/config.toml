@@ -7,6 +7,8 @@ rustflags = [
   "link-arg=-Tlink.ld",                                    # 使用自定义链接脚本
   "-C",
   "link-arg=-Map=target/thumbv7em-none-eabihf/output.map", # 生成链接映射文件
+  "-C",
+  "force-frame-pointers=true",                             # 全量帧指针, 供 panic/fault 栈回溯
 ]
 
 # cargo run 时把构建产物交给烧录脚本 (构建 -> 复制 .elf -> pyocd 烧录)

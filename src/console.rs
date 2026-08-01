@@ -36,6 +36,8 @@ pub fn write_fmt(args: core::fmt::Arguments<'_>) {
     let _ = core::fmt::write(&mut uart, args);
 }
 
+// panic/fault 诊断处理见 `panic` 模块 (输出同样经由本模块)
+
 /// 输出格式化内容, 不换行
 #[macro_export]
 macro_rules! print {
