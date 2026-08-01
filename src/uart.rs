@@ -265,7 +265,8 @@ impl<const U: u8> Uart<U> {
         self.pr().write(config.clock_div.psc());
 
         // 5. 波特率寄存器 (整数 + 小数)
-        self.brr().write((div_int << BRR_DIV_INTEGER_POS) | div_frac);
+        self.brr()
+            .write((div_int << BRR_DIV_INTEGER_POS) | div_frac);
         if fbme {
             self.cr1().modify(|v| v | CR1_FBME);
         }
@@ -306,6 +307,16 @@ impl<const U: u8> Uart<U> {
     }
 }
 
+/// 实现 `core::fmt::Write`, 使任意 UART 可作为格式化输出目标
+/// (配合 `core::fmt::write` / `write_fmt` 使用, 见 `console` 模块的
+/// `print!`/`println!` 宏)。
+impl<const U: u8> core::fmt::Write for Uart<U> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.write(s.as_bytes());
+        Ok(())
+    }
+}
+
 /// 计算 BRR 的 DIV_INTEGER/DIV_FRACTION 与小数使能标志
 ///
 /// 8 位过采样: scale = 8; 16 位过采样: scale = 16
@@ -313,8 +324,16 @@ impl<const U: u8> Uart<U> {
 /// FRAC = round(256·scale·(DIV_INT+1)·B / C) - 128
 ///
 /// 实现为纯整数运算, 与 DDL UART_CalculateBrr 的结果一致。
-fn calc_brr(usart_clk: u32, baudrate: u32, oversample: Oversample) -> Result<(u32, u32, bool), UartError> {
-    let over8 = if oversample == Oversample::Eight { 1 } else { 0 };
+fn calc_brr(
+    usart_clk: u32,
+    baudrate: u32,
+    oversample: Oversample,
+) -> Result<(u32, u32, bool), UartError> {
+    let over8 = if oversample == Oversample::Eight {
+        1
+    } else {
+        0
+    };
     let scale = 8 * (2 - over8);
 
     let d = baudrate
@@ -336,10 +355,7 @@ fn calc_brr(usart_clk: u32, baudrate: u32, oversample: Oversample) -> Result<(u3
     }
 
     // 小数补偿 (u64 防溢出): FRAC = round(256·scale·n·B / C) - 128
-    let t = (256u64
-        * u64::from(scale)
-        * u64::from(n)
-        * u64::from(baudrate)
+    let t = (256u64 * u64::from(scale) * u64::from(n) * u64::from(baudrate)
         + u64::from(usart_clk / 2))
         / u64::from(usart_clk);
     if t < 128 {

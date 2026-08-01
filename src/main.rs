@@ -3,12 +3,15 @@
 // 禁用操作系统默认的标准入口
 #![no_main]
 
+mod console;
 mod gpio;
 mod icg;
 mod startup;
 mod systick;
 mod uart;
 mod vector_table;
+
+// print!/println! 由 console 模块通过 #[macro_export] 导出, 直接可用
 
 use gpio::{Config, Drive, Gpio, Level, Mode, Pin, PortA, PortC};
 use uart::{Uart1, UartConfig};
@@ -19,18 +22,17 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-/// SysTick 中断频率 (Hz)。每次中断翻转一次 LED,
-/// 因此 LED 闪烁频率 = 此值的一半。
+/// SysTick 中断频率 (Hz)
 const SYSTICK_FREQ_HZ: u32 = 1;
 
 /// PC13 LED, const 构造 (引脚号在编译期校验),
 /// 主循环与中断共享 (Copy + Sync, 见 gpio 模块的并发安全说明)。
 const LED: Pin<PortC, 13> = Pin::new();
 
-/// SysTick 中断服务函数: 翻转 PC13 LED 并累加节拍计数
+/// SysTick 中断服务函数: 累加节拍计数
 ///
 /// 由向量表 [`vector_table::EXCEPTIONS`] 的 SysTick 槽位 (异常 15) 指向。
-/// LED 翻转走 POTR 硬件原子操作, 且在 with_unlocked 临界区内, 中断安全。
+/// 注意: 中断内不要调用打印宏 (与主循环发送可能交错, 见 console 模块说明)。
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_tick_handler() {
     systick::on_tick();
@@ -58,19 +60,23 @@ pub(crate) fn main() -> ! {
     gpio.pin::<PortA, 9>().set_func(32);
     gpio.pin::<PortA, 10>().set_func(33);
 
-    // 开启 SysTick 中断 (LED 闪烁)
+    // 开启 SysTick 中断
     systick::init(SYSTICK_FREQ_HZ).expect("SysTick 配置失败");
 
-    // 初始化 USART1: 115200, 8N1, 8 位过采样, 时钟不分频
+    // 初始化 USART1 (console 的绑定目标): 115200, 8N1
     let uart = Uart1::take();
     uart.init(UartConfig::default()).expect("UART 初始化失败");
 
-    // 主循环: 周期性发送测试数据
-    const MSG: &str = "Hello HC32F460 UART!\n";
-        uart.write_str("Start!\n");
+    // 控制台输出验证
+    println!("HC32F460 console ready!");
+    println!("console uart = {}", stringify!(Uart1));
+
+    // 主循环: 周期性输出计数
+    let mut count: u32 = 0;
     loop {
         systick::delay_ms(500u32);
         LED.toggle();
-        uart.write_str(MSG);
+        println!("count = {}", count);
+        count = count.wrapping_add(1);
     }
 }
