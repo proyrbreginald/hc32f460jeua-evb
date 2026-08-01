@@ -66,7 +66,7 @@ pub static EXCEPTIONS: [Vector; 14] = [
         handler: default_handler,
     }, // 14: PendSV
     Vector {
-        handler: default_handler,
+        handler: crate::sys_tick_handler,
     }, // 15: SysTick
 ];
 
