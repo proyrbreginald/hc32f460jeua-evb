@@ -3,6 +3,10 @@
 // 禁用操作系统默认的标准入口
 #![no_main]
 
+mod gpio;
+
+use gpio::{Config, Drive, Gpio, Level, Mode, OutputPin, PortC};
+
 // 设置 panic 处理函数
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -21,6 +25,29 @@ unsafe extern "C" {
 // 设置为复位处理函数
 #[unsafe(no_mangle)]
 unsafe extern "C" fn reset_handler() -> ! {
+    // ---- SRAMC 初始化 (对齐 DDL startup_hc32f460.S 的 ClrSramSR + SetSRAM3Wait) ----
+    //
+    // HC32F460 的 SRAM 分块管理 (SRAMH/SRAM12/SRAM3/SRAMR), 其中 SRAM3
+    // (0x20020000~0x20026FFF, 本工程的栈区) 是慢速块, 需要 1 个读/写等待周期,
+    // 否则访问数据会损坏。复位后 WTCR=0 (0 等待), 必须显式配置。
+    //
+    // SRAMC 基址 0x4005_0800, 寄存器: WTCR(+0x0) WTPR(+0x4) CKCR(+0x8) CKPR(+0xC) CKSR(+0x10)
+    // WTPR/CKPR 写保护键值: 0x77 解锁, 0x76 锁定 (SRAM_REG_UNLOCK_KEY/LOCK_KEY)
+    unsafe {
+        const SRAMC: usize = 0x4005_0800;
+
+        // 清除 SRAM 校验错误标志 (CKSR: 1ERR/2ERR/PYERR)
+        core::ptr::write_volatile((SRAMC + 0x10) as *mut u32, 0x1F);
+        // 解锁 SRAMC 寄存器写保护
+        core::ptr::write_volatile((SRAMC + 0x04) as *mut u32, 0x77);
+        core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x77);
+        // SRAM3 读等待 1 周期 + 写等待 1 周期 (WTCR = 0x1100)
+        core::ptr::write_volatile((SRAMC + 0x00) as *mut u32, 0x1100);
+        // 恢复 SRAMC 寄存器写保护
+        core::ptr::write_volatile((SRAMC + 0x04) as *mut u32, 0x76);
+        core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x76);
+    }
+
     // 开启 FPU (CPACR: 使能 CP10 和 CP11 的完全访问权限)
     unsafe {
         let cpacr = 0xE000ED88 as *mut u32;
@@ -52,7 +79,7 @@ unsafe extern "C" fn reset_handler() -> ! {
         }
     }
 
-    // 跳转到主循环：延时翻转 PC13 引脚
+    // 跳转到主循环：翻转 PC13 引脚
     blink_loop();
 }
 
@@ -65,42 +92,32 @@ fn delay(iterations: u32) {
 }
 
 fn blink_loop() -> ! {
-    const GPIO: *mut u32 = 0x40053800 as *mut u32;
-    const PC13: u16 = 1u16 << 13;
-    let mut pwpr: u16 = 0u16;
-    let mut pfsrc: u16 = 0u16;
-    let mut poerc: u16 = 0u16;
-    let mut pcr: u16 = 0u16;
+    // 获取 GPIO 句柄
+    let gpio = Gpio::take();
+    // 开发板上 LED 连接在 PC13
+    let led = gpio.pin::<PortC, 13>();
 
-    unsafe {
-        // 解除 GPIO 写保护 (PWPR.WP = 0xA501, PWPR.WE = 1)
-        core::ptr::write_volatile(GPIO.byte_add(0x3FC) as *mut u16, 0xA501u16);
-        pwpr = core::ptr::read_volatile(GPIO.byte_add(0x3FC) as *mut u16);
+    // 配置 PC13: GPIO 功能, 推挽输出, 低速驱动
+    led.configure(Config {
+        mode: Mode::Output,
+        pull_up: false,
+        drive: Drive::Low,
+    });
 
-        // 配置 PC13 为 GPIO 功能 (PFSRC13.FSEL = 0)
-        core::ptr::write_volatile(GPIO.byte_add(0x4B6) as *mut u16, 0u16);
-        pfsrc = core::ptr::read_volatile(GPIO.byte_add(0x4B6) as *mut u16);
+    // 先点亮再交给通用闪烁逻辑
+    led.set_level(Level::High);
+    // led.set_level(Level::Low);
+    blink(&led);
+    loop {}
+}
 
-        // 配置 PC13 为输出 (POERC bit13)
-        core::ptr::write_volatile(GPIO.byte_add(0x26) as *mut u16, PC13);
-        poerc = core::ptr::read_volatile(GPIO.byte_add(0x26) as *mut u16);
-
-        core::ptr::write_volatile(GPIO.byte_add(0x4B4) as *mut u16, 0x0022u16);
-        pcr = core::ptr::read_volatile(GPIO.byte_add(0x4B4) as *mut u16);
-
-        // 解除 PWPR 写保护后不再锁定，否则后续 POSRC/PORRC 写入也将被忽略
-    }
-
+/// 针对 [`OutputPin`] 接口编程, 与具体端口/引脚解耦,
+/// 同一份代码可以驱动任意输出引脚
+fn blink(pin: &impl OutputPin) -> ! {
     loop {
-        // delay(4_000_000);
-
-        unsafe {
-            // 翻转 PC13
-            // core::ptr::write_volatile(GPIO.byte_add(0x2C) as *mut u16, PC13);
-
-            core::ptr::write_volatile(GPIO.byte_add(0x28) as *mut u16, PC13);
-            // core::ptr::write_volatile(GPIO.byte_add(0x2A) as *mut u16, PC13);
-        }
+        // 翻转引脚电平 (POTRC 写 1, 原子操作)
+        pin.toggle();
+        delay(40_000);
     }
 }
 
@@ -111,6 +128,7 @@ pub static RESET_VECTOR: unsafe extern "C" fn() -> ! = reset_handler;
 
 // 定义一个联合体，兼容函数指针和预留整型值
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub union Vector {
     pub handler: unsafe extern "C" fn(),
     pub reserved: usize,
@@ -145,7 +163,9 @@ pub static EXCEPTIONS: [Vector; 14] = [
     Vector { reserved: 0 }, // 7: 预留
     Vector { reserved: 0 }, // 8: 预留
     Vector { reserved: 0 }, // 9: 预留
-    Vector { reserved: 0 }, // 10: 预留
+    Vector {
+        handler: default_handler,
+    }, // 10: 预留
     Vector {
         handler: default_handler,
     }, // 11: SVCall
@@ -162,11 +182,13 @@ pub static EXCEPTIONS: [Vector; 14] = [
 ];
 
 // 定义外设中断表
+// HC32F460 共有 144 个外设中断 (INT000~INT143, 见 DDL hc32f460.h IRQn 定义),
+// 向量表必须覆盖全部, 否则任何中断触发都会取到垃圾向量导致程序跑飞。
 #[unsafe(link_section = ".vector_table.interrupts")]
 #[unsafe(no_mangle)]
-pub static INTERRUPTS: [Vector; 1] = [Vector {
+pub static INTERRUPTS: [Vector; 144] = [Vector {
     handler: default_handler,
-}];
+}; 144];
 
 // ICG 配置数据
 #[unsafe(link_section = ".icgs")]
