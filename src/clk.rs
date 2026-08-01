@@ -37,7 +37,10 @@ use crate::gpio::{Config, Drive, Level, Mode, Pin, PortH};
 /// 外部高速晶振频率 (Hz)。合法范围 4~25MHz (参考手册)。
 /// **按实际电路板晶振修改此常量!**
 pub const XTAL_HZ: u32 = 8_000_000;
-const _: () = assert!(XTAL_HZ >= 4_000_000 && XTAL_HZ <= 25_000_000, "XTAL 频率必须在 4~25MHz");
+const _: () = assert!(
+    XTAL_HZ >= 4_000_000 && XTAL_HZ <= 25_000_000,
+    "XTAL 频率必须在 4~25MHz"
+);
 
 /// 内部中速 RC 频率 (Hz), 复位默认系统时钟源
 pub const MRC_HZ: u32 = 8_000_000;

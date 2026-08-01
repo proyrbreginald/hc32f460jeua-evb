@@ -77,9 +77,9 @@ core::arch::global_asm!(
     ".thumb_func",
     "fault_handler:",
     "    mrs r0, ipsr", // 异常号
-    "    mrs r1, msp", // MSP (异常压栈帧基址)
-    "    mov r2, sp", // 当前 SP (handler 模式下即 MSP)
-    "    mov r3, r7", // 现场帧指针 (fault 指令所在函数的 FP)
+    "    mrs r1, msp",  // MSP (异常压栈帧基址)
+    "    mov r2, sp",   // 当前 SP (handler 模式下即 MSP)
+    "    mov r3, r7",   // 现场帧指针 (fault 指令所在函数的 FP)
     "    b fault_diagnose",
 );
 

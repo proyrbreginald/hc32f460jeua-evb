@@ -108,37 +108,17 @@ fn pwpr() -> Reg<u16> {
 ///
 /// # 中断安全
 ///
-/// 整个解锁-执行-加锁窗口处于临界区 (PRIMASK 关中断) 内:
+/// 整个解锁-执行-加锁窗口处于临界区 ([`crate::critical_section`]) 内:
 /// - 若中断在此窗口内也操作 GPIO, 嵌套的解锁/加锁会使主循环的写入
 ///   被中断的加锁"提前锁死"而静默丢弃, 因此窗口内禁止中断;
-/// - 仅当进入前中断开启 (PRIMASK=0) 时才执行 `cpsid`/`cpsie` 对,
-///   因此**嵌套调用安全**: 外层已处于临界区时, 内层不会重新开中断;
-/// - 退出时按进入前的 PRIMASK 原样恢复。
+/// - 临界区嵌套安全: 外层已处于临界区时, 内层不会重新开中断。
 fn with_unlocked<T>(f: impl FnOnce() -> T) -> T {
-    // 保存 PRIMASK
-    let primask: u32;
-    unsafe {
-        core::arch::asm!("mrs {}, primask", out(reg) primask);
-    }
-
-    // 仅当此前中断开启时才进入临界区 (嵌套调用时保持外层状态)
-    if primask & 1 == 0 {
-        unsafe {
-            core::arch::asm!("cpsid i");
-        }
-    }
-
-    pwpr().write(PWPR_UNLOCK);
-    let result = f();
-    pwpr().write(PWPR_LOCK);
-
-    // 只有自己关闭了中断才重新开启
-    if primask & 1 == 0 {
-        unsafe {
-            core::arch::asm!("cpsie i");
-        }
-    }
-    result
+    crate::critical_section::with(|| {
+        pwpr().write(PWPR_UNLOCK);
+        let result = f();
+        pwpr().write(PWPR_LOCK);
+        result
+    })
 }
 
 // ================================ 端口层 ================================
