@@ -72,7 +72,7 @@ pyocd list # 列出可用调试器
 ### 四、烧录固件
 
 ```bash
-pyocd flash -u <调试器ID> --target hc32f460xe target/thumbv7em-none-eabihf/debug/hc32f460.elf
+pyocd flash -u <调试器ID> --target hc32f460xe target/thumbv7em-none-eabi/debug/hc32f460.elf
 ```
 
 参数说明：
@@ -95,7 +95,7 @@ pyocd gdbserver --target hc32f460xe
 在另一个终端中启动 GDB 并连接：
 
 ```bash
-arm-none-eabi-gdb -q target/thumbv7em-none-eabihf/debug/hc32f460.elf
+arm-none-eabi-gdb -q target/thumbv7em-none-eabi/debug/hc32f460.elf
 target extended-remote localhost:3333
 monitor reset halt   # 复位并暂停
 load                 # 烧录当前 ELF

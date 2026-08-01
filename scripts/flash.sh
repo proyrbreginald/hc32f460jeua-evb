@@ -14,7 +14,7 @@
 #   FLASH_DRY_RUN 非空时只打印命令不真正烧录 (用于验证流程)
 set -euo pipefail
 
-# cargo 构建产物 (如 target/thumbv7em-none-eabihf/release/hc32f460)
+# cargo 构建产物 (如 target/thumbv7em-none-eabi/release/hc32f460)
 ELF="${1:?缺少构建产物路径}"
 ELF_ELF="${ELF}.elf"
 
