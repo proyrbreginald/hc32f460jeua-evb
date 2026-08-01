@@ -9,6 +9,11 @@ MEMORY
 
 ENTRY(reset_handler)
 
+/* 栈预留大小: 栈顶 = RAM 顶 (0x20027000), 向下预留 STACK_SIZE 给栈,
+ * 其余空间 (bss 之后) 全部划给堆。栈向堆溢出时会被堆数据覆盖,
+ * 预留大小需按应用栈深度调整。 */
+STACK_SIZE = 8K;
+
 SECTIONS
 {
     .vector_table :
@@ -41,6 +46,16 @@ SECTIONS
         KEEP(*(.text.panic_handler));
     } > FLASH
 
+    .ARM.extab :
+    {
+        *(.ARM.extab*);
+    } > FLASH
+
+    .ARM.exidx :
+    {
+        *(.ARM.exidx*);
+    } > FLASH
+
     _data_load_addr = LOADADDR(.data);
 
     .data :
@@ -60,13 +75,14 @@ SECTIONS
         _bss_ram_end = .;
     } > RAM
 
-    .ARM.extab :
+    /* 堆: bss 之后, 栈预留区之前 */
+    .heap (NOLOAD) :
     {
-        *(.ARM.extab*);
-    } > FLASH
-
-    .ARM.exidx :
-    {
-        *(.ARM.exidx*);
-    } > FLASH
+        . = ALIGN(8);
+        _heap_start = .;
+    } > RAM
 }
+
+/* 堆上界 = RAM 顶 - 栈预留 (绝对符号) */
+_heap_end = ORIGIN(RAM) + LENGTH(RAM) - STACK_SIZE;
+ASSERT(_heap_end >= _heap_start, "RAM 空间不足以容纳堆和栈预留");
