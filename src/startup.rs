@@ -50,8 +50,12 @@ pub unsafe extern "C" fn reset_handler() -> ! {
     // 切换外部晶振/更高时钟时由 `clk::switch_to_xtal` 在切换前重新配置。
     crate::clk::set_flash_wait_cycle(crate::clk::MRC_HZ);
 
-    // 注意: 本工程使用软浮点 target (thumbv7em-none-eabi), FPU 未使能
-    // (CPACR 保持复位值), 浮点操作由编译器软件模拟。
+    // 开启 FPU (CPACR: 使能 CP10 和 CP11 的完全访问权限)
+    unsafe {
+        let cpacr = 0xE000ED88 as *mut u32;
+        let value = core::ptr::read_volatile(cpacr);
+        core::ptr::write_volatile(cpacr, value | (0b1111 << 20));
+    }
 
     // 初始化 .data 段
     unsafe {

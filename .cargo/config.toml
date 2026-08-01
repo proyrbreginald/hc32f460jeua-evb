@@ -1,13 +1,12 @@
 [build]
-# 软浮点 target: 禁用硬件 FPU, 全部浮点操作由编译器软件模拟
-target = "thumbv7em-none-eabi"
+target = "thumbv7em-none-eabihf"
 
-[target.thumbv7em-none-eabi]
+[target.thumbv7em-none-eabihf]
 rustflags = [
   "-C",
   "link-arg=-Tlink.ld",                                    # 使用自定义链接脚本
   "-C",
-  "link-arg=-Map=target/thumbv7em-none-eabi/output.map",   # 生成链接映射文件
+  "link-arg=-Map=target/thumbv7em-none-eabihf/output.map", # 生成链接映射文件
   "-C",
   "force-frame-pointers=true",                             # 全量帧指针, 供 panic/fault 栈回溯
 ]
