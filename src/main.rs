@@ -7,9 +7,11 @@ mod gpio;
 mod icg;
 mod startup;
 mod systick;
+mod uart;
 mod vector_table;
 
-use gpio::{Config, Drive, Gpio, Level, Mode, Pin, PortC};
+use gpio::{Config, Drive, Gpio, Level, Mode, Pin, PortA, PortC};
+use uart::{Uart1, UartConfig};
 
 // 设置 panic 处理函数
 #[panic_handler]
@@ -19,7 +21,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 /// SysTick 中断频率 (Hz)。每次中断翻转一次 LED,
 /// 因此 LED 闪烁频率 = 此值的一半。
-const SYSTICK_FREQ_HZ: u32 = 1000u32;
+const SYSTICK_FREQ_HZ: u32 = 1;
 
 /// PC13 LED, const 构造 (引脚号在编译期校验),
 /// 主循环与中断共享 (Copy + Sync, 见 gpio 模块的并发安全说明)。
@@ -31,7 +33,6 @@ const LED: Pin<PortC, 13> = Pin::new();
 /// LED 翻转走 POTR 硬件原子操作, 且在 with_unlocked 临界区内, 中断安全。
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_tick_handler() {
-    // LED.toggle();
     systick::on_tick();
     // Arm Errata 838869: ISR 末尾加 DSB, 确保中断唤醒低功耗模式的行为可靠
     unsafe {
@@ -43,6 +44,7 @@ pub extern "C" fn sys_tick_handler() {
 pub(crate) fn main() -> ! {
     // 获取 GPIO 句柄
     let gpio = Gpio::take();
+
     // 配置 PC13: GPIO 功能, 推挽输出, 低速驱动, 初始电平高
     gpio.pin::<PortC, 13>().configure(Config {
         mode: Mode::Output,
@@ -51,12 +53,24 @@ pub(crate) fn main() -> ! {
         initial_level: Level::High,
     });
 
-    // 开启 SysTick 中断
+    // UART 引脚复用: PA9=USART1_TX (FSEL 32), PA10=USART1_RX (FSEL 33)
+    // Func_Grp1 组, 由引脚硬件固定 (数据手册表 2-1/2-2)
+    gpio.pin::<PortA, 9>().set_func(32);
+    gpio.pin::<PortA, 10>().set_func(33);
+
+    // 开启 SysTick 中断 (LED 闪烁)
     systick::init(SYSTICK_FREQ_HZ).expect("SysTick 配置失败");
 
-    // 主循环: 由中断驱动 LED 翻转
+    // 初始化 USART1: 115200, 8N1, 8 位过采样, 时钟不分频
+    let uart = Uart1::take();
+    uart.init(UartConfig::default()).expect("UART 初始化失败");
+
+    // 主循环: 周期性发送测试数据
+    const MSG: &str = "Hello HC32F460 UART!\n";
+        uart.write_str("Start!\n");
     loop {
         systick::delay_ms(500u32);
         LED.toggle();
+        uart.write_str(MSG);
     }
 }

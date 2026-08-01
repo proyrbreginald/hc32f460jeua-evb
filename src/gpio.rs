@@ -157,12 +157,15 @@ pub trait Port: sealed::Sealed {
     const DATA_OFFSET: usize;
     /// 引脚控制寄存器组基址 (PCR0 相对 GPIO 基地址)
     const PCR_OFFSET: usize;
-    /// 该端口实际可用的引脚数 (不同封装引脚数不同)
-    const PIN_COUNT: u8;
+    /// 该端口在 JEUA (LQFP48) 封装上的引脚存在性表 `[pin0 .. pin15]`
+    ///
+    /// 引脚表见数据手册表 2-1: JEUA 共 38 个 GPIO
+    /// (PA0~15, PB0~15, PC13~15, PH0~2), 其余引脚不存在。
+    const VALID_PINS: [bool; 16];
 }
 
 macro_rules! port {
-    ($name:ident, $data:expr, $pcr:expr, $count:expr) => {
+    ($name:ident, $data:expr, $pcr:expr, $valid:expr) => {
         /// 端口标记类型
         pub struct $name;
 
@@ -171,17 +174,37 @@ macro_rules! port {
         impl Port for $name {
             const DATA_OFFSET: usize = $data;
             const PCR_OFFSET: usize = $pcr;
-            const PIN_COUNT: u8 = $count;
+            const VALID_PINS: [bool; 16] = $valid;
         }
     };
 }
 
-port!(PortA, 0x000, 0x400, 16);
-port!(PortB, 0x010, 0x440, 16);
-port!(PortC, 0x020, 0x480, 16);
-port!(PortD, 0x030, 0x4C0, 16);
-port!(PortE, 0x040, 0x500, 16);
-port!(PortH, 0x050, 0x540, 3); // JEUA 封装仅有 PH0~PH2
+/// 仅引脚 13~15 存在 (PortC: PC13~PC15)
+const PC_PINS: [bool; 16] = {
+    let mut t = [false; 16];
+    t[13] = true;
+    t[14] = true;
+    t[15] = true;
+    t
+};
+
+/// 仅引脚 0~2 存在 (PortH: PH0~PH2)
+const PH_PINS: [bool; 16] = {
+    let mut t = [false; 16];
+    t[0] = true;
+    t[1] = true;
+    t[2] = true;
+    t
+};
+
+// JEUA (LQFP48) 封装引脚表 (数据手册表 2-1):
+// 仅 PA0~15、PB0~15、PC13~15、PH0~2 存在, 共 38 个 GPIO
+port!(PortA, 0x000, 0x400, [true; 16]);
+port!(PortB, 0x010, 0x440, [true; 16]);
+port!(PortC, 0x020, 0x480, PC_PINS);
+port!(PortD, 0x030, 0x4C0, [false; 16]); // JEUA 无 PD 引脚
+port!(PortE, 0x040, 0x500, [false; 16]); // JEUA 无 PE 引脚
+port!(PortH, 0x050, 0x540, PH_PINS);
 
 // ================================ 引脚层 ================================
 
@@ -262,9 +285,12 @@ impl<P: Port, const N: u8> Pin<P, N> {
     /// 创建引脚。
     ///
     /// 当以 `const` 方式使用 (如 `const LED: Pin<PortC, 13> = Pin::new();`)
-    /// 时, 引脚号越界会在编译期报错。
+    /// 时, 引脚不存在于 JEUA 封装会在编译期报错。
     pub const fn new() -> Self {
-        assert!(N < P::PIN_COUNT, "pin index out of range");
+        assert!(
+            P::VALID_PINS[N as usize],
+            "pin does not exist on the JEUA package"
+        );
         Self { _port: PhantomData }
     }
 
@@ -299,6 +325,17 @@ impl<P: Port, const N: u8> Pin<P, N> {
     /// 引脚功能选择寄存器 PFSRn
     fn pfsr(&self) -> Reg<u16> {
         Reg::new(P::PCR_OFFSET + N as usize * 4 + 2)
+    }
+
+    /// 选择周边复用功能 (PFSR.FSEL)
+    ///
+    /// FSEL=0 为通用输出 GPO (默认)。具体功能号见数据手册"引脚功能表":
+    /// - Func0~15 各引脚独立;
+    /// - Func32~63 按引脚的 Func_Grp1/Grp2 分组映射 (表 2-2), 组由硬件固定。
+    ///
+    /// 复用功能引脚的输出/输入由外设驱动, 无需配置 PCR (POUTE/DDIS 等保持默认)。
+    pub fn set_func(&self, fsel: u8) {
+        with_unlocked(|| self.pfsr().write(fsel as u16));
     }
 
     /// 按配置初始化引脚: 选择 GPIO 功能 (PFSR.FSEL=0) 并设置模式/上拉/驱动/初始电平。
