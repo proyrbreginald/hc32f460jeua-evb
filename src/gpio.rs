@@ -7,12 +7,22 @@
 //!
 //! | 层 | 类型 | 职责 |
 //! |----|------|------|
-//! | 寄存器层 | [`Reg`] | 偏移量编码在 const 泛型中的零开销易失性寄存器 |
+//! | 寄存器层 | [`Reg`] | 偏移量编码在类型中的零开销易失性寄存器 |
 //! | 端口层 | [`Port`] trait + `PortA`~`PortH` | 端口的寄存器布局元数据 |
 //! | 引脚层 | [`Pin<P, N>`] | 端口/引脚号编码在类型中, 越界在编译期报错 |
 //! | 接口层 | [`OutputPin`] / [`InputPin`] | 引脚操作的抽象 trait |
-//! | 所有权层 | [`Gpio`] | 单例句柄, `take()` 保证全局独占 |
-//! | 保护层 | [`with_unlocked`] | PWPR 写保护自动解锁/加锁, 应用层无感 |
+//! | 所有权层 | [`Gpio`] | 句柄, 只能通过 `take()` 构造 |
+//! | 保护层 | [`with_unlocked`] | PWPR 写保护自动解锁/加锁 + 临界区 |
+//!
+//! # 并发安全
+//!
+//! `Pin` 实现了 `Send + Sync`, 允许主循环与中断共享同一引脚。soundness
+//! 论证如下:
+//! - [`Pin::set_high`]/[`Pin::set_low`]/[`Pin::toggle`]: 写 POSR/PORR/POTR,
+//!   硬件"写 1 生效"原子操作, 并发安全;
+//! - [`Pin::configure`]: 解锁-写-加锁序列, 全部在 [`with_unlocked`] 的
+//!   临界区 (PRIMASK) 内执行, 中断无法穿插;
+//! - [`Pin::is_high`] 等读操作: 只读 PIDR, 无副作用。
 //!
 //! HAL 提供完整 API, 但应用往往只使用其中一部分,
 //! 因此忽略未使用项 (输入/输出接口, 单个引脚方法等) 的死代码警告。
@@ -23,11 +33,27 @@ use core::marker::PhantomData;
 /// GPIO 外设基地址 (SVD: GPIO.baseAddress)
 const GPIO_BASE: usize = 0x4005_3800;
 
-/// PWPR 解除写保护: WE=1, WP=0xA5
 /// PWPR 解除写保护: WE=1, WP=0xA5 (与 DDL GPIO_REG_UNLOCK_KEY 一致)
 const PWPR_UNLOCK: u16 = 0xA501;
 /// PWPR 恢复写保护: WE=0, WP=0xA5 (与 DDL GPIO_REG_LOCK_KEY 一致)
 const PWPR_LOCK: u16 = 0xA500;
+
+/// 端口数据寄存器组内各寄存器偏移 (每组 0x10 字节, 16 位寄存器)
+const PIDR_OFF: usize = 0x00; // 输入数据 (只读)
+const PODR_OFF: usize = 0x04; // 输出数据
+const POER_OFF: usize = 0x06; // 输出使能
+const POSR_OFF: usize = 0x08; // 置位 (写 1)
+const PORR_OFF: usize = 0x0A; // 复位 (写 1)
+const POTR_OFF: usize = 0x0C; // 翻转 (写 1)
+
+/// 引脚控制寄存器 PCR 字段位 (SVD: PCRA0, resetMask 0xD377)
+const PCR_POUT: u16 = 1 << 0; // 输出数据
+const PCR_POUTE: u16 = 1 << 1; // 输出使能
+const PCR_NOD: u16 = 1 << 2; // 开漏
+const PCR_DRV_SHIFT: u16 = 4; // 驱动能力 (2 位)
+const PCR_DRV_MASK: u16 = 0x30;
+const PCR_PUU: u16 = 1 << 6; // 内部上拉
+const PCR_DDIS: u16 = 1 << 15; // 关闭数字输入 (模拟模式)
 
 // ================================ 寄存器层 ================================
 
@@ -70,7 +96,7 @@ impl<T: Copy> Reg<T> {
     }
 }
 
-/// PWPR: 端口写保护控制寄存器 (偏移 0x3FC)
+/// PWPR: 端口写保护控制寄存器
 fn pwpr() -> Reg<u16> {
     Reg::new(0x3FC)
 }
@@ -85,20 +111,28 @@ fn pwpr() -> Reg<u16> {
 /// 整个解锁-执行-加锁窗口处于临界区 (PRIMASK 关中断) 内:
 /// - 若中断在此窗口内也操作 GPIO, 嵌套的解锁/加锁会使主循环的写入
 ///   被中断的加锁"提前锁死"而静默丢弃, 因此窗口内禁止中断;
-/// - 进入时保存 PRIMASK, 退出时原样恢复 (嵌套中断环境安全)。
+/// - 仅当进入前中断开启 (PRIMASK=0) 时才执行 `cpsid`/`cpsie` 对,
+///   因此**嵌套调用安全**: 外层已处于临界区时, 内层不会重新开中断;
+/// - 退出时按进入前的 PRIMASK 原样恢复。
 fn with_unlocked<T>(f: impl FnOnce() -> T) -> T {
-    // 保存 PRIMASK 并关中断
+    // 保存 PRIMASK
     let primask: u32;
     unsafe {
         core::arch::asm!("mrs {}, primask", out(reg) primask);
-        core::arch::asm!("cpsid i");
+    }
+
+    // 仅当此前中断开启时才进入临界区 (嵌套调用时保持外层状态)
+    if primask & 1 == 0 {
+        unsafe {
+            core::arch::asm!("cpsid i");
+        }
     }
 
     pwpr().write(PWPR_UNLOCK);
     let result = f();
     pwpr().write(PWPR_LOCK);
 
-    // 恢复中断状态: 仅当进入前中断开启时才重新开启
+    // 只有自己关闭了中断才重新开启
     if primask & 1 == 0 {
         unsafe {
             core::arch::asm!("cpsie i");
@@ -193,6 +227,9 @@ pub struct Config {
     pub pull_up: bool,
     /// 驱动能力 (PCR.DRV, 仅输出模式有效)
     pub drive: Drive,
+    /// 配置完成时的初始输出电平 (PCR.POUT, 仅输出模式有效)。
+    /// 输出数据位与输出使能位同一次写入, 使能瞬间即为目标电平, 无毛刺。
+    pub initial_level: Level,
 }
 
 impl Default for Config {
@@ -201,6 +238,7 @@ impl Default for Config {
             mode: Mode::Input,
             pull_up: false,
             drive: Drive::Medium,
+            initial_level: Level::Low,
         }
     }
 }
@@ -232,27 +270,27 @@ impl<P: Port, const N: u8> Pin<P, N> {
 
     /// 输入数据寄存器 PIDR (只读, 实时引脚电平)
     fn pidr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + 0x00)
+        Reg::new(P::DATA_OFFSET + PIDR_OFF)
     }
     /// 输出数据寄存器 PODR
     fn podr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + 0x04)
+        Reg::new(P::DATA_OFFSET + PODR_OFF)
     }
     /// 输出使能寄存器 POER
     fn poer(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + 0x06)
+        Reg::new(P::DATA_OFFSET + POER_OFF)
     }
     /// 置位寄存器 POSR (写 1 输出高电平, 原子操作)
     fn posr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + 0x08)
+        Reg::new(P::DATA_OFFSET + POSR_OFF)
     }
     /// 复位寄存器 PORR (写 1 输出低电平, 原子操作)
     fn porr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + 0x0A)
+        Reg::new(P::DATA_OFFSET + PORR_OFF)
     }
     /// 翻转寄存器 POTR (写 1 翻转电平, 原子操作)
     fn potr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + 0x0C)
+        Reg::new(P::DATA_OFFSET + POTR_OFF)
     }
     /// 引脚控制寄存器 PCRn
     fn pcr(&self) -> Reg<u16> {
@@ -263,10 +301,13 @@ impl<P: Port, const N: u8> Pin<P, N> {
         Reg::new(P::PCR_OFFSET + N as usize * 4 + 2)
     }
 
-    /// 按配置初始化引脚: 选择 GPIO 功能 (PFSR.FSEL=0) 并设置模式/上拉/驱动。
+    /// 按配置初始化引脚: 选择 GPIO 功能 (PFSR.FSEL=0) 并设置模式/上拉/驱动/初始电平。
     ///
     /// 寄存器值对齐 DDL 的 GPIO_Init (PCR 的 POUT/POUTE/NOD/DRV/PUU/DDIS,
     /// 不设置 INTE/LTE/INVE —— 它们属于外部中断/锁存/输入反相功能)。
+    ///
+    /// 注意: 本方法**重置**该引脚的 PCR 全部可写位 (INVE/LTE/INTE 等会被清零),
+    /// 适用于引脚生命周期内的一次性初始化。
     pub fn configure(&self, config: Config) {
         let bit = 1u16 << N;
         let output = matches!(config.mode, Mode::Output | Mode::OpenDrain);
@@ -275,22 +316,8 @@ impl<P: Port, const N: u8> Pin<P, N> {
             // PFSR.FSEL = 0: 选择 GPIO 功能
             self.pfsr().write(0);
 
-            // 构造 PCR 值
-            let mut pcr = 0u16;
-            if output {
-                pcr |= 1 << 1; // POUTE: 输出使能
-            }
-            if config.pull_up {
-                pcr |= 1 << 6; // PUU: 内部上拉
-            }
-            pcr |= (config.drive as u16) << 4; // DRV: 驱动能力
-            if config.mode == Mode::OpenDrain {
-                pcr |= 1 << 2; // NOD: 开漏
-            }
-            if config.mode == Mode::Analog {
-                pcr |= 1 << 15; // DDIS: 关闭数字输入
-            }
-            self.pcr().write(pcr);
+            // POUT(输出数据) 与 POUTE(输出使能) 同一次写入, 使能瞬间即为目标电平
+            self.pcr().write(build_pcr_value(config));
 
             // 输出使能位同步到 POER
             if output {
@@ -344,9 +371,38 @@ impl<P: Port, const N: u8> Pin<P, N> {
     }
 }
 
-// ================================ 接口层 ================================
+/// 由配置构造 PCR 寄存器值。
+///
+/// 输出数据位 (POUT) 与输出使能位 (POUTE) 在同一寄存器中一次性写入,
+/// 保证输出使能生效瞬间引脚即为目标电平。
+fn build_pcr_value(config: Config) -> u16 {
+    let output = matches!(config.mode, Mode::Output | Mode::OpenDrain);
 
-/// 输出引脚操作接口, 便于应用代码针对接口编程
+    let mut pcr = 0u16;
+    if config.initial_level == Level::High {
+        pcr |= PCR_POUT; // 输出数据
+    }
+    if output {
+        pcr |= PCR_POUTE; // 输出使能
+    }
+    if config.pull_up {
+        pcr |= PCR_PUU; // 内部上拉
+    }
+    debug_assert!(
+        (config.drive as u16) & !(PCR_DRV_MASK >> PCR_DRV_SHIFT) == 0,
+        "drive 编码越界"
+    );
+    pcr |= (config.drive as u16) << PCR_DRV_SHIFT; // 驱动能力
+    if config.mode == Mode::OpenDrain {
+        pcr |= PCR_NOD; // 开漏
+    }
+    if config.mode == Mode::Analog {
+        pcr |= PCR_DDIS; // 关闭数字输入
+    }
+    pcr
+}
+
+// ================================ 接口层 ================================/// 输出引脚操作接口, 便于应用代码针对接口编程
 pub trait OutputPin {
     /// 输出高电平
     fn set_high(&self);
