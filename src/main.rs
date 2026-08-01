@@ -56,39 +56,50 @@ unsafe extern "C" fn reset_handler() -> ! {
     blink_loop();
 }
 
-// 怠速延时函数：在 8MHz 系统时钟下，每次迭代约消耗 5 个周期
 fn delay(iterations: u32) {
-    let tracker: u32 = 0;
-    let p = &tracker as *const u32;
-    unsafe {
-        for _ in 0..iterations {
-            core::ptr::read_volatile(p);
+    for _ in 0..iterations {
+        unsafe {
+            core::arch::asm!("nop");
         }
     }
 }
 
 fn blink_loop() -> ! {
     const GPIO: *mut u32 = 0x40053800 as *mut u32;
+    const PC13: u16 = 1u16 << 13;
+    let mut pwpr: u16 = 0u16;
+    let mut pfsrc: u16 = 0u16;
+    let mut poerc: u16 = 0u16;
+    let mut pcr: u16 = 0u16;
 
     unsafe {
         // 解除 GPIO 写保护 (PWPR.WP = 0xA501, PWPR.WE = 1)
         core::ptr::write_volatile(GPIO.byte_add(0x3FC) as *mut u16, 0xA501u16);
+        pwpr = core::ptr::read_volatile(GPIO.byte_add(0x3FC) as *mut u16);
 
         // 配置 PC13 为 GPIO 功能 (PFSRC13.FSEL = 0)
         core::ptr::write_volatile(GPIO.byte_add(0x4B6) as *mut u16, 0u16);
+        pfsrc = core::ptr::read_volatile(GPIO.byte_add(0x4B6) as *mut u16);
 
-        // 配置 PC13 为输出 (POERC = 1)
-        core::ptr::write_volatile(GPIO.byte_add(0x26) as *mut u16, 1u16);
+        // 配置 PC13 为输出 (POERC bit13)
+        core::ptr::write_volatile(GPIO.byte_add(0x26) as *mut u16, PC13);
+        poerc = core::ptr::read_volatile(GPIO.byte_add(0x26) as *mut u16);
+
+        core::ptr::write_volatile(GPIO.byte_add(0x4B4) as *mut u16, 0x0022u16);
+        pcr = core::ptr::read_volatile(GPIO.byte_add(0x4B4) as *mut u16);
 
         // 解除 PWPR 写保护后不再锁定，否则后续 POSRC/PORRC 写入也将被忽略
     }
 
     loop {
-        delay(8_000_000);
+        // delay(4_000_000);
 
         unsafe {
-            // 置位 PC13，输出高电平
-            core::ptr::write_volatile(GPIO.byte_add(0x2C) as *mut u16, 1u16);
+            // 翻转 PC13
+            // core::ptr::write_volatile(GPIO.byte_add(0x2C) as *mut u16, PC13);
+
+            core::ptr::write_volatile(GPIO.byte_add(0x28) as *mut u16, PC13);
+            // core::ptr::write_volatile(GPIO.byte_add(0x2A) as *mut u16, PC13);
         }
     }
 }
