@@ -66,8 +66,8 @@ pub static EXCEPTIONS: [Vector; 14] = [
     }, // 12: DebugMonitor
     Vector { reserved: 0 }, // 13: 预留
     Vector {
-        handler: default_handler,
-    }, // 14: PendSV
+        handler: crate::rtos::context::pendsv_handler,
+    }, // 14: PendSV (RTOS 上下文切换)
     Vector {
         handler: crate::sys_tick_handler,
     }, // 15: SysTick
