@@ -83,6 +83,12 @@ fn heap_bounds() -> (usize, usize) {
     (start, end)
 }
 
+/// 堆容量 (字节, 诊断/启动横幅用)
+pub fn capacity() -> usize {
+    let (start, end) = heap_bounds();
+    end.saturating_sub(start)
+}
+
 /// payload 指针 → 块头地址
 #[inline]
 fn block_of(payload: *mut u8) -> usize {

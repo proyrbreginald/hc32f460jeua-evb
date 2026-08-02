@@ -181,7 +181,7 @@ impl<const U: u8> Uart<U> {
     /// 获取 UART 句柄。`U` 越界 (非 1~4) 时:
     /// 以 `const` 方式使用会在编译期报错。
     pub const fn take() -> Self {
-        assert!(U >= 1 && U <= 4, "USART unit must be 1..=4");
+        assert!(U >= 1 && U <= 4, "USART 单元必须为 1..=4");
         Self { _private: () }
     }
 

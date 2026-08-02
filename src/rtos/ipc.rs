@@ -567,7 +567,7 @@ impl Mailbox {
     /// 消息池在**首次使用**时分配 (惰性初始化, 使 [`Mailbox`] 可作
     /// `static` 使用); 常量求值时仅检查容量合法性。
     pub const fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "Mailbox::new: capacity must be > 0");
+        assert!(capacity > 0, "Mailbox::new: 容量必须大于 0");
         Self {
             inner: UnsafeCell::new(MailboxInner {
                 base: IpcBase::const_new(),
@@ -718,7 +718,7 @@ impl MessageQueue {
     /// 消息池在**首次使用**时分配 (惰性初始化, 使 [`MessageQueue`]
     /// 可作 `static` 使用); 常量求值时仅检查参数合法性。
     pub const fn new(msg_size: usize, max_msgs: usize) -> Self {
-        assert!(msg_size > 0 && max_msgs > 0, "MessageQueue::new: invalid size");
+        assert!(msg_size > 0 && max_msgs > 0, "MessageQueue::new: 参数无效");
         Self {
             inner: UnsafeCell::new(MessageQueueInner {
                 base: IpcBase::const_new(),

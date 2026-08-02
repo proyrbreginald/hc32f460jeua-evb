@@ -26,7 +26,9 @@
 //! - 临界区 = 关中断 (PRIMASK), 调度锁由临界区覆盖;
 //! - 时间片为 0 表示不参与轮转 (RT-Thread 的 `tick` 字段);
 //! - 定时器仅硬定时器 (回调在中断上下文)。
+#![allow(dead_code)]
 
+pub(crate) mod banner;
 pub(crate) mod context;
 pub(crate) mod idle;
 pub(crate) mod ipc;
@@ -75,7 +77,7 @@ pub fn init() {
 
 /// 启动调度器: 切换到最高优先级线程, **永不返回**。
 pub fn start() -> ! {
-    let first = unsafe { sched::highest_ready_thread() }.expect("rtos::start: no thread to run");
+    let first = unsafe { sched::highest_ready_thread() }.expect("rtos::start: 没有可运行的线程");
     unsafe {
         sched::set_current(first);
         context::switch_to_first(&mut (*first).sp as *mut usize as usize);

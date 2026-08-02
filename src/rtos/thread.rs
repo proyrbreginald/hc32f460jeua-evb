@@ -171,13 +171,13 @@ pub fn thread_create(
     entry: extern "C" fn(usize),
     param: usize,
 ) -> &'static Thread {
-    assert!(priority < PRIORITY_MAX, "thread_create: priority out of range");
-    assert!(stack_size >= 256, "thread_create: stack too small");
+    assert!(priority < PRIORITY_MAX, "thread_create: 优先级超出范围");
+    assert!(stack_size >= 256, "thread_create: 栈过小");
 
     // 分配线程栈 (8 字节对齐), 填充溢出检测魔数
-    let layout = Layout::from_size_align(stack_size, 8).expect("bad stack layout");
+    let layout = Layout::from_size_align(stack_size, 8).expect("栈布局无效");
     let stack = unsafe { alloc(layout) };
-    assert!(!stack.is_null(), "thread_create: stack allocation failed");
+    assert!(!stack.is_null(), "thread_create: 栈分配失败");
     unsafe {
         let words = stack as *mut u32;
         for i in 0..stack_size / 4 {
@@ -325,7 +325,7 @@ pub(crate) unsafe fn thread_from_ready(node: *mut ListHead) -> *mut Thread {
 
 /// 释放线程栈与 TCB (由空闲线程的僵尸回收调用)
 pub(crate) unsafe fn free_thread(t: *mut Thread) {
-    let layout = Layout::from_size_align((*t).stack_size, 8).expect("bad layout");
+    let layout = Layout::from_size_align((*t).stack_size, 8).expect("内存布局无效");
     unsafe { dealloc((*t).stack_addr as *mut u8, layout) };
     drop(Box::from_raw(t));
 }
