@@ -57,17 +57,21 @@ pub extern "C" fn sys_tick_handler() {
 /// 应用入口: 由 [`startup::reset_handler`] 在完成硬件与内存初始化后调用
 pub(crate) fn main() -> ! {
     // 硬件初始化 (时钟 200MHz / LED / UART 引脚 / SysTick / USART1)
-    let _uart = hardware_init();
+    let uart = hardware_init();
 
     // RTOS 初始化: 中断优先级 + 空闲线程
     rtos::init();
 
     // 创建演示线程
     rtos::thread_create("led", 2048, 2, 10, led_thread, 0);
+    rtos::thread_create("rx", 2048, 18, 10, rx_thread, 0);
 
     // 周期定时器 (回调在中断上下文执行)
     static TIMER: rtos::Timer = rtos::Timer::new();
     TIMER.start(2000, 2000, timer_cb, 0);
+
+    // 使能 UART1 接收中断 (INTC 通道 INT001, NVIC 优先级 8)
+    uart.enable_rx_interrupt(1, 8);
 
     // 内核启动横幅 (创建线程后、启动前, 就绪统计包含所有线程)
     rtos::banner::show();
@@ -84,6 +88,33 @@ extern "C" fn led_thread(_param: usize) {
         LED.toggle();
         rtos::thread_delay_ms(500);
     }
+}
+
+/// RX 演示线程: 轮询读取中断接收的环形缓冲, 回显收到的数据
+extern "C" fn rx_thread(_param: usize) {
+    let uart = Uart1::take();
+    let mut buf = [0u8; 128];
+    loop {
+        rtos::thread_delay_ms(25);
+        let n = uart.drain_rx(&mut buf);
+        if n > 0 {
+            println!("[RX] {} 字节: {:02X?} \"{}\"", n, &buf[..n], printable(&buf[..n]));
+        }
+    }
+}
+
+/// 转成可打印字符串 (非 ASCII 字节显示为 '.')
+fn printable(bytes: &[u8]) -> alloc::string::String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if (0x20..=0x7E).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
 }
 
 /// 周期定时器回调 (中断上下文): 仅做计数, 不调用阻塞 API

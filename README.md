@@ -158,23 +158,39 @@ continue
 - 终端: `minicom -D /dev/ttyUSB0 -b 115200` 或 `screen /dev/ttyUSB0 115200`
   (建议使用交互式终端; `cat` 读取不及时会丢字节);
 - 启动横幅 (`rtos::banner::show()`): 块字符大标题 + 内核信息面板
-  (CPU 频率/节拍/堆大小/特性/构建日期/rustc 版本/就绪线程数)。
+  (CPU 频率/节拍/堆大小/构建日期/rustc 版本/就绪线程数)。
+
+### UART 中断接收 (USART1)
+
+- `uart.enable_rx_interrupt(irq_n, priority)`: INTC 事件源映射 +
+  NVIC 使能 + `CR1.RIE` (对齐 DDL `INTC_IrqSignIn` / `USART_FuncCmd`);
+- 接收中断把字节写入 512 字节环形缓冲 (溢出丢弃新字节), 应用侧
+  `rx_count()` / `read_rx()` / `drain_rx()` 非阻塞读取;
+- 错误处理对齐 `USART_ClearStatus`: 读 RDR 清 RXNE, 写 CR1 的
+  CPE/CFE/CORE 清 PE/FE/ORE;
+- 外设中断通过 `vector_table::register_irq` 分发 (INT000~007 槽位,
+  向量表在 FLASH, 槽位预置分发入口, 回调运行时注册);
+- 真机验证 (115200, PC→板): ASCII/二进制/混合/连续数据均完整接收,
+  500B 单包零丢失。
 
 ```
-█████  █████      █████  █   █   ███  █████
-█   █    █        █   █  █   █  █      █
-█████    █    ███  █████  █   █   ███   █
-█ █      █        █ █    █   █     █   █
-█  █     █        █  █    ███   ███    █
+ooooooooo.   ooooooooooooo         ooooooooo.                            .   
+`888   `Y88. 8'   888   `8         `888   `Y88.                        .o8   
+ 888   .d88'      888               888   .d88' oooo  oooo   .oooo.o .o888oo 
+ 888ooo88P'       888               888ooo88P'  `888  `888  d88(  "8   888   
+ 888`88b.         888      8888888  888`88b.     888   888  `"Y88b.    888   
+ 888  `88b.       888               888  `88b.   888   888  o.  )88b   888 . 
+o888o  o888o     o888o             o888o  o888o  `V88V"V8P' 8""888P'   "888" 
 
-  RT-RUST v0.1.0  —  RT-Thread 架构的 Rust RTOS (HC32F460JEUA)
-  ...
-  cpu        : Cortex-M4F @ 200 MHz
-  tick       : 1 ms (1000 Hz)
-  heap       : 179 KB
-  ...
-  build      : 2026-08-02  [release]  rustc 1.97.1 (...)
-  ready      : 2 threads  (map 0x80000004)
+hc32f460jeua-evb v0.1.0  —  RT-Thread 架构的 Rust RTOS (HC32F460JEUA)
+── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+处理器 : Cortex-M4F @ 200 MHz
+节拍 : 1 ms (1000 Hz)
+优先级 : 32 级 (空闲 = 31)
+堆 : 179 KB
+── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+构建 : 2026-08-02 [debug] rustc 1.97.1 (8bab26f4f 2026-07-14)
+就绪 : 2 个线程 (位图 0x80000004)
 ```
 
 > 提示: 横幅的块字符与中文均为 UTF-8 字节流, 终端需设置为 UTF-8 编码
