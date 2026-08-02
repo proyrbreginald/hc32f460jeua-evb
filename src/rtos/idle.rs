@@ -18,7 +18,7 @@ static DEFUNCT: KCell<ListHead> = KCell::new(ListHead::const_new());
 
 /// 临界区内: 线程进入僵尸队列
 pub(crate) unsafe fn defunct_push(t: *mut Thread) {
-    unsafe { (*DEFUNCT.get()).push_back(&mut (*t).defunct_node) };
+    unsafe { (*DEFUNCT.get_mut()).push_back(&mut (*t).defunct_node) };
 }
 
 /// 创建空闲线程 (由 [`crate::rtos::init`] 调用)
@@ -40,7 +40,7 @@ extern "C" fn idle_entry(_param: usize) {
 fn defunct_execute() {
     loop {
         let t = critical_section::with(|| unsafe {
-            let node = (*DEFUNCT.get()).pop_first()?;
+            let node = (*DEFUNCT.get_mut()).pop_first()?;
             Some(thread_from_defunct(node))
         });
         let Some(t) = t else { break };

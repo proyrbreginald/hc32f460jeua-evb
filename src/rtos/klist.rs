@@ -59,6 +59,16 @@ impl<T> KCell<T> {
     pub unsafe fn get(&self) -> *mut T {
         self.0.get()
     }
+
+    /// 临界区内: 获取可变引用
+    ///
+    /// 写操作请优先使用本方法: 通过共享引用派生裸指针再写入可能被
+    /// 编译器视为死存储而消除 (静态对象无可变借用, 写入无别名依据)。
+    #[inline]
+    #[allow(clippy::mut_from_ref)] // 内核对象经 UnsafeCell 由临界区保护
+    pub unsafe fn get_mut(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
 }
 
 impl ListHead {

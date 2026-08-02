@@ -427,6 +427,17 @@ static RX_RINGS: [RxRingCell; 4] = [
     RxRingCell(core::cell::UnsafeCell::new(RxRing::new())),
 ];
 
+/// 各 USART 单元的"数据到达"信号量 (ISR 释放, 应用侧等待)
+///
+/// 避免轮询 RX 缓冲: 应用线程在信号量上阻塞, ISR 每收到一个字节
+/// 释放一次 (计数截断, 缓冲满时语义退化为"有数据"提示)。
+static RX_SEMS: [crate::rtos::Semaphore; 4] = [
+    crate::rtos::Semaphore::new(0, 255),
+    crate::rtos::Semaphore::new(0, 255),
+    crate::rtos::Semaphore::new(0, 255),
+    crate::rtos::Semaphore::new(0, 255),
+];
+
 /// 接收中断 ISR (对齐 DDL 示例 USART_RxFull_IrqCallback + USART_RxError_IrqCallback)
 ///
 /// - RXNE: 读 RDR 取数据入环形缓冲 (读 RDR 自动清 RXNE);
@@ -444,6 +455,8 @@ unsafe extern "C" fn rx_irq_handler<const U: u8>() {
             let ring = &mut *RX_RINGS[U as usize - 1].0.get();
             if sr & SR_RXNE != 0 {
                 ring.push(byte);
+                // 通知等待线程 (信号量计数截断: 缓冲满时退化为"有数据"提示)
+                RX_SEMS[U as usize - 1].release();
             }
             if sr & (SR_PE | SR_FE | SR_ORE) != 0 {
                 // 读-改-写 CR1 清除错误标志 (CPE/CFE/CORE, 对齐 USART_ClearStatus)
@@ -453,6 +466,21 @@ unsafe extern "C" fn rx_irq_handler<const U: u8>() {
                     cr1 | CR1_CPE | CR1_CFE | CR1_CORE,
                 );
             }
+        }
+    }
+}
+
+impl<const U: u8> Uart<U> {
+    /// 阻塞等待一个接收字节 (中断驱动, 无需轮询)
+    ///
+    /// 挂起在数据到达信号量上, 由 RX ISR 唤醒; 收到字节即返回。
+    /// 仅可在线程上下文调用。
+    pub fn read_rx_blocking(&self) -> u8 {
+        loop {
+            if let Some(b) = self.read_rx() {
+                return b;
+            }
+            let _ = RX_SEMS[U as usize - 1].take(crate::rtos::Timeout::Forever);
         }
     }
 }

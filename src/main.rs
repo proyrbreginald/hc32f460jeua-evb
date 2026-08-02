@@ -25,6 +25,7 @@ mod console;          // 控制台: 打印锁 (优先级继承) + 原子整行�
 mod rtos;
 // -- 应用 --
 mod banner; // 启动横幅 (应用层, 依赖 clk/heap/rtos 公共状态)
+mod shell;  // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use gpio::{Config, Drive, Gpio, Level, Mode, Pin, PortA, PortC};
@@ -65,9 +66,9 @@ pub(crate) fn main() -> ! {
     rtos::init();
 
     // 创建演示线程
-    rtos::thread_create("led", 2048, 2, 10, led_thread, 0);
-    rtos::thread_create("selftest", 2048, 15, 0, selftest_thread, 0);
-    rtos::thread_create("rx", 2048, 18, 10, rx_thread, 0);
+    rtos::thread_create("led", 4096, 2, 10, led_thread, 0);
+    rtos::thread_create("selftest", 4096, 15, 0, selftest_thread, 0);
+    rtos::thread_create("shell", 4096, 18, 10, shell::shell_entry, 0);
 
     // 周期定时器 (回调在中断上下文执行)
     static TIMER: rtos::Timer = rtos::Timer::new();
@@ -91,33 +92,6 @@ extern "C" fn led_thread(_param: usize) {
         LED.toggle();
         rtos::thread_delay_ms(500);
     }
-}
-
-/// RX 演示线程: 轮询读取中断接收的环形缓冲, 回显收到的数据
-extern "C" fn rx_thread(_param: usize) {
-    let uart = Uart1::take();
-    let mut buf = [0u8; 128];
-    loop {
-        rtos::thread_delay_ms(25);
-        let n = uart.drain_rx(&mut buf);
-        if n > 0 {
-            println!("[RX] {} 字节: {:02X?} \"{}\"", n, &buf[..n], printable(&buf[..n]));
-        }
-    }
-}
-
-/// 转成可打印字符串 (非 ASCII 字节显示为 '.')
-fn printable(bytes: &[u8]) -> alloc::string::String {
-    bytes
-        .iter()
-        .map(|&b| {
-            if (0x20..=0x7E).contains(&b) {
-                b as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
 }
 
 // ---- rtos 自检 (IPC 各原语 + 线程生命周期) ----

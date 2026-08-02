@@ -160,6 +160,17 @@ continue
 - 启动横幅 (`banner::show()`): 块字符大标题 + 内核信息面板
   (CPU 频率/节拍/堆大小/构建日期/rustc 版本/就绪线程数)。
 
+### 终端 (仿 Ubuntu shell)
+
+- 启动后先登录: 用户名 + 密码 (密码不显示), 配置见 `shell.conf`
+  (编译期经 build.rs 注入, 改密码无需改代码);
+- 密码错误 3 次 (可配置) 提示 "Too many login failures";
+- 命令提示符 `root@HC32F460JEUA:~$` (用户名@芯片型号);
+- 命令: `help` / `sysinfo` / `uptime` / `ps` / `free` / `echo` /
+  `led on|off` / `clear` / `whoami` / `reboot` / `logout|exit`;
+- 输入: 回车提交, 退格删除, Ctrl+C 清行;
+- 输入采用中断驱动 (RX ISR 释放信号量, 线程阻塞等待, 无轮询)。
+
 ### 内核自检 (selftest)
 
 - `selftest_thread` 在启动后自动运行, 依次验证信号量 / 互斥量 (递归) /
@@ -234,10 +245,23 @@ python3 -m venv .venv && .venv/bin/pip install pyocd
 
 - banner 移出 `rtos` 内核 (应用层 `src/banner.rs`), 内核不再依赖
   `clk`/`heap` 等应用模块;
-- `klist.rs` 新增 `container_of!` 宏, 统一 5 处"链表节点 → 内核对象"
-  转换 (thread/timer/ipc/idle);
+- `klist.rs` 新增 `container_of!` 宏与 `KCell::get_mut`, 统一 5 处
+  "链表节点 → 内核对象" 转换 (thread/timer/ipc/idle);
 - `thread.rs` 提取公共辅助: `wakeup_thread` (唤醒统一路径) /
   `resched_needed` (优先级抢占判定) / `blocked_wait` (阻塞恢复判定),
   消除 `ipc.rs` 6 处重复的"调度 + 超时检查"模式与 3 处唤醒序列;
-- `context.rs` 统一寄存器写入辅助; 全项目修复历史 clippy 警告
-  (identity_op / collapsible_if / 多余 cast), 当前 0 警告 0 错误。
+- `timer::check` 的"摘除 + 回调"改为临界区原子 (消除线程删除与
+  定时器回调之间的 use-after-free 竞态);
+- `context.rs` 统一寄存器写入辅助; 全项目修复历史 clippy 警告,
+  当前 0 警告 0 错误。
+
+## 终端 (shell) 调试中修复的问题
+
+- **浮点格式化崩溃**: `core` 的浮点格式化 (flt2dec/dragon) 在
+  no_std 裸机环境下导致内存破坏 (表现为系统崩溃/输出垃圾字节)。
+  `free` 命令改用整数百分比计算, 完全规避浮点格式化;
+- **静态链表写入被消除**: 静态对象的 `KCell` 链表写入 (thread_create
+  的线程登记) 曾因"写后无读"被编译器判定为死存储而消除 (ps 列表为空),
+  通过 `get_mut` + volatile 读屏障强制保留;
+- **RX 输入中断驱动化**: read_line 从 5ms 轮询改为信号量阻塞等待
+  (RX ISR 释放), 消除高频定时器操作对调度的扰动。

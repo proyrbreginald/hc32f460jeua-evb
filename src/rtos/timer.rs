@@ -156,34 +156,40 @@ unsafe fn insert_sorted(t: &mut TimerInner) {
 }
 
 /// 检查并触发到期定时器 (由时钟中断调用)
+///
+/// "摘除 + 回调"在**同一个临界区内**原子完成: 若回调在临界区外执行,
+/// 线程删除路径 (stop_internal + 僵尸回收) 可能在其间释放回调参数
+/// 引用的对象 (如线程 TCB), 造成 use-after-free。回调须保持简短,
+/// 且不得在回调内阻塞 (临界区内不可挂起)。
 pub(crate) fn check() {
     loop {
-        // 临界区内摘除到期定时器
-        let due = critical_section::with(|| unsafe {
+        let done = critical_section::with(|| unsafe {
             let list = &mut *TIMER_LIST.get();
-            let node = list.first()?;
+            let Some(node) = list.first() else {
+                return false;
+            };
             let t = timer_from_node(node);
             // tick 回绕安全判定: (now - timeout) 视为 i32 时非负即到期
             if (tick().wrapping_sub((*t).timeout_tick) as i32) >= 0 {
                 (*node).remove();
-                Some(t)
+                // 回调在临界区内执行: 与 delete/stop 互斥, 参数对象安全
+                // (回调须简短, 不得在回调内阻塞)
+                let cb = (*t).callback;
+                let param = (*t).param;
+                cb(param);
+                // 周期定时器重新入队 (回调内已 stop/重新 start 时跳过)
+                let t = &mut *t;
+                if t.started && t.period_ticks != 0 && !t.node.is_linked() {
+                    t.timeout_tick = tick().wrapping_add(t.period_ticks);
+                    insert_sorted(t);
+                }
+                true
             } else {
-                None
+                false
             }
         });
-        let Some(t) = due else { break };
-
-        // 回调在临界区外执行 (可被高优先级中断抢占 / 调用内核 API)
-        let (cb, param) = unsafe { ((*t).callback, (*t).param) };
-        cb(param);
-
-        // 周期定时器重新入队 (回调内已 stop/重新 start 时跳过)
-        critical_section::with(|| unsafe {
-            let t = &mut *t;
-            if t.started && t.period_ticks != 0 && !t.node.is_linked() {
-                t.timeout_tick = tick().wrapping_add(t.period_ticks);
-                insert_sorted(t);
-            }
-        });
+        if !done {
+            break;
+        }
     }
 }
