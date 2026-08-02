@@ -17,10 +17,12 @@ fn main() {
     );
 
     // rustc 版本
-    if let Ok(out) = std::process::Command::new("rustc").arg("--version").output() {
-        if let Ok(s) = String::from_utf8(out.stdout) {
-            println!("cargo:rustc-env=RTOS_RUSTC={}", s.trim());
-        }
+    if let Ok(out) = std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        && let Ok(s) = String::from_utf8(out.stdout)
+    {
+        println!("cargo:rustc-env=RTOS_RUSTC={}", s.trim());
     }
 }
 

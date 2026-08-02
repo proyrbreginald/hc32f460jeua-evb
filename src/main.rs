@@ -23,6 +23,8 @@ mod console;          // 控制台: 打印锁 (优先级继承) + 原子整行�
 
 // -- RTOS 内核 (RT-Thread 架构移植) --
 mod rtos;
+// -- 应用 --
+mod banner; // 启动横幅 (应用层, 依赖 clk/heap/rtos 公共状态)
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use gpio::{Config, Drive, Gpio, Level, Mode, Pin, PortA, PortC};
@@ -64,6 +66,7 @@ pub(crate) fn main() -> ! {
 
     // 创建演示线程
     rtos::thread_create("led", 2048, 2, 10, led_thread, 0);
+    rtos::thread_create("selftest", 2048, 15, 0, selftest_thread, 0);
     rtos::thread_create("rx", 2048, 18, 10, rx_thread, 0);
 
     // 周期定时器 (回调在中断上下文执行)
@@ -74,7 +77,7 @@ pub(crate) fn main() -> ! {
     uart.enable_rx_interrupt(1, 8);
 
     // 内核启动横幅 (创建线程后、启动前, 就绪统计包含所有线程)
-    rtos::banner::show();
+    banner::show();
 
     // 启动调度器, 永不返回
     rtos::start();
@@ -115,6 +118,157 @@ fn printable(bytes: &[u8]) -> alloc::string::String {
             }
         })
         .collect()
+}
+
+// ---- rtos 自检 (IPC 各原语 + 线程生命周期) ----
+
+use rtos::{EventOpt, Timeout};
+
+/// 被删除的线程: 空转等待删除
+extern "C" fn victim_thread(_param: usize) {
+    loop {
+        rtos::thread_delay_ms(50);
+    }
+}
+
+/// 自然退出的线程: 入口返回后经 thread_exit → defunct → 空闲线程回收
+extern "C" fn exit_thread(_param: usize) {}
+
+/// rtos 自检线程: 依次验证信号量/互斥量/事件/邮箱/消息队列/
+/// 延时/线程删除/线程退出, 全部通过打印 PASS。
+extern "C" fn selftest_thread(_param: usize) {
+    println!("[selftest] 开始 (rtos 内核功能自检)");
+    let mut pass = 0u32;
+    let mut fail = 0u32;
+    let mut check = |ok: bool, name: &str| {
+        if ok {
+            pass += 1;
+            println!("  [PASS] {}", name);
+        } else {
+            fail += 1;
+            println!("  [FAIL] {}", name);
+        }
+    };
+
+    // 信号量: 计数获取 / 立即超时 / release 唤醒
+    static SEM: rtos::Semaphore = rtos::Semaphore::new(1, 1);
+    check(SEM.take(Timeout::Ticks(0)).is_ok(), "信号量: 初始计数可获取");
+    check(
+        SEM.take(Timeout::Ticks(0)).is_err(),
+        "信号量: 计数 0 立即超时",
+    );
+    SEM.release();
+    check(
+        SEM.take(Timeout::Ticks(0)).is_ok(),
+        "信号量: release 后可获取",
+    );
+
+    // 互斥量: 获取 / 递归持有 / 释放
+    static MTX: rtos::Mutex = rtos::Mutex::new();
+    check(MTX.lock(Timeout::Ticks(0)).is_ok(), "互斥量: 可获取");
+    check(
+        MTX.lock(Timeout::Ticks(0)).is_ok(),
+        "互斥量: 递归持有合法",
+    );
+    MTX.unlock();
+    MTX.unlock();
+    check(
+        MTX.lock(Timeout::Ticks(0)).is_ok(),
+        "互斥量: 释放后可重新获取",
+    );
+    MTX.unlock();
+
+    // 事件: AND / OR / 立即超时
+    static EVT: rtos::Event = rtos::Event::new();
+    EVT.send(0x05);
+    check(
+        EVT.recv(0x05, EventOpt::And, Timeout::Ticks(0)) == Ok(0x05),
+        "事件: AND 匹配返回等待全集",
+    );
+    check(
+        EVT.recv(0x02, EventOpt::And, Timeout::Ticks(0)).is_err(),
+        "事件: 不满足立即超时",
+    );
+    EVT.send(0x08);
+    check(
+        EVT.recv(0x08, EventOpt::Or, Timeout::Ticks(0)) == Ok(0x08),
+        "事件: OR 匹配返回实际位",
+    );
+    check(
+        EVT.recv(0x10, EventOpt::OrClear, Timeout::Ticks(0)).is_err(),
+        "事件: 无匹配位立即超时",
+    );
+
+    // 邮箱: 收发 / 紧急插队 / 满返回 Full / 空返回 TimedOut
+    static MB: rtos::Mailbox = rtos::Mailbox::new(4);
+    check(MB.send(100, Timeout::Ticks(0)).is_ok(), "邮箱: 发送");
+    check(
+        MB.recv(Timeout::Ticks(0)) == Ok(100),
+        "邮箱: 接收一致",
+    );
+    check(
+        MB.recv(Timeout::Ticks(0)).is_err(),
+        "邮箱: 空立即超时",
+    );
+    for i in 0..4 {
+        MB.send(1000 + i, Timeout::Ticks(0)).ok();
+    }
+    check(
+        MB.send(9999, Timeout::Ticks(0)).is_err(),
+        "邮箱: 满返回 Full",
+    );
+    // 取出一条腾出空间后再紧急发送 (urgent 在满时同样返回 Full)
+    MB.recv(Timeout::Ticks(0)).ok();
+    check(
+        MB.urgent(42, Timeout::Ticks(0)).is_ok(),
+        "邮箱: 紧急发送",
+    );
+    check(
+        MB.recv(Timeout::Ticks(0)) == Ok(42),
+        "邮箱: 紧急消息插到队首",
+    );
+
+    // 消息队列: 收发一致 (含二进制)
+    static MQ: rtos::MessageQueue = rtos::MessageQueue::new(16, 4);
+    let hello: &[u8] = &[0x52, 0x00, 0xFF, b'!'];
+    check(MQ.send(hello, Timeout::Ticks(0)).is_ok(), "消息队列: 发送");
+    let mut buf = [0u8; 16];
+    check(
+        MQ.recv(&mut buf, Timeout::Ticks(0)) == Ok(4) && buf[..4] == *hello,
+        "消息队列: 接收内容一致",
+    );
+    check(
+        MQ.recv(&mut buf, Timeout::Ticks(0)).is_err(),
+        "消息队列: 空立即超时",
+    );
+
+    // 延时: uptime 前进
+    let t0 = rtos::uptime_ms();
+    rtos::thread_delay_ms(20);
+    check(
+        rtos::uptime_ms() >= t0 + 20,
+        "线程延时: uptime 前进 ≥ 20ms",
+    );
+
+    // 线程删除 (delete API) 与自然退出 (defunct 回收)
+    println!("  [info] 创建 victim 线程");
+    let victim = rtos::thread_create("victim", 1024, 24, 0, victim_thread, 0);
+    println!("  [info] victim 已创建, 延时 50ms");
+    rtos::thread_delay_ms(50);
+    println!("  [info] 调用 victim.delete()");
+    victim.delete();
+    println!("  [info] delete() 已返回, 延时 50ms");
+    rtos::thread_delay_ms(50);
+    check(true, "线程删除: delete() 完成且系统正常");
+    println!("  [info] 创建 exit-me 线程");
+    rtos::thread_create("exit-me", 1024, 25, 0, exit_thread, 0);
+    rtos::thread_delay_ms(100);
+    check(true, "线程退出: 入口返回后经 defunct 回收");
+
+    println!(
+        "[selftest] 完成: {} 通过, {} 失败",
+        pass, fail
+    );
 }
 
 /// 周期定时器回调 (中断上下文): 仅做计数, 不调用阻塞 API

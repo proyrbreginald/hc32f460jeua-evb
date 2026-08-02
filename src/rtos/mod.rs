@@ -28,7 +28,6 @@
 //! - 定时器仅硬定时器 (回调在中断上下文)。
 #![allow(dead_code)]
 
-pub(crate) mod banner;
 pub(crate) mod context;
 pub(crate) mod idle;
 pub(crate) mod ipc;
@@ -54,7 +53,7 @@ pub fn tick() -> u32 {
     TICK.load(Ordering::Relaxed)
 }
 
-/// 调度器是否已启动 (`[`start`] 之后)
+/// 调度器是否已启动 (`start` 之后)
 ///
 /// 启动前系统为单执行流 (main), 无并发; 中断上下文返回当前被打断
 /// 的线程 (非空), 因此该判定只对"启动前"为真。

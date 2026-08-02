@@ -50,5 +50,5 @@ fn defunct_execute() {
 
 /// 僵尸节点 → 线程
 unsafe fn thread_from_defunct(node: *mut ListHead) -> *mut Thread {
-    (node as *mut u8).sub(core::mem::offset_of!(Thread, defunct_node)) as *mut Thread
+    crate::rtos::klist::container_of!(node, Thread, defunct_node)
 }

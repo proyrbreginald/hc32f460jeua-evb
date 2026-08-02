@@ -17,6 +17,17 @@
 
 use core::ptr;
 
+/// 节点指针 → 包含该节点的内核对象指针 (RT-Thread `rt_list_entry` 移植)
+///
+/// 各模块的 `*_from_node` 转换统一走此宏, 避免 offset_of 计算分散。
+macro_rules! container_of {
+    ($node:expr, $ty:ty, $field:ident) => {{
+        let node = $node as *mut u8;
+        node.sub(core::mem::offset_of!($ty, $field)) as *mut $ty
+    }};
+}
+pub(crate) use container_of;
+
 /// 双向链表节点
 #[derive(Clone, Copy)]
 pub(crate) struct ListHead {

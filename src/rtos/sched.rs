@@ -63,7 +63,9 @@ pub(crate) fn ready_thread_count() -> usize {
         }
         n
     })
-}/// 设置当前线程 (调度器启动时)
+}
+
+/// 设置当前线程 (调度器启动时)
 #[inline]
 pub(crate) fn set_current(t: *mut Thread) {
     CURRENT.store(t, Ordering::Relaxed);

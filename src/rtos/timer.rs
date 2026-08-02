@@ -131,7 +131,7 @@ impl Timer {
 
 /// 定时器节点 → 定时器对象
 unsafe fn timer_from_node(node: *mut ListHead) -> *mut TimerInner {
-    (node as *mut u8).sub(core::mem::offset_of!(TimerInner, node)) as *mut TimerInner
+    crate::rtos::klist::container_of!(node, TimerInner, node)
 }
 
 /// 临界区内: 按超时时刻升序插入

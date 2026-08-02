@@ -30,7 +30,8 @@ use crate::critical_section;
 use crate::rtos::klist::ListHead;
 use crate::rtos::sched;
 use crate::rtos::thread::{
-    thread_from_suspend, thread_timer_cb, Thread, TS_READY, TS_SUSPEND,
+    blocked_wait, resched_needed, thread_from_suspend, thread_timer_cb, wakeup_thread, Thread,
+    TS_SUSPEND,
 };
 
 /// 阻塞超时
@@ -131,20 +132,12 @@ unsafe fn suspend_prio(list: *mut ListHead, ticks: u32) {
 
 /// 临界区内: 唤醒挂起队列头部等待者
 ///
-/// 停止其线程定时器, 移入就绪队列; 返回被唤醒线程。
+/// 返回被唤醒线程 (由调用方决定是否需要重新调度)。
 unsafe fn wake_head(list: *mut ListHead) -> Option<*mut Thread> {
     let node = (*list).pop_first()?;
     let w = thread_from_suspend(node);
-    (*w).thread_timer.stop_internal();
-    (*w).state = TS_READY;
-    sched::ready_insert(w);
+    wakeup_thread(w);
     Some(w)
-}
-
-/// 被唤醒线程是否比当前线程更紧急 (需要重新调度)
-fn need_resched(w: *mut Thread) -> bool {
-    let cur = sched::current();
-    !cur.is_null() && unsafe { (*w).current_priority < (*cur).current_priority }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,11 +185,8 @@ impl Semaphore {
                 blocked = true;
             }
         });
-        if blocked {
-            sched::schedule();
-            if unsafe { (*sched::current()).error } != 0 {
-                return Err(Error::TimedOut);
-            }
+        if blocked && blocked_wait() {
+            return Err(Error::TimedOut);
         }
         outcome
     }
@@ -206,7 +196,7 @@ impl Semaphore {
         let need = critical_section::with(|| unsafe {
             let s = &mut *self.ptr();
             if let Some(w) = wake_head(&mut s.base.suspend_list) {
-                need_resched(w)
+                resched_needed(w)
             } else {
                 if s.value < s.max_value {
                     s.value += 1;
@@ -288,11 +278,8 @@ impl Mutex {
                 blocked = true;
             }
         });
-        if blocked {
-            sched::schedule();
-            if unsafe { (*sched::current()).error } != 0 {
-                return Err(Error::TimedOut);
-            }
+        if blocked && blocked_wait() {
+            return Err(Error::TimedOut);
         }
         outcome
     }
@@ -323,7 +310,7 @@ impl Mutex {
                 m.owner = w;
                 m.hold = 1;
                 (*w).taken_list.insert_after(&mut m.taken_node);
-                need_resched(w)
+                resched_needed(w)
             } else {
                 false
             }
@@ -380,7 +367,7 @@ pub(crate) unsafe fn mutex_release_all_held(t: *mut Thread) {
 
 /// taken 节点 → 互斥量
 unsafe fn mutex_from_taken(node: *mut ListHead) -> *mut MutexInner {
-    (node as *mut u8).sub(core::mem::offset_of!(MutexInner, taken_node)) as *mut MutexInner
+    crate::rtos::klist::container_of!(node, MutexInner, taken_node)
 }
 
 // ---------------------------------------------------------------------------
@@ -473,10 +460,8 @@ impl Event {
                     // 唤醒等待者
                     (*node).remove();
                     (*w).event_recv_bits = bits;
-                    (*w).thread_timer.stop_internal();
-                    (*w).state = TS_READY;
-                    sched::ready_insert(w);
-                    need |= need_resched(w);
+                    wakeup_thread(w);
+                    need |= resched_needed(w);
                 }
                 n = next;
             }
@@ -499,7 +484,9 @@ impl Event {
                 (e.set & wanted) != 0
             };
             if matched {
-                let bits = e.set & wanted;
+                // 返回的匹配位: AND = 等待的全集合, OR = 实际置位位
+                // (与 Event::send 唤醒路径的 event_recv_bits 语义一致)
+                let bits = if opt.is_and() { wanted } else { e.set & wanted };
                 if opt.clear() {
                     if opt.is_and() {
                         e.set &= !wanted;
@@ -519,8 +506,7 @@ impl Event {
             }
         });
         if blocked {
-            sched::schedule();
-            if unsafe { (*sched::current()).error } != 0 {
+            if blocked_wait() {
                 return Err(Error::TimedOut);
             }
             // 返回唤醒时匹配的事件位 (由 Event::send 记录)
@@ -609,7 +595,7 @@ impl Mailbox {
                 mb.count += 1;
                 outcome = Ok(());
                 if let Some(w) = wake_head(&mut mb.base.suspend_list) {
-                    need = need_resched(w);
+                    need = resched_needed(w);
                 }
             } else if timeout == Timeout::Ticks(0) {
                 outcome = Err(Error::Full);
@@ -618,10 +604,10 @@ impl Mailbox {
                 blocked = true;
             }
         });
-        if need || blocked {
+        if need {
             sched::schedule();
         }
-        if blocked && unsafe { (*sched::current()).error } != 0 {
+        if blocked && blocked_wait() {
             return Err(Error::TimedOut);
         }
         outcome
@@ -641,7 +627,7 @@ impl Mailbox {
                 mb.count -= 1;
                 outcome = Ok(msg);
                 if let Some(w) = wake_head(&mut mb.sender_list) {
-                    need = need_resched(w);
+                    need = resched_needed(w);
                 }
             } else if timeout == Timeout::Ticks(0) {
                 outcome = Err(Error::TimedOut);
@@ -650,10 +636,10 @@ impl Mailbox {
                 blocked = true;
             }
         });
-        if need || blocked {
+        if need {
             sched::schedule();
         }
-        if blocked && unsafe { (*sched::current()).error } != 0 {
+        if blocked && blocked_wait() {
             return Err(Error::TimedOut);
         }
         outcome
@@ -778,7 +764,7 @@ impl MessageQueue {
                 q.count += 1;
                 outcome = Ok(());
                 if let Some(w) = wake_head(&mut q.base.suspend_list) {
-                    need = need_resched(w);
+                    need = resched_needed(w);
                 }
             } else if timeout == Timeout::Ticks(0) {
                 outcome = Err(Error::Full);
@@ -787,10 +773,10 @@ impl MessageQueue {
                 blocked = true;
             }
         });
-        if need || blocked {
+        if need {
             sched::schedule();
         }
-        if blocked && unsafe { (*sched::current()).error } != 0 {
+        if blocked && blocked_wait() {
             return Err(Error::TimedOut);
         }
         outcome
@@ -815,7 +801,7 @@ impl MessageQueue {
                 q.free = b;
                 outcome = Ok(len);
                 if let Some(w) = wake_head(&mut q.sender_list) {
-                    need = need_resched(w);
+                    need = resched_needed(w);
                 }
             } else if timeout == Timeout::Ticks(0) {
                 outcome = Err(Error::TimedOut);
@@ -824,10 +810,10 @@ impl MessageQueue {
                 blocked = true;
             }
         });
-        if need || blocked {
+        if need {
             sched::schedule();
         }
-        if blocked && unsafe { (*sched::current()).error } != 0 {
+        if blocked && blocked_wait() {
             return Err(Error::TimedOut);
         }
         outcome

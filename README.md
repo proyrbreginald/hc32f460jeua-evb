@@ -19,9 +19,10 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 
 ```
 src/
-├── main.rs            # 应用入口: 硬件初始化 + RTOS 演示 (14 线程 + 定时器)
+├── main.rs            # 应用入口: 硬件初始化 + 演示线程 (led/selftest/rx) + 定时器
+├── banner.rs          # 启动横幅 (应用层): 块字符大标题 + 内核信息面板
 ├── startup.rs         # 复位入口: SRAM 等待周期/FPU/.data/.bss → main
-├── vector_table.rs    # 复位/异常/144 外设中断向量表
+├── vector_table.rs    # 复位/异常/144 外设中断向量表 + INT000~007 中断分发
 ├── panic.rs           # panic 与硬件 fault 诊断 (CFSR/HFSR 解码, 栈回溯)
 ├── critical_section.rs# PRIMASK 临界区 (嵌套安全, 中断安全的基础)
 ├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
@@ -29,15 +30,14 @@ src/
 ├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
 ├── gpio.rs            # GPIO: 寄存器→端口→引脚→接口四层, const 泛型校验
 ├── systick.rs         # SysTick 1kHz 节拍 (RTOS 时钟源)
-├── uart.rs            # USART1~4 驱动 (波特率/过采样/小数分频)
+├── uart.rs            # USART1~4 驱动 (波特率/过采样) + 中断接收环形缓冲
 ├── console.rs         # 控制台: 打印锁 (优先级继承) + 原子整行输出
 ├── build.rs           # 构建元数据 (日期/rustc 版本, 供启动横幅使用)
-└── rtos/              # RTOS 内核 (RT-Thread 架构移植)
+└── rtos/              # RTOS 内核 (RT-Thread 架构移植, 不依赖应用模块)
     ├── mod.rs         # 公共 API: init/start/tick/thread_create 等
-    ├── banner.rs      # 启动横幅: 块字符大标题 + 内核信息面板
-    ├── klist.rs       # 侵入式双向链表 (rt_list 移植, 临界区内使用)
+    ├── klist.rs       # 侵入式链表 + container_of 宏 (rt_list 移植)
     ├── sched.rs       # 位图就绪表 (32 级) + 时间片轮转 + 栈溢出检测
-    ├── thread.rs      # TCB/创建/删除/挂起/延时/thread_exit
+    ├── thread.rs      # TCB/创建/删除/挂起/延时 + 公共唤醒/调度判定辅助
     ├── timer.rs       # 有序链表硬定时器 (tick 回绕安全)
     ├── ipc.rs         # 信号量/互斥量(优先级继承)/事件/邮箱/消息队列
     ├── idle.rs        # 空闲线程 (wfi) + 僵尸线程回收
@@ -157,8 +157,15 @@ continue
 - 板载 USB 串口 (CH340, 如 `/dev/ttyUSB0`),115200 8N1;
 - 终端: `minicom -D /dev/ttyUSB0 -b 115200` 或 `screen /dev/ttyUSB0 115200`
   (建议使用交互式终端; `cat` 读取不及时会丢字节);
-- 启动横幅 (`rtos::banner::show()`): 块字符大标题 + 内核信息面板
+- 启动横幅 (`banner::show()`): 块字符大标题 + 内核信息面板
   (CPU 频率/节拍/堆大小/构建日期/rustc 版本/就绪线程数)。
+
+### 内核自检 (selftest)
+
+- `selftest_thread` 在启动后自动运行, 依次验证信号量 / 互斥量 (递归) /
+  事件 (AND/OR/清除) / 邮箱 (含紧急插队) / 消息队列 (含二进制) /
+  线程延时 / 线程删除 (delete) / 线程自然退出 (defunct 回收);
+- 全部通过输出 `[selftest] 完成: N 通过, 0 失败` (失败项逐条标 `[FAIL]`)。
 
 ### UART 中断接收 (USART1)
 
@@ -216,9 +223,21 @@ python3 -m venv .venv && .venv/bin/pip install pyocd
 ## 验证记录
 
 - debug 与 release 构建均已在真机烧录验证:0 panic,稳定运行 60s+;
-- 演示覆盖:时间片轮转、线程生命周期 (挂起/恢复/删除/thread_exit)、
-  优先级继承互斥量、信号量、事件 (含超时)、邮箱、消息队列、周期定时器;
-- 启动横幅完整输出 (debug/release,含构建日期与 rustc 版本);
+- 内核自检 (selftest) 连续 5 次复位全部 22 项通过;
+- RX 中断接收:ASCII/二进制/混合数据完整回显, 90 秒后系统仍正常响应;
+- 大包高速输入 (超 512B 缓冲) 按设计丢弃新字节, 不崩溃;
 - 已知现象:115200 无流控下 PC 端读取不及时 (如 `cat`) 会丢字节
   (表现为行尾截断, 非打印设计缺陷), 建议使用交互式终端查看;
   启动横幅经 `screen` 捕获验证零丢失。
+
+## 代码整理与设计优化记录
+
+- banner 移出 `rtos` 内核 (应用层 `src/banner.rs`), 内核不再依赖
+  `clk`/`heap` 等应用模块;
+- `klist.rs` 新增 `container_of!` 宏, 统一 5 处"链表节点 → 内核对象"
+  转换 (thread/timer/ipc/idle);
+- `thread.rs` 提取公共辅助: `wakeup_thread` (唤醒统一路径) /
+  `resched_needed` (优先级抢占判定) / `blocked_wait` (阻塞恢复判定),
+  消除 `ipc.rs` 6 处重复的"调度 + 超时检查"模式与 3 处唤醒序列;
+- `context.rs` 统一寄存器写入辅助; 全项目修复历史 clippy 警告
+  (identity_op / collapsible_if / 多余 cast), 当前 0 警告 0 错误。

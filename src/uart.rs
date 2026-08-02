@@ -362,7 +362,7 @@ impl<const U: u8> Uart<U> {
             );
             core::ptr::write_volatile(
                 (NVIC_IPR_BASE + irq_n) as *mut u8,
-                ((priority & 0x0F) as u8) << 4,
+                (priority & 0x0F) << 4,
             );
 
             // 3. CR1.RIE: 接收满 + 接收错误中断使能 (对齐 USART_FuncCmd(USART_INT_RX))
@@ -437,7 +437,7 @@ static RX_RINGS: [RxRingCell; 4] = [
 unsafe extern "C" fn rx_irq_handler<const U: u8>() {
     unsafe {
         let base = USART_BASES[U as usize - 1];
-        let sr = core::ptr::read_volatile((base + 0x00) as *const u32);
+        let sr = core::ptr::read_volatile(base as *const u32);
         if sr & (SR_RXNE | SR_PE | SR_FE | SR_ORE) != 0 {
             // 读 RDR: 清 RXNE/ORE, 同时取出数据 (对齐示例先读再判错)
             let byte = core::ptr::read_volatile((base + 0x06) as *const u16) as u8;
@@ -531,7 +531,7 @@ fn calc_brr(
         return Err(UartError::BaudrateUnsupported); // DIV_INT 溢出
     }
 
-    if usart_clk % d == 0 {
+    if usart_clk.is_multiple_of(d) {
         // 精确波特率, 无需小数
         return Ok((div_int, 0, false));
     }

@@ -143,10 +143,8 @@ impl Thread {
                 return false;
             }
             (*t).suspend_node.remove();
-            (*t).thread_timer.stop_internal();
-            (*t).state = TS_READY;
-            sched::ready_insert(t);
-            need = (*t).current_priority < (*sched::current()).current_priority;
+            wakeup_thread(t);
+            need = resched_needed(t);
             true
         });
         if !ok {
@@ -303,10 +301,8 @@ pub(crate) extern "C" fn thread_timer_cb(param: usize) {
         }
         (*t).error = -1; // -RT_ETIMEDOUT
         (*t).suspend_node.remove();
-        (*t).state = TS_READY;
-        sched::ready_insert(t);
-        let cur = sched::current();
-        need = !cur.is_null() && (*t).current_priority < (*cur).current_priority;
+        wakeup_thread(t);
+        need = resched_needed(t);
     });
     if need {
         sched::schedule();
@@ -315,12 +311,37 @@ pub(crate) extern "C" fn thread_timer_cb(param: usize) {
 
 /// 挂起节点 → 线程
 pub(crate) unsafe fn thread_from_suspend(node: *mut ListHead) -> *mut Thread {
-    (node as *mut u8).sub(core::mem::offset_of!(Thread, suspend_node)) as *mut Thread
+    crate::rtos::klist::container_of!(node, Thread, suspend_node)
 }
 
 /// 就绪节点 → 线程
 pub(crate) unsafe fn thread_from_ready(node: *mut ListHead) -> *mut Thread {
-    (node as *mut u8).sub(core::mem::offset_of!(Thread, ready_node)) as *mut Thread
+    crate::rtos::klist::container_of!(node, Thread, ready_node)
+}
+
+/// 临界区内: 唤醒挂起线程 (对齐 RT-Thread `rt_thread_resume` 的核心步骤)
+///
+/// 停止线程定时器 → 状态就绪 → 入就绪队列。调用方须保证线程处于
+/// 挂起态 (状态检查由各调用路径完成, 超时回调与显式唤醒互斥)。
+pub(crate) unsafe fn wakeup_thread(t: *mut Thread) {
+    (*t).thread_timer.stop_internal();
+    (*t).state = TS_READY;
+    sched::ready_insert(t);
+}
+
+/// 被唤醒线程是否比当前线程更紧急 (需要重新调度)
+pub(crate) fn resched_needed(w: *mut Thread) -> bool {
+    let cur = sched::current();
+    !cur.is_null() && unsafe { (*w).current_priority < (*cur).current_priority }
+}
+
+/// 阻塞等待后返回: 是否已超时
+///
+/// 挂起后的统一路径: 触发重新调度; 恢复后线程错误码非零即超时唤醒
+/// (由 [`thread_timer_cb`] 写入 `-1`)。
+pub(crate) fn blocked_wait() -> bool {
+    sched::schedule();
+    (unsafe { (*sched::current()).error }) != 0
 }
 
 /// 释放线程栈与 TCB (由空闲线程的僵尸回收调用)

@@ -485,12 +485,10 @@ pub const fn sram_wtcr_value(hclk_hz: u32) -> u32 {
     let w12r = if hclk_hz > 100_000_000 { 1u32 } else { 0 }; // SRAM1/2/Ret
     // WTCR 位: SRAM12_RWT[2:0] SRAM12_WWT[6:4] SRAM3_RWT[10:8] SRAM3_WWT[14:12]
     //          SRAMH_RWT[18:16] SRAMH_WWT[22:20] SRAMR_RWT[26:24] SRAMR_WWT[30:28]
-    (w12r << 0)
+    w12r
         | (w12r << 4)
         | (1 << 8)
         | (1 << 12) // SRAM3 恒 1 等待 (栈空间, 脚注要求)
-        | (0 << 16)
-        | (0 << 20) // SRAMH 恒 0 等待
         | (w12r << 24)
         | (w12r << 28)
 }
@@ -512,7 +510,7 @@ pub fn set_sram_wait_cycle(hclk_hz: u32) {
         core::ptr::write_volatile((SRAMC + 0x04) as *mut u32, 0x77);
         core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x77);
         // 写入等待周期
-        core::ptr::write_volatile((SRAMC + 0x00) as *mut u32, wtcr);
+        core::ptr::write_volatile(SRAMC as *mut u32, wtcr);
         // 恢复写保护
         core::ptr::write_volatile((SRAMC + 0x04) as *mut u32, 0x76);
         core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x76);
@@ -594,7 +592,7 @@ fn hrc_hz() -> u32 {
 /// MPLL 输出频率: PLLCLK = src/(M+1)·(N+1)/(P+1)
 fn pll_hz() -> u32 {
     let r = read32(CMU_BASE + CMU_PLLCFGR);
-    let m = (r >> 0) & 0x1F;
+    let m = r & 0x1F;
     let n = (r >> 8) & 0x1FF;
     let p = (r >> 28) & 0xF;
     let src = if r & (1 << PLLCFGR_PLLSRC_POS) != 0 {
