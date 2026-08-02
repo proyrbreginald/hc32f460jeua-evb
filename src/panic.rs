@@ -24,7 +24,7 @@
 //! 故忽略死代码警告。
 #![allow(dead_code)]
 
-use crate::console::write_fmt;
+use crate::console::write_fmt_raw as write_fmt;
 
 /// panic/fault 后的行为策略 (编译期常量, 修改此处即可切换)
 const STRATEGY: PanicStrategy = PanicStrategy::Halt;
