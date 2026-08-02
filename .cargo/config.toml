@@ -1,6 +1,11 @@
 [build]
 target = "thumbv7em-none-eabihf"
 
+# 板级信息: 编译期注入 (启动横幅显示用), 更换芯片/开发板时只改这里
+[env]
+RTOS_CHIP_MODEL = "HC32F460JEUA"
+RTOS_CORE = "Cortex-M4F"
+
 [target.thumbv7em-none-eabihf]
 rustflags = [
   "-C",

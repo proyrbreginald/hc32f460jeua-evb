@@ -9,12 +9,13 @@
 use crate::clk;
 use crate::heap;
 use crate::println; // #[macro_export] 宏需显式引入
-use crate::rtos::{sched, PRIORITY_MAX, TICKS_PER_SEC};
+use crate::rtos::{IDLE_PRIORITY, PRIORITY_MAX, TICKS_PER_SEC, sched};
 
-/// 内核名称
-pub const KERNEL_NAME: &str = "RT-Rust";
 /// 内核版本 (与 Cargo.toml 包版本一致)
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 芯片型号 / 内核名 (板级信息, 由 Cargo.toml `[env]` 注入, 不在代码中写死)
+const CHIP_MODEL: &str = env!("RTOS_CHIP_MODEL");
+const CORE: &str = env!("RTOS_CORE");
 
 /// 块字符大标题 "RT-RUST" (5 行, 5x5 字模, 每字符 5 列 + 2 列间距)
 const TITLE: [&str; 7] = [
@@ -28,26 +29,33 @@ const TITLE: [&str; 7] = [
 ];
 
 /// 信息面板分隔线
-const SEP: &str = "── ── ── ── ── ── ── ── ── ── ── ── ── ──";
+const SEP: &str = "── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──";
 
 /// 构建日期 (UTC, 由 build.rs 注入)
 const BUILD_DATE: &str = env!("RTOS_BUILD_DATE");
 /// rustc 版本 (由 build.rs 注入)
 const RUSTC: &str = env!("RTOS_RUSTC");
 /// 构建 profile
-const PROFILE: &str = if cfg!(debug_assertions) { "debug" } else { "release" };
+const PROFILE: &str = if cfg!(debug_assertions) {
+    "debug"
+} else {
+    "release"
+};
 
 /// 输出启动横幅 (每行原子打印)
 pub fn show() {
+    println!();
     for line in TITLE {
         println!("{}", line);
     }
     println!();
     println!(
-        "  {} v{}  —  RT-Thread 架构的 Rust RTOS (HC32F460JEUA)",
-        KERNEL_NAME, KERNEL_VERSION
+        "{} v{}  —  RT-Thread 架构的 Rust RTOS ({})",
+        env!("CARGO_PKG_NAME"),
+        KERNEL_VERSION,
+        CHIP_MODEL
     );
-    println!("  {}", SEP);
+    println!("{}", SEP);
     // XTAL 状态 (失败时已自动回退 MRC, 在此显式告警)
     let xtal = match clk::xtal_status() {
         clk::XtalStatus::Active => "",
@@ -55,20 +63,25 @@ pub fn show() {
         clk::XtalStatus::NotAttempted => " (XTAL not attempted)",
     };
     println!(
-        "  处理器    : Cortex-M4F @ {} MHz{}",
+        "处理器 : {} @ {} MHz{}",
+        CORE,
         clk::system_clock_hz() / 1_000_000,
         xtal
     );
-    println!("  节拍      : {} ms ({} Hz)", 1000 / TICKS_PER_SEC, TICKS_PER_SEC);
-    println!("  堆        : {} KB", heap::capacity() / 1024);
-    println!("  调度器    : 位图 {} 级优先级 + 时间片轮转", PRIORITY_MAX);
-    println!("  进程通信  : 信号量 / 互斥量(优先级继承) / 事件 / 邮箱 / 消息队列");
-    println!("  定时器    : 硬定时器 (有序链表, 节拍回绕安全)");
-    println!("  控制台    : 原子整行打印 (优先级继承锁)");
-    println!("  {}", SEP);
-    println!("  构建      : {}  [{}]  {}", BUILD_DATE, PROFILE, RUSTC);
     println!(
-        "  就绪      : {} 个线程 (位图 0x{:08x})",
+        "节拍 : {} ms ({} Hz)",
+        1000 / TICKS_PER_SEC,
+        TICKS_PER_SEC
+    );
+    println!(
+        "优先级 : {} 级 (空闲 = {})",
+        PRIORITY_MAX, IDLE_PRIORITY
+    );
+    println!("堆 : {} KB", heap::capacity() / 1024);
+    println!("{}", SEP);
+    println!("构建 : {} [{}] {}", BUILD_DATE, PROFILE, RUSTC);
+    println!(
+        "就绪 : {} 个线程 (位图 0x{:08x})",
         sched::ready_thread_count(),
         sched::ready_group_value()
     );
