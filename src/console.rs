@@ -1,7 +1,8 @@
 //! 控制台输出: 将任意 UART 绑定到 `print!` / `println!`
 //!
-//! 绑定在**编译期**完成: 修改 [`ConsoleUart`] 类型别名即可切换输出串口,
-//! 零运行时开销 (`Uart<U>` 是零大小类型)。
+//! 绑定在**编译期**完成: 输出串口由 `.cargo/config.toml` 的 `CFG_UART_UNIT`
+//! 决定 (经 [`crate::config::ConsoleUart`]), 零运行时开销 (`Uart<U>` 是
+//! 零大小类型)。
 //!
 //! # 用法
 //!
@@ -37,10 +38,9 @@
 //! 应限制输出速率或改用带流控的接口。
 
 use crate::rtos::{Mutex, Timeout};
-use crate::uart::Uart1;
 
-/// 控制台输出串口 (编译期绑定, 切换此处即可换串口)
-pub type ConsoleUart = Uart1;
+/// 控制台输出串口 (编译期绑定: `.cargo/config.toml` 的 `CFG_UART_UNIT`)
+pub type ConsoleUart = crate::config::ConsoleUart;
 
 /// 打印互斥量 (优先级继承): 串行化线程上下文的打印输出
 static PRINT_MUTEX: Mutex = Mutex::new();
@@ -53,7 +53,6 @@ static PRINT_MUTEX: Mutex = Mutex::new();
 /// 调度器启动前 (boot 阶段, 单执行流) 自动退化为无锁输出,
 /// 避免在 `rtos::init()` 之前使用互斥量 (此时 `sched::current()`
 /// 为空, 内核阻塞原语不可用)。
-#[allow(dead_code)] // `print!` 宏展开后的支撑函数 (当前演示仅用 println)
 pub fn write_fmt(args: core::fmt::Arguments<'_>) {
     if crate::rtos::scheduler_started() {
         PRINT_MUTEX.lock(Timeout::Forever).ok();

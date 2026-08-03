@@ -2,6 +2,7 @@
 //!
 //! 块字符大标题 + 信息面板: 实时查询时钟/堆/就绪线程数,
 //! 构建日期与 rustc 版本由 [`build.rs`] 注入。
+//! 开头先清屏 (与上次输出分隔), 见 [`show`]。
 //!
 //! 位于应用层 (非内核): 内核 [`crate::rtos`] 不依赖任何应用模块。
 //! 须在创建全部线程后、[`crate::rtos::start`] 之前调用
@@ -44,7 +45,11 @@ const PROFILE: &str = if cfg!(debug_assertions) {
 };
 
 /// 输出启动横幅 (每行原子打印)
+///
+/// 开头先**清屏 + 光标归位** (`ESC[2J` 仅清可视区, 保留滚动缓冲,
+/// 便于回看上次启动/panic 输出), 使每次启动与上次输出明确分隔。
 pub fn show() {
+    println!("\x1b[2J\x1b[H");
     println!();
     for line in TITLE {
         println!("{}", line);

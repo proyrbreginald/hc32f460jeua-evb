@@ -22,8 +22,8 @@
 //! 开关) 仍由各自的 `CFG_*` 配置控制。
 //!
 //! 当前命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) /
-//! `echo` / `led on|off` / `selftest` / `clear` / `whoami` / `reboot` /
-//! `logout`(exit)。
+//! `echo` / `led on|off` / `log` / `selftest` / `clear` / `whoami` /
+//! `reboot` / `logout`(exit)。
 //!
 //! # 输入处理
 //!
@@ -96,6 +96,7 @@ static COMMANDS: &[Command] = &[
     cmd("echo", &[], "回显 <文本>", cmd_echo),
     cmd("led", &[], "板载 LED on|off", cmd_led),
     cmd("selftest", &[], "内核自检 (rtos 功能自检)", cmd_selftest),
+    cmd("log", &[], "日志开关/级别 (on|off|level <级>)", cmd_log),
     cmd("clear", &[], "清屏", cmd_clear),
     cmd("whoami", &[], "当前用户", cmd_whoami),
     cmd("reboot", &[], "软复位重启", cmd_reboot),
@@ -132,6 +133,8 @@ fn login() {
                     "RT-Thread 架构的 Rust RTOS",
                     config::CORE
                 );
+                // 应用日志: 登录成功属 info 级 (默认输出, 可经 `log` 关闭)
+                crate::log_info!("用户 {} 登录成功", SHELL_USERNAME);
                 return;
             }
             tries += 1;
@@ -346,6 +349,38 @@ fn cmd_reboot(_rest: &str) -> CmdResult {
 /// 退出 shell (重新登录)
 fn cmd_logout(_rest: &str) -> CmdResult {
     CmdResult::Logout
+}
+
+/// 日志控制: 无参数显示状态; `on|off` 切换开关; `level <级别>` 调整阈值
+///
+/// 仅影响应用日志 (`log::*`), 内核打印 (横幅/shell 输出等) 不受影响;
+/// 重启后恢复配置默认值 (`CFG_LOG_ENABLE` / `CFG_LOG_LEVEL`)。
+fn cmd_log(rest: &str) -> CmdResult {
+    let mut words = rest.split_whitespace();
+    match words.next() {
+        None => println!(
+            "日志: {} (级别阈值 = {})",
+            if crate::log::enabled() { "开启" } else { "关闭" },
+            crate::log::level().name()
+        ),
+        Some("on") => {
+            crate::log::set_enabled(true);
+            println!("日志已开启");
+        }
+        Some("off") => {
+            crate::log::set_enabled(false);
+            println!("日志已关闭");
+        }
+        Some("level") => match words.next().and_then(crate::log::Level::from_name) {
+            Some(l) => {
+                crate::log::set_level(l);
+                println!("日志级别阈值: {}", l.name());
+            }
+            None => println!("用法: log level error|warn|info|debug|trace"),
+        },
+        Some(_) => println!("用法: log [on|off|level <error|warn|info|debug|trace>]"),
+    }
+    CmdResult::Ok
 }
 
 /// 从 UART 读取一行 (阻塞, 支持退格/Ctrl+C)

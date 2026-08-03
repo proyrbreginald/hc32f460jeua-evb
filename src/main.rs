@@ -17,6 +17,7 @@ mod vector_table; // 复位/异常/144 外设中断向量表 // panic 与硬件 
 // -- 外设驱动 (寄存器级, 零依赖) --
 mod clk; // 时钟链: XTAL + MPLL → 200MHz, 失败自动回退
 mod console;
+mod log; // 应用日志: 可开关+分级+彩色, 与内核打印分离 (见 log.rs)
 mod gpio; // GPIO: 寄存器/端口/引脚分层, const 泛型封装
 mod systick; // SysTick 节拍 (1kHz, RTOS 的时钟源)
 mod uart; // USART1~4: 波特率/过采样/小数分频 // 控制台: 打印锁 (优先级继承) + 原子整行输出
@@ -98,8 +99,13 @@ pub(crate) fn main() -> ! {
     // 使能控制台 UART 接收中断 (INTC 通道/NVIC 优先级来自 .cargo/config.toml)
     uart.enable_rx_interrupt(config::UART_RX_IRQ_CHANNEL, config::UART_RX_IRQ_PRIORITY);
 
-    // 内核启动横幅 (创建线程后、启动前, 就绪统计包含所有线程)
+    // 内核启动横幅 (创建线程后、启动前, 就绪统计包含所有线程;
+    // 开头先清屏, 使每次启动与上次输出明确分隔)
     banner::show();
+
+    // 应用日志 (与内核打印分离): 输出与否由 CFG_LOG_ENABLE / CFG_LOG_LEVEL
+    // 决定, 运行时可经 shell `log` 命令切换
+    log_info!("系统启动: {} @ {} MHz", config::CORE, clk::system_clock_hz() / 1_000_000);
 
     // 启动调度器, 永不返回
     rtos::start();
@@ -111,6 +117,8 @@ pub(crate) fn main() -> ! {
 extern "C" fn led_thread(_param: usize) {
     loop {
         LED.toggle();
+        // debug 级: 默认阈值 (info) 不输出, 可经 `log level debug` 打开
+        log_debug!("LED 翻转, uptime = {} ms", rtos::uptime_ms());
         rtos::thread_delay_ms(config::APP_LED_BLINK_MS);
     }
 }

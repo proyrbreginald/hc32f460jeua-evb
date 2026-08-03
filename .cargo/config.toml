@@ -65,7 +65,11 @@ CFG_SHELL_PASSWORD = "root123"
 CFG_SHELL_LOGIN_TRIES = "3" # 登录失败允许次数
 CFG_SHELL_LINE_BUF = "128"  # 输入行缓冲区 (字节)
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
-CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,led,selftest,clear,whoami,reboot,logout"
+CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,led,log,selftest,clear,whoami,reboot,logout"
+
+# [log] 应用日志 (可开关+分级+彩色, 与内核打印分离)
+CFG_LOG_ENABLE = "true" # 日志默认开关 (运行时可用 shell `log on|off` 切换)
+CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出 ≤ 阈值)
 
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
 CFG_APP_SELFTEST_STACK = "4096"

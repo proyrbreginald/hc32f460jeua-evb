@@ -32,6 +32,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 过采样 / 缓冲 / 中断参数 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
+| `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
 | `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
 
 约束:
@@ -60,6 +61,7 @@ src/
 ├── systick.rs         # SysTick 1kHz 节拍 (RTOS 时钟源)
 ├── uart.rs            # USART1~4 驱动 (波特率/过采样) + 中断接收环形缓冲
 ├── console.rs         # 控制台: 打印锁 (优先级继承) + 原子整行输出
+├── log.rs             # 应用日志: 分级+彩色标签, 与内核打印分离 (可开关)
 ├── build.rs           # 构建元数据 (日期/rustc 版本, 供启动横幅使用)
 └── rtos/              # RTOS 内核 (RT-Thread 架构移植, 不依赖应用模块)
     ├── mod.rs         # 公共 API: init/start/tick/thread_create 等
@@ -185,8 +187,26 @@ continue
 - 板载 USB 串口 (CH340, 如 `/dev/ttyUSB0`),115200 8N1;
 - 终端: `minicom -D /dev/ttyUSB0 -b 115200` 或 `screen /dev/ttyUSB0 115200`
   (建议使用交互式终端; `cat` 读取不及时会丢字节);
-- 启动横幅 (`banner::show()`): 块字符大标题 + 内核信息面板
+- 启动横幅 (`banner::show()`): 先**清屏分隔** (仅清可视区, 保留滚动缓冲),
+  再输出块字符大标题 + 内核信息面板
   (CPU 频率/节拍/堆大小/构建日期/rustc 版本/就绪线程数)。
+
+### 应用日志 (log)
+
+与**内核打印分离**的可开关诊断输出 (`src/log.rs`):
+
+- **分层**: 内核打印 (启动横幅/panic 诊断/shell 输出, 经 console 打印锁)
+  **无论如何都输出**; 应用日志是可选层, 输出与否 = (全局开关 × 级别阈值);
+- **级别与色彩**: `error`(红) / `warn`(黄) / `info`(绿) / `debug`(青) /
+  `trace`(白), 彩色标签 `[ERR]`~`[TRC]`, 整行原子输出 (不交错);
+- **宏**: `log_error!` / `log_warn!` / `log_info!` / `log_debug!` /
+  `log_trace!` (线程上下文使用, 与 `println!` 同约束);
+- **默认值来自配置**: `CFG_LOG_ENABLE` (默认开启) + `CFG_LOG_LEVEL`
+  (默认 `info`, 输出 ≤ 阈值的级别); 非法值编译期报错;
+- **运行时控制** (shell 命令, 重启后恢复配置默认):
+  - `log` — 显示当前开关与级别;
+  - `log on` / `log off` — 切换日志开关;
+  - `log level error|warn|info|debug|trace` — 调整级别阈值。
 
 ### 终端 (仿 Ubuntu shell)
 
@@ -200,7 +220,8 @@ continue
 - **每个命令可单独启用/禁用**: `CFG_SHELL_COMMANDS` 为逗号分隔的命令名
   列表, 未列出的命令执行时提示 "未启用" 且不出现在 `help` 中;
 - 命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) / `echo` /
-  `led on|off` / `selftest` / `clear` / `whoami` / `reboot` / `logout`(exit);
+  `led on|off` / `log` / `selftest` / `clear` / `whoami` / `reboot` /
+  `logout`(exit);
 - 输入: 回车提交, 退格删除, Ctrl+C 清行;
 - 输入采用中断驱动 (RX ISR 释放信号量, 线程阻塞等待, 无轮询)。
 

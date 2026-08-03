@@ -195,6 +195,33 @@ pub const SHELL_LOGIN_TRIES: u32 = parse_u32(env!("CFG_SHELL_LOGIN_TRIES"));
 /// 输入行缓冲区大小 (字节) (CFG_SHELL_LINE_BUF)
 pub const SHELL_LINE_BUF_SIZE: usize = parse_u32(env!("CFG_SHELL_LINE_BUF")) as usize;
 
+// ============================== [log] ==============================
+
+/// 日志默认开关 (CFG_LOG_ENABLE = true/false)
+/// 运行时可经 shell `log on|off` 切换, 重启后恢复此默认值
+pub const LOG_ENABLE: bool = if eq_str(env!("CFG_LOG_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_LOG_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_LOG_ENABLE 非法 (可用 true/false)")
+};
+/// 日志默认级别阈值 (CFG_LOG_LEVEL = error/warn/info/debug/trace)
+/// 输出 ≤ 阈值的级别; 运行时可经 shell `log level <级别>` 调整
+pub const LOG_LEVEL: crate::log::Level = if eq_str(env!("CFG_LOG_LEVEL"), "error") {
+    crate::log::Level::Error
+} else if eq_str(env!("CFG_LOG_LEVEL"), "warn") {
+    crate::log::Level::Warn
+} else if eq_str(env!("CFG_LOG_LEVEL"), "info") {
+    crate::log::Level::Info
+} else if eq_str(env!("CFG_LOG_LEVEL"), "debug") {
+    crate::log::Level::Debug
+} else if eq_str(env!("CFG_LOG_LEVEL"), "trace") {
+    crate::log::Level::Trace
+} else {
+    panic!("CFG_LOG_LEVEL 非法 (可用 error/warn/info/debug/trace)")
+};
+
 /// 命令是否在启用列表中 (CFG_SHELL_COMMANDS, 逗号分隔, 忽略首尾空格)
 ///
 /// 每个 shell 命令可单独通过该列表启用/禁用: 新增命令需在
