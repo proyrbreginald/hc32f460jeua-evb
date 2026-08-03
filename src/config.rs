@@ -166,8 +166,7 @@ const fn assert_pll_xtal_range(xtal_hz: u32, m: u32, n: u32) {
         "PLL 输入频率 XTAL/(M+1) 应为 1~25MHz"
     );
     assert!(
-        xtal_hz / (m + 1) * (n + 1) >= 240_000_000
-            && xtal_hz / (m + 1) * (n + 1) <= 480_000_000,
+        xtal_hz / (m + 1) * (n + 1) >= 240_000_000 && xtal_hz / (m + 1) * (n + 1) <= 480_000_000,
         "PLL VCO 输出频率应为 240~480MHz"
     );
 }
@@ -273,14 +272,13 @@ pub const UART_FIRST_BIT: uart::FirstBit = if eq_str(env!("CFG_UART_FIRST_BIT"),
     panic!("CFG_UART_FIRST_BIT 非法 (可用 lsb/msb)")
 };
 /// 硬件流控 (CFG_UART_FLOW_CTRL = none/cts; RTS 为 F460 默认行为)
-pub const UART_FLOW_CTRL: uart::FlowControl =
-    if eq_str(env!("CFG_UART_FLOW_CTRL"), "none") {
-        uart::FlowControl::None
-    } else if eq_str(env!("CFG_UART_FLOW_CTRL"), "cts") {
-        uart::FlowControl::Cts
-    } else {
-        panic!("CFG_UART_FLOW_CTRL 非法 (可用 none/cts)")
-    };
+pub const UART_FLOW_CTRL: uart::FlowControl = if eq_str(env!("CFG_UART_FLOW_CTRL"), "none") {
+    uart::FlowControl::None
+} else if eq_str(env!("CFG_UART_FLOW_CTRL"), "cts") {
+    uart::FlowControl::Cts
+} else {
+    panic!("CFG_UART_FLOW_CTRL 非法 (可用 none/cts)")
+};
 /// 噪声滤波 (CFG_UART_NOISE_FILTER = true/false, CR1.NFE)
 pub const UART_NOISE_FILTER: bool = if eq_str(env!("CFG_UART_NOISE_FILTER"), "true") {
     true
@@ -291,8 +289,12 @@ pub const UART_NOISE_FILTER: bool = if eq_str(env!("CFG_UART_NOISE_FILTER"), "tr
 };
 /// 接收环形缓冲大小 (字节) (CFG_UART_RX_BUF_SIZE)
 pub const UART_RX_BUF_SIZE: usize = parse_u32(env!("CFG_UART_RX_BUF_SIZE")) as usize;
-/// INTC 中断通道 (CFG_UART_IRQ_CHANNEL, INT000~INT007)
+/// INTC 中断通道 (CFG_UART_IRQ_CHANNEL, INT000~INT127; INT128+ 为共享线)
 pub const UART_RX_IRQ_CHANNEL: usize = parse_u32(env!("CFG_UART_IRQ_CHANNEL")) as usize;
+const _: () = assert!(
+    UART_RX_IRQ_CHANNEL < 128,
+    "CFG_UART_IRQ_CHANNEL 应为 INT000~INT127 (共享线 INT128+ 不支持)"
+);
 /// NVIC 抢占优先级 (CFG_UART_IRQ_PRIORITY, 0~15)
 pub const UART_RX_IRQ_PRIORITY: u8 = parse_u8(env!("CFG_UART_IRQ_PRIORITY"));
 

@@ -58,6 +58,7 @@ src/
 ├── critical_section.rs# PRIMASK 临界区 (嵌套安全, 中断安全的基础)
 ├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
 ├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
+├── intc.rs            # 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 ├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
 ├── gpio.rs            # GPIO: 寄存器→端口→引脚→接口四层, const 泛型校验
 ├── systick.rs         # SysTick 1kHz 节拍 (RTOS 时钟源)
@@ -103,6 +104,30 @@ src/
 - MPLL 参数编译期校验: 寄存器位宽 + 有效倍频/分频范围 + XTAL 源下
   VCO 输入 (1~25MHz) 与输出 (240~480MHz) 范围;
 - 所有 CMU 寄存器偏移已与 DDL v3.3.0 头文件逐项核对一致。
+
+## 中断系统 (intc + vector_table)
+
+HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
+**事件源 → INTC.SEL → NVIC 线**:
+
+- 事件源 (`en_int_src_t`, 如 `USART1_RI=279`) → 写 `INTC.SELx` (SEL0 偏移
+  0x5C, 每线 4 字节, 复位值 0x1FF=未映射) → NVIC 线 `INTxxx` (IRQn=x,
+  共 144 条) → ISER/IPR 使能/优先级;
+- **注册 API** (`src/intc.rs`): `intc::register(源, 线, 优先级, 回调)`
+  一步完成 路由+装回调+清挂起+设优先级+使能 (对齐 DDL 例程流程);
+  失败返回 `IrqError::LineTaken` (线被其他源占用); `unregister` 逆操作;
+- **事件源常量** `intc::src::*`: USART1~4 全部事件 (EI/RI/TI/TCI/RTO,
+  USART1=278~282, 每单元 +5)、EIRQ0~15、TIM0/TIM6_1~3/TMRA、DMA、RTC、
+  USBFS、I2C、CMP、LVD、ADC、TRNG、EFM、WDT 等;
+- **NVIC 原语**: `enable`/`disable`/`pend` (软件触发)/`clear_pend`/
+  `set_priority` (0~15, 写 IPR 高半字节, 默认 PRIGROUP=0 无子优先级);
+- **向量表** (`vector_table.rs`): 15 异常 + 144 外设中断全部预置分发入口,
+  RAM 回调表运行时注册 — 任意 INT000~INT143 线可用 (旧版仅 8 槽);
+  未注册槽位触发时静默返回; 异常走 `default_handler` 死循环/`fault_handler`;
+- INT128~143 为**共享中断线** (VSSEL 位掩码 + 外设状态轮询, DDL
+  `hc32f460_ll_interrupts_share.c` 模式), 本模块暂不支持 (注册限制
+  INT000~127, 配置层已校验);
+- ISR 约束: 中断上下文只能使用非阻塞操作 (与 `print!`/`log!` 同约束)。
 
 ## 启动流程
 

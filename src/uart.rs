@@ -83,27 +83,13 @@ const USART_BASES: [usize; 4] = [0x4001_D000, 0x4001_D400, 0x4002_1000, 0x4002_1
 /// PWC 外设基址 (FCG 时钟门控)
 const PWC_BASE: usize = 0x4004_8000;
 
-// ---- 中断路径 (INTC 事件源映射 + NVIC, 参考 DDL hc32_ll_interrupts.c) ----
-
-/// INTC 基址 (CM_INTC_TypeDef, 见 hc32f460.h):
-/// NMICR@0x00, NMIENR@0x04, NMIFR@0x08, NMICFR@0x0C,
-/// EIRQCR0~15@0x10..0x4C, WUPEN@0x50, EIFR@0x54, EIFCR@0x58,
-/// **SEL0@0x5C** 起 (每通道 4 字节, 复位值 0x1FF = 未映射)。
-const INTC_BASE: usize = 0x4005_1000;
-const INTC_SEL_OFF: usize = 0x5C;
-/// NVIC ISER0 基址 (Cortex-M4 内核外设)
-const NVIC_ISER_BASE: usize = 0xE000_E100;
-/// NVIC IPR0 基址 (优先级字节, 每中断 1 字节)
-const NVIC_IPR_BASE: usize = 0xE000_E400;
-
-/// USART1 中断事件源编号 (DDL hc32f460.h en_int_src_t)
-pub const INT_SRC_USART1_RI: u32 = 279; // 接收数据寄存器非空/接收错误
-#[allow(unused)]
-pub const INT_SRC_USART1_EI: u32 = 278; // 接收错误
-#[allow(unused)]
-pub const INT_SRC_USART1_TI: u32 = 280; // 发送数据寄存器空
-#[allow(unused)]
-pub const INT_SRC_USART1_TCI: u32 = 281; // 发送完成
+/// 单元 U 的接收中断事件源编号 (`en_int_src_t`, 见 [`crate::intc::src`])
+///
+/// USART1~4 的 EI/RI/TI/TCI/RTO 编号连续: USART1=278~282, 每单元 +5,
+/// 故 USARTn_RI = 279 + (n-1)×5。
+const fn ri_source(u: u8) -> u32 {
+    279 + (u as u32 - 1) * 5
+}
 
 /// FCG1.USARTn 时钟门控位 (清位 = 使能): USART1=bit24 ... USART4=bit27
 const fn fcg1_usart_bit(unit: u8) -> u32 {
@@ -477,37 +463,20 @@ impl<const U: u8> Uart<U> {
         }
     }
 
-    /// 使能接收中断 (对齐 DDL 示例: 注册 INTC 事件源 + NVIC + CR1.RIE)
+    /// 使能接收中断 (事件源路由 + NVIC + `CR1.RIE`, 对齐 DDL 例程)
     ///
     /// 中断 ISR ([`rx_irq_handler`], 各单元共用同一 ISR 按单元分发)
     /// 把收到的字节写入环形缓冲 [`RX_RINGS`], 应用侧用
     /// [`Uart::rx_count`] / [`Uart::read_rx`] / [`Uart::drain_rx`] 读取。
     ///
-    /// - `irq_n`: INTC 通道号 (INT000~INT007, 对应向量表分发槽位);
-    /// - `priority`: NVIC 抢占优先级 (0~15, 4 位, 值越小优先级越高)。
-    pub fn enable_rx_interrupt(&self, irq_n: usize, priority: u8) {
-        assert!(
-            irq_n < 8,
-            "enable_rx_interrupt: INTC 通道仅支持 INT000~INT007"
-        );
-        crate::vector_table::register_irq(irq_n, rx_irq_handler::<U>);
-        unsafe {
-            // 1. INTC 事件源映射: SEL[irq_n] = USART1_RI (对齐 INTC_IrqSignIn)
-            let sel = INTC_BASE + INTC_SEL_OFF + 4 * irq_n;
-            core::ptr::write_volatile(sel as *mut u32, INT_SRC_USART1_RI);
-
-            // 2. NVIC: 清挂起 → 设优先级 → 使能 (对齐 INTC_IrqInstalHandler)。
-            //    ISER 为写 1 置位 (W1S) 寄存器, 直接写入只影响本中断位;
-            //    IPR 是字节寄存器, 用字节指针写 (u32 指针会因未对齐触发 UB 检查)。
-            core::ptr::write_volatile(
-                (NVIC_ISER_BASE + 4 * (irq_n / 32)) as *mut u32,
-                1 << (irq_n % 32),
-            );
-            core::ptr::write_volatile((NVIC_IPR_BASE + irq_n) as *mut u8, (priority & 0x0F) << 4);
-
-            // 3. CR1.RIE: 接收满 + 接收错误中断使能 (对齐 USART_FuncCmd(USART_INT_RX))
-            self.cr1().modify(|v| v | CR1_RIE);
-        }
+    /// - `line`: NVIC 中断线 (INT000~INT127, 见 [`crate::intc::Line`]),
+    ///   事件源自动取本单元 USARTn_RI;
+    /// - `priority`: NVIC 抢占优先级 (0~15, 值越小优先级越高)。
+    pub fn enable_rx_interrupt(&self, line: crate::intc::Line, priority: u8) {
+        crate::intc::register(ri_source(U), line, priority, rx_irq_handler::<U>)
+            .expect("USART 接收中断注册失败 (中断线被占用)");
+        // CR1.RIE: 接收满 + 接收错误中断使能 (对齐 USART_FuncCmd(USART_INT_RX))
+        self.cr1().modify(|v| v | CR1_RIE);
     }
 }
 

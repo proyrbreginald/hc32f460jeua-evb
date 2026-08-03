@@ -89,7 +89,12 @@ const fn cmd(
 /// 命令表: 新增命令 = 追加一项, 并加入 `CFG_SHELL_COMMANDS` 启用列表
 static COMMANDS: &[Command] = &[
     cmd("help", &[], "命令列表", cmd_help),
-    cmd("sysinfo", &["info"], "系统信息 (型号/频率/节拍/构建)", cmd_sysinfo),
+    cmd(
+        "sysinfo",
+        &["info"],
+        "系统信息 (型号/频率/节拍/构建)",
+        cmd_sysinfo,
+    ),
     cmd("uptime", &[], "运行时间", cmd_uptime),
     cmd("ps", &[], "线程列表", cmd_ps),
     cmd("free", &["mem"], "堆内存统计", cmd_free),
@@ -359,7 +364,11 @@ fn cmd_sysinfo(_rest: &str) -> CmdResult {
             os,
             cd,
             fc,
-            if config::UART_NOISE_FILTER { "开" } else { "关" }
+            if config::UART_NOISE_FILTER {
+                "开"
+            } else {
+                "关"
+            }
         ),
     );
     sysinfo_line(
@@ -387,7 +396,11 @@ fn cmd_sysinfo(_rest: &str) -> CmdResult {
         "日志",
         format_args!(
             "默认{}, 阈值 {}",
-            if config::LOG_ENABLE { "开启" } else { "关闭" },
+            if config::LOG_ENABLE {
+                "开启"
+            } else {
+                "关闭"
+            },
             config::LOG_LEVEL.name()
         ),
     );
@@ -395,7 +408,8 @@ fn cmd_sysinfo(_rest: &str) -> CmdResult {
         "终端",
         format_args!(
             "用户 {}, 失败次数 {}",
-            config::SHELL_USERNAME, config::SHELL_LOGIN_TRIES
+            config::SHELL_USERNAME,
+            config::SHELL_LOGIN_TRIES
         ),
     );
     sysinfo_line(
@@ -558,7 +572,11 @@ fn cmd_log(rest: &str) -> CmdResult {
     match words.next() {
         None => println!(
             "日志: {} (级别阈值 = {})",
-            if crate::log::enabled() { "开启" } else { "关闭" },
+            if crate::log::enabled() {
+                "开启"
+            } else {
+                "关闭"
+            },
             crate::log::level().name()
         ),
         Some("on") => {

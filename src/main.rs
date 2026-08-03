@@ -10,6 +10,7 @@ extern crate alloc;
 mod critical_section; // PRIMASK 临界区 (中断安全的基础)
 mod heap; // 全局堆分配器 (边界标记 + 首次适配)
 mod icg; // ICG 硬件配置段
+mod intc; // 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 mod panic;
 mod startup; // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
 mod vector_table; // 复位/异常/144 外设中断向量表 // panic 与硬件 fault 诊断
@@ -17,8 +18,8 @@ mod vector_table; // 复位/异常/144 外设中断向量表 // panic 与硬件 
 // -- 外设驱动 (寄存器级, 零依赖) --
 mod clk; // 时钟链: XTAL + MPLL → 200MHz, 失败自动回退
 mod console;
-mod log; // 应用日志: 可开关+分级+彩色, 与内核打印分离 (见 log.rs)
 mod gpio; // GPIO: 寄存器/端口/引脚分层, const 泛型封装
+mod log; // 应用日志: 可开关+分级+彩色, 与内核打印分离 (见 log.rs)
 mod systick; // SysTick 节拍 (1kHz, RTOS 的时钟源)
 mod uart; // USART1~4: 波特率/过采样/小数分频 // 控制台: 打印锁 (优先级继承) + 原子整行输出
 
@@ -26,8 +27,8 @@ mod uart; // USART1~4: 波特率/过采样/小数分频 // 控制台: 打印锁 
 mod rtos;
 // -- 应用 --
 mod banner; // 启动横幅 (应用层, 依赖 clk/heap/rtos 公共状态)
-mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
-mod config; // 编译期配置 (.cargo/config.toml [env] → env!)
+mod config;
+mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令 // 编译期配置 (.cargo/config.toml [env] → env!)
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use gpio::{Config, Drive, Gpio, Mode, Pin, PortA, PortC};
@@ -96,8 +97,11 @@ pub(crate) fn main() -> ! {
         0,
     );
 
-    // 使能控制台 UART 接收中断 (INTC 通道/NVIC 优先级来自 .cargo/config.toml)
-    uart.enable_rx_interrupt(config::UART_RX_IRQ_CHANNEL, config::UART_RX_IRQ_PRIORITY);
+    // 使能控制台 UART 接收中断 (NVIC 线/优先级来自 .cargo/config.toml)
+    uart.enable_rx_interrupt(
+        intc::Line::new(config::UART_RX_IRQ_CHANNEL as u8),
+        config::UART_RX_IRQ_PRIORITY,
+    );
 
     // 内核启动横幅 (创建线程后、启动前, 就绪统计包含所有线程;
     // 开头先清屏, 使每次启动与上次输出明确分隔)
@@ -105,7 +109,11 @@ pub(crate) fn main() -> ! {
 
     // 应用日志 (与内核打印分离): 输出与否由 CFG_LOG_ENABLE / CFG_LOG_LEVEL
     // 决定, 运行时可经 shell `log` 命令切换
-    log_info!("系统启动: {} @ {} MHz", config::CORE, clk::system_clock_hz() / 1_000_000);
+    log_info!(
+        "系统启动: {} @ {} MHz",
+        config::CORE,
+        clk::system_clock_hz() / 1_000_000
+    );
 
     // 启动调度器, 永不返回
     rtos::start();
@@ -308,14 +316,13 @@ fn hardware_init() -> config::ConsoleUart {
 
     // GPIO
     let gpio = Gpio::take();
-    gpio.pin::<PortC, { config::LED_PIN }>()
-        .configure(Config {
-            mode: Mode::Output,
-            pull_up: false,
-            drive: Drive::Low,
-            initial_level: config::LED_INITIAL_LEVEL,
-            invert: false,
-        });
+    gpio.pin::<PortC, { config::LED_PIN }>().configure(Config {
+        mode: Mode::Output,
+        pull_up: false,
+        drive: Drive::Low,
+        initial_level: config::LED_INITIAL_LEVEL,
+        invert: false,
+    });
     // UART 引脚复用 (PA9=TX / PA10=RX; 引脚号/功能号来自配置)
     gpio.pin::<PortA, { config::UART_TX_PIN }>()
         .set_func(config::UART_TX_FSEL);
