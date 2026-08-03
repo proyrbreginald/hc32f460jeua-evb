@@ -415,15 +415,13 @@ fn cmd_sysinfo(_rest: &str) -> CmdResult {
     sysinfo_line(
         "线程",
         format_args!(
-            "led P{} T{} {}B | shell P{} T{} {}B | 自检 P{} {}B",
+            "led P{} T{} {}B | shell P{} T{} {}B",
             config::APP_LED_PRIORITY,
             config::APP_LED_TIMESLICE,
             config::APP_LED_STACK,
             config::APP_SHELL_PRIORITY,
             config::APP_SHELL_TIMESLICE,
-            config::APP_SHELL_STACK,
-            config::APP_SELFTEST_PRIORITY,
-            config::APP_SELFTEST_STACK
+            config::APP_SHELL_STACK
         ),
     );
     CmdResult::Ok
@@ -524,10 +522,11 @@ fn cmd_led(rest: &str) -> CmdResult {
     CmdResult::Ok
 }
 
-/// 内核自检: 通过命令手动启动 (受 CFG_APP_SELFTEST_ENABLE 控制)
+/// 内核自检: **同步执行** (完成后才出下一提示符, 可按 ESC 中断)
+/// (受 CFG_APP_SELFTEST_ENABLE 控制)
 fn cmd_selftest(_rest: &str) -> CmdResult {
     if config::APP_SELFTEST_ENABLE {
-        crate::start_selftest();
+        crate::selftest_run();
     } else {
         println!("selftest 未启用 (CFG_APP_SELFTEST_ENABLE=false)");
     }

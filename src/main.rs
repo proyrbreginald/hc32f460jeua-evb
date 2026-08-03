@@ -32,7 +32,7 @@ mod banner; // 启动横幅 (应用层, 依赖 clk/heap/rtos 公共状态)
 mod config;
 mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令 // 编译期配置 (.cargo/config.toml [env] → env!)
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use gpio::{Config, Drive, Gpio, Mode, Pin, PortA, PortC};
 use uart::UartConfig;
 
@@ -71,8 +71,8 @@ pub(crate) fn main() -> ! {
     rtos::init();
 
     // 创建演示线程 (栈/优先级/时间片来自 .cargo/config.toml)
-    // 注: selftest 线程不在此创建, 由 shell 命令 `selftest` 手动启动
-    // (见 start_selftest, 受 CFG_APP_SELFTEST_ENABLE 控制)
+    // 注: selftest 不在此运行, 由 shell 命令 `selftest` 同步执行
+    // (见 selftest_run, 受 CFG_APP_SELFTEST_ENABLE 控制)
     rtos::thread_create(
         "led",
         config::APP_LED_STACK,
@@ -147,39 +147,38 @@ extern "C" fn victim_thread(_param: usize) {
 /// 自然退出的线程: 入口返回后经 thread_exit → defunct → 空闲线程回收
 extern "C" fn exit_thread(_param: usize) {}
 
-/// 内核自检线程是否正在运行 (防止 `selftest` 命令重复启动)
-static SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// 启动内核自检线程 (由 shell 命令 `selftest` 调用)
+/// 检测用户是否按下 ESC (0x1B): 轮询并清空接收缓冲
 ///
-/// 受 `CFG_APP_SELFTEST_ENABLE` 控制 (见 shell::cmd_selftest),
-/// 线程运行结束后可再次启动。
-pub(crate) fn start_selftest() {
-    if SELFTEST_RUNNING.swap(true, Ordering::SeqCst) {
-        println!("[selftest] 已在运行");
-        return;
+/// 自检期间终端输入一律丢弃 (ESC 除外); 返回 true 表示请求中断。
+fn selftest_abort_requested() -> bool {
+    let uart = config::ConsoleUart::take();
+    let mut esc = false;
+    while let Some(b) = uart.read_rx() {
+        if b == 0x1B {
+            esc = true;
+        }
     }
-    rtos::thread_create(
-        "selftest",
-        config::APP_SELFTEST_STACK,
-        config::APP_SELFTEST_PRIORITY,
-        0,
-        selftest_thread,
-        0,
-    );
+    esc
 }
 
-/// rtos 自检线程: 依次验证信号量/互斥量/事件/邮箱/消息队列/
-/// 延时/线程删除/线程退出。
+/// 内核自检: 依次验证信号量/互斥量/事件/邮箱/消息队列/延时/
+/// 线程删除/线程退出/Flash。
+///
+/// **同步执行** (由 shell 的 `selftest` 命令调用, 完成后才出下一提示符);
+/// 每项检查后轮询 ESC, 按下即中断剩余项。
 ///
 /// 日志分级: **trace** 级输出每项执行细节 (实际返回值/耗时等,
 /// `log level trace` 打开), **info** 级输出 PASS/FAIL 结果;
 /// 汇总一行始终打印 (命令的执行结果, 不受日志开关影响)。
-extern "C" fn selftest_thread(_param: usize) {
-    log_info!("[selftest] 开始 (rtos 内核功能自检)");
+pub(crate) fn selftest_run() {
+    log_info!("[selftest] 开始 (rtos 内核功能自检), 按 ESC 可中断");
     let mut pass = 0u32;
     let mut fail = 0u32;
+    let aborted = core::cell::Cell::new(false);
     let mut check = |ok: bool, name: &str, detail: core::fmt::Arguments<'_>| {
+        if aborted.get() {
+            return; // 已中断: 跳过剩余项
+        }
         // trace 级: 执行细节 (实际返回值/参数), 用于故障定位
         log_trace!("[selftest] {} → {}", name, detail);
         if ok {
@@ -189,24 +188,30 @@ extern "C" fn selftest_thread(_param: usize) {
             fail += 1;
             log_info!("[FAIL] {}", name);
         }
+        // 每项后检查 ESC (中断剩余项)
+        if selftest_abort_requested() {
+            aborted.set(true);
+            log_info!("[selftest] 收到 ESC, 中断剩余项");
+        }
     };
 
     // 信号量: 计数获取 / 立即超时 / release 唤醒
-    static SEM: rtos::Semaphore = rtos::Semaphore::new(1, 1);
-    let r = SEM.take(Timeout::Ticks(0));
+    // (测试对象用局部变量: 每次运行全新状态, 不依赖 static 持久化)
+    let sem = rtos::Semaphore::new(1, 1);
+    let r = sem.take(Timeout::Ticks(0));
     check(
         r.is_ok(),
         "信号量: 初始计数可获取",
         format_args!("take(0) = {:?}", r),
     );
-    let r = SEM.take(Timeout::Ticks(0));
+    let r = sem.take(Timeout::Ticks(0));
     check(
         r.is_err(),
         "信号量: 计数 0 立即超时",
         format_args!("take(0) = {:?}", r),
     );
-    SEM.release();
-    let r = SEM.take(Timeout::Ticks(0));
+    sem.release();
+    let r = sem.take(Timeout::Ticks(0));
     check(
         r.is_ok(),
         "信号量: release 后可获取",
@@ -214,48 +219,48 @@ extern "C" fn selftest_thread(_param: usize) {
     );
 
     // 互斥量: 获取 / 递归持有 / 释放
-    static MTX: rtos::Mutex = rtos::Mutex::new();
-    let r = MTX.lock(Timeout::Ticks(0));
+    let mtx = rtos::Mutex::new();
+    let r = mtx.lock(Timeout::Ticks(0));
     check(r.is_ok(), "互斥量: 可获取", format_args!("lock(0) = {:?}", r));
-    let r = MTX.lock(Timeout::Ticks(0));
+    let r = mtx.lock(Timeout::Ticks(0));
     check(
         r.is_ok(),
         "互斥量: 递归持有合法",
         format_args!("递归 lock(0) = {:?}", r),
     );
-    MTX.unlock();
-    MTX.unlock();
-    let r = MTX.lock(Timeout::Ticks(0));
+    mtx.unlock();
+    mtx.unlock();
+    let r = mtx.lock(Timeout::Ticks(0));
     check(
         r.is_ok(),
         "互斥量: 释放后可重新获取",
         format_args!("unlock×2 后 lock(0) = {:?}", r),
     );
-    MTX.unlock();
+    mtx.unlock();
 
     // 事件: AND / OR / 立即超时
-    static EVT: rtos::Event = rtos::Event::new();
-    EVT.send(0x05);
-    let r = EVT.recv(0x05, EventOpt::And, Timeout::Ticks(0));
+    let evt = rtos::Event::new();
+    evt.send(0x05);
+    let r = evt.recv(0x05, EventOpt::And, Timeout::Ticks(0));
     check(
         r == Ok(0x05),
         "事件: AND 匹配返回等待全集",
         format_args!("send(0x05) recv(0x05, And) = {:?}", r),
     );
-    let r = EVT.recv(0x02, EventOpt::And, Timeout::Ticks(0));
+    let r = evt.recv(0x02, EventOpt::And, Timeout::Ticks(0));
     check(
         r.is_err(),
         "事件: 不满足立即超时",
         format_args!("recv(0x02, And) = {:?}", r),
     );
-    EVT.send(0x08);
-    let r = EVT.recv(0x08, EventOpt::Or, Timeout::Ticks(0));
+    evt.send(0x08);
+    let r = evt.recv(0x08, EventOpt::Or, Timeout::Ticks(0));
     check(
         r == Ok(0x08),
         "事件: OR 匹配返回实际位",
         format_args!("send(0x08) recv(0x08, Or) = {:?}", r),
     );
-    let r = EVT.recv(0x10, EventOpt::OrClear, Timeout::Ticks(0));
+    let r = evt.recv(0x10, EventOpt::OrClear, Timeout::Ticks(0));
     check(
         r.is_err(),
         "事件: 无匹配位立即超时",
@@ -263,27 +268,27 @@ extern "C" fn selftest_thread(_param: usize) {
     );
 
     // 邮箱: 收发 / 紧急插队 / 满返回 Full / 空返回 TimedOut
-    static MB: rtos::Mailbox = rtos::Mailbox::new(4);
-    let r = MB.send(100, Timeout::Ticks(0));
+    let mb = rtos::Mailbox::new(4);
+    let r = mb.send(100, Timeout::Ticks(0));
     check(r.is_ok(), "邮箱: 发送", format_args!("send(100) = {:?}", r));
-    let r = MB.recv(Timeout::Ticks(0));
+    let r = mb.recv(Timeout::Ticks(0));
     check(r == Ok(100), "邮箱: 接收一致", format_args!("recv() = {:?}", r));
-    let r = MB.recv(Timeout::Ticks(0));
+    let r = mb.recv(Timeout::Ticks(0));
     check(r.is_err(), "邮箱: 空立即超时", format_args!("recv() = {:?}", r));
     for i in 0..4 {
-        MB.send(1000 + i, Timeout::Ticks(0)).ok();
+        mb.send(1000 + i, Timeout::Ticks(0)).ok();
     }
-    let r = MB.send(9999, Timeout::Ticks(0));
+    let r = mb.send(9999, Timeout::Ticks(0));
     check(
         r.is_err(),
         "邮箱: 满返回 Full",
         format_args!("满 4 条后 send(9999) = {:?}", r),
     );
     // 取出一条腾出空间后再紧急发送 (urgent 在满时同样返回 Full)
-    MB.recv(Timeout::Ticks(0)).ok();
-    let r = MB.urgent(42, Timeout::Ticks(0));
+    mb.recv(Timeout::Ticks(0)).ok();
+    let r = mb.urgent(42, Timeout::Ticks(0));
     check(r.is_ok(), "邮箱: 紧急发送", format_args!("urgent(42) = {:?}", r));
-    let r = MB.recv(Timeout::Ticks(0));
+    let r = mb.recv(Timeout::Ticks(0));
     check(
         r == Ok(42),
         "邮箱: 紧急消息插到队首",
@@ -291,18 +296,18 @@ extern "C" fn selftest_thread(_param: usize) {
     );
 
     // 消息队列: 收发一致 (含二进制)
-    static MQ: rtos::MessageQueue = rtos::MessageQueue::new(16, 4);
+    let mq = rtos::MessageQueue::new(16, 4);
     let hello: &[u8] = &[0x52, 0x00, 0xFF, b'!'];
-    let r = MQ.send(hello, Timeout::Ticks(0));
+    let r = mq.send(hello, Timeout::Ticks(0));
     check(r.is_ok(), "消息队列: 发送", format_args!("send({:02X?}) = {:?}", hello, r));
     let mut buf = [0u8; 16];
-    let n = MQ.recv(&mut buf, Timeout::Ticks(0));
+    let n = mq.recv(&mut buf, Timeout::Ticks(0));
     check(
         n == Ok(4) && buf[..4] == *hello,
         "消息队列: 接收内容一致",
         format_args!("recv() = {:?}, data = {:02X?}", n, &buf[..4]),
     );
-    let r = MQ.recv(&mut buf, Timeout::Ticks(0));
+    let r = mq.recv(&mut buf, Timeout::Ticks(0));
     check(r.is_err(), "消息队列: 空立即超时", format_args!("recv() = {:?}", r));
 
     // 延时: uptime 前进
@@ -316,22 +321,24 @@ extern "C" fn selftest_thread(_param: usize) {
     );
 
     // 线程删除 (delete API) 与自然退出 (defunct 回收)
-    log_debug!("[selftest] 创建 victim 线程");
-    let victim = rtos::thread_create("victim", 1024, 24, 0, victim_thread, 0);
-    log_debug!("[selftest] victim 已创建, 延时 50ms");
-    rtos::thread_delay_ms(50);
-    log_debug!("[selftest] 调用 victim.delete()");
-    victim.delete();
-    log_debug!("[selftest] delete() 已返回, 延时 50ms");
-    rtos::thread_delay_ms(50);
-    check(true, "线程删除: delete() 完成且系统正常", format_args!("victim 已删除, 系统无异常"));
-    log_debug!("[selftest] 创建 exit-me 线程");
-    rtos::thread_create("exit-me", 1024, 25, 0, exit_thread, 0);
-    rtos::thread_delay_ms(100);
-    check(true, "线程退出: 入口返回后经 defunct 回收", format_args!("exit-me 已退出并被回收"));
+    if !aborted.get() {
+        log_debug!("[selftest] 创建 victim 线程");
+        let victim = rtos::thread_create("victim", 1024, 24, 0, victim_thread, 0);
+        log_debug!("[selftest] victim 已创建, 延时 50ms");
+        rtos::thread_delay_ms(50);
+        log_debug!("[selftest] 调用 victim.delete()");
+        victim.delete();
+        log_debug!("[selftest] delete() 已返回, 延时 50ms");
+        rtos::thread_delay_ms(50);
+        check(true, "线程删除: delete() 完成且系统正常", format_args!("victim 已删除, 系统无异常"));
+        log_debug!("[selftest] 创建 exit-me 线程");
+        rtos::thread_create("exit-me", 1024, 25, 0, exit_thread, 0);
+        rtos::thread_delay_ms(100);
+        check(true, "线程退出: 入口返回后经 defunct 回收", format_args!("exit-me 已退出并被回收"));
+    }
 
     // Flash (EFM): 扇区擦除 + 多字编程 + 回读校验 (末扇区, 远离固件/swap 标记)
-    {
+    if !aborted.get() {
         const FLASH_TEST_ADDR: u32 = 0x0007_C000; // 扇区 62 (0x7C000)
         let data: [u8; 64] = [
             0x52, b'F', b'L', b'A', b'S', b'H', 0x00, 0xFF, // 二进制 + ASCII 混合
@@ -367,9 +374,16 @@ extern "C" fn selftest_thread(_param: usize) {
     }
 
     // 汇总始终打印 (内核打印, 不受日志开关影响)
-    println!("[selftest] 完成: {} 通过, {} 失败", pass, fail);
-    // 允许再次通过 `selftest` 命令启动
-    SELFTEST_RUNNING.store(false, Ordering::SeqCst);
+    if aborted.get() {
+        println!(
+            "[selftest] 被中断 (ESC): 已完成 {} 项, 通过 {}, 失败 {}",
+            pass + fail,
+            pass,
+            fail
+        );
+    } else {
+        println!("[selftest] 完成: {} 通过, {} 失败", pass, fail);
+    }
 }
 
 /// 周期定时器回调 (中断上下文): 仅做计数, 不调用阻塞 API

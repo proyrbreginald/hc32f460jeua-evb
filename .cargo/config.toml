@@ -59,27 +59,27 @@ CFG_UART_TX_FSEL = "32"
 CFG_UART_RX_PIN = "10"
 CFG_UART_RX_FSEL = "33"
 CFG_UART_BAUDRATE = "115200"
-CFG_UART_OVERSAMPLE = "8"   # 8 或 16
-CFG_UART_CLOCK_DIV = "1"    # 1/4/16/64
-CFG_UART_DATA_BITS = "8"    # 8/9 (带校验时 8 = 7 数据 + 1 校验)
-CFG_UART_PARITY = "none"    # none/even/odd
-CFG_UART_STOP_BITS = "1"    # 1/2
-CFG_UART_FIRST_BIT = "lsb"  # lsb/msb
-CFG_UART_FLOW_CTRL = "none" # none/cts (RTS 为 F460 默认行为)
+CFG_UART_OVERSAMPLE = "8"       # 8 或 16
+CFG_UART_CLOCK_DIV = "1"        # 1/4/16/64
+CFG_UART_DATA_BITS = "8"        # 8/9 (带校验时 8 = 7 数据 + 1 校验)
+CFG_UART_PARITY = "none"        # none/even/odd
+CFG_UART_STOP_BITS = "1"        # 1/2
+CFG_UART_FIRST_BIT = "lsb"      # lsb/msb
+CFG_UART_FLOW_CTRL = "none"     # none/cts (RTS 为 F460 默认行为)
 CFG_UART_NOISE_FILTER = "false" # 噪声滤波 (三取二采样)
-CFG_UART_RX_BUF_SIZE = "512" # 中断接收环形缓冲 (字节)
-CFG_UART_IRQ_CHANNEL = "1"  # INTC 通道 INT000~INT007
-CFG_UART_IRQ_PRIORITY = "8" # NVIC 抢占优先级 0~15 (越小越高)
+CFG_UART_RX_BUF_SIZE = "512"    # 中断接收环形缓冲 (字节)
+CFG_UART_IRQ_CHANNEL = "1"      # INTC 通道 INT000~INT007
+CFG_UART_IRQ_PRIORITY = "8"     # NVIC 抢占优先级 0~15 (越小越高)
 
 # [gpio] 板载 LED (PC13)
 CFG_LED_PIN = "13"
-CFG_LED_LEVEL = "high"      # high / low
+CFG_LED_LEVEL = "high" # high / low
 
 # [shell] 终端登录 (改密码无需改代码)
 CFG_SHELL_USERNAME = "root"
-CFG_SHELL_PASSWORD = "root123"
-CFG_SHELL_LOGIN_TRIES = "3" # 登录失败允许次数
-CFG_SHELL_LINE_BUF = "128"  # 输入行缓冲区 (字节)
+CFG_SHELL_PASSWORD = "root"
+CFG_SHELL_LOGIN_TRIES = "3"    # 登录失败允许次数
+CFG_SHELL_LINE_BUF = "128"     # 输入行缓冲区 (字节)
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
 CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,led,log,selftest,clear,whoami,reboot,logout"
 
@@ -88,12 +88,10 @@ CFG_LOG_ENABLE = "true" # 日志默认开关 (运行时可用 shell `log on|off`
 CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出 ≤ 阈值)
 
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
-CFG_APP_SELFTEST_STACK = "4096"
-CFG_APP_SELFTEST_PRIORITY = "0"
 # 是否启用内核自检 (true/false); 启用后通过 shell 命令 `selftest` 手动启动,
 # 不再开机自动运行; false 时命令提示未启用
 CFG_APP_SELFTEST_ENABLE = "true"
-CFG_APP_SHELL_STACK = "4096"
+CFG_APP_SHELL_STACK = "8192"     # 自检在 shell 线程内同步执行, 需更大栈 (调试格式化机器栈较深)
 CFG_APP_SHELL_PRIORITY = "1"
 CFG_APP_SHELL_TIMESLICE = "10"
 CFG_APP_TIMER_PERIOD_MS = "2000"
