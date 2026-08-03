@@ -29,7 +29,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_DIV_*` | 总线分频 (1/2/4/8/16) |
 | `CFG_SYSTICK_HZ` / `CFG_TICKS_PER_SEC` | 节拍频率 (两者必须一致, 编译期校验) |
 | `CFG_PRIORITY_MAX` / `CFG_IDLE_*` | RTOS 优先级与空闲线程 |
-| `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 过采样 / 缓冲 / 中断参数 |
+| `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 数据位 / 校验 / 停止位 / 过采样 / 流控 / 噪声滤波 / 缓冲 / 中断参数 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
 | `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
@@ -243,18 +243,40 @@ continue
   `log` 命令控制); **汇总始终打印** (不受日志开关影响):
   `[selftest] 完成: N 通过, 0 失败`。
 
-### UART 中断接收 (USART1)
+### UART 驱动 (USART1~4)
 
-- `uart.enable_rx_interrupt(irq_n, priority)`: INTC 事件源映射 +
-  NVIC 使能 + `CR1.RIE` (对齐 DDL `INTC_IrqSignIn` / `USART_FuncCmd`);
-- 接收中断把字节写入 512 字节环形缓冲 (溢出丢弃新字节), 应用侧
-  `rx_count()` / `read_rx()` / `drain_rx()` 非阻塞读取;
+- `UartConfig` 对齐 DDL `stc_usart_uart_init_t`: 波特率 / 过采样 (8·16) /
+  时钟预分频 (1·4·16·64) / 数据位 (8·9) / 校验 (无·偶·奇) / 停止位 (1·2) /
+  首字节 (LSB·MSB) / CTS 硬件流控 / 噪声滤波; 默认 115200 8N1,
+  全部可经 `CFG_UART_*` 配置 (编译期校验);
+- 波特率: 纯整数计算 DIV_INT/FRAC (与 DDL `USART_CalculateBrr` 一致),
+  小数分频自动使能 FBME;
+- 引脚复用: 功能号见 `gpio::func` 常量 (数据手册表 2-2, USART1=32/33,
+  USART2=36~39, USART3=48~51, USART4=52~55); 各 USART 均挂 PCLK1;
+- 发送: `write_byte` / `write_word` (9 位模式) / `write` / `write_str` /
+  `flush` (等待发送完成 TC);
+- 接收 (中断驱动): `enable_rx_interrupt` 注册 INTC 通道 + NVIC +
+  `CR1.RIE` (对齐 DDL `INTC_IrqSignIn` / `USART_FuncCmd`);
+- 接收中断把字节写入环形缓冲 (大小 `CFG_UART_RX_BUF_SIZE`, 溢出丢弃
+  新字节), 应用侧 `rx_count()` / `read_rx()` / `drain_rx()` 非阻塞读取,
+  `read_rx_blocking()` 阻塞等待;
 - 错误处理对齐 `USART_ClearStatus`: 读 RDR 清 RXNE, 写 CR1 的
-  CPE/CFE/CORE 清 PE/FE/ORE;
+  CPE/CFE/CORE 清 PE/FE/ORE; ISR 同时累加 PE/FE/ORE 计数,
+  `rx_error_counts()` 读取并清零 (诊断波特率/接线/读取不及时);
 - 外设中断通过 `vector_table::register_irq` 分发 (INT000~007 槽位,
   向量表在 FLASH, 槽位预置分发入口, 回调运行时注册);
 - 真机验证 (115200, PC→板): ASCII/二进制/混合/连续数据均完整接收,
   500B 单包零丢失。
+
+### GPIO 驱动 (寄存器→端口→引脚)
+
+- 引脚层 `Pin<P, N>` (const 泛型): `configure` (模式/上拉/驱动/初始电平/
+  反相, 对齐 DDL `GPIO_Init`) / `set_func` (PFSR.FSEL) / `set_high` /
+  `set_low` / `toggle` / `is_high` / `output_is_high` / `set_output_enable`;
+- 端口层: `read_input_port` / `read_output_port` / `write_output_port` /
+  `set_output_enable_port` (对齐 DDL `GPIO_ReadInputPort` 等);
+- 功能复用号常量 `gpio::func::*` (数据手册表 2-2, 32 个 USART/SPI 功能);
+- 注意: HC32F460 **无内部下拉** (仅 PUU 上拉), 下拉需外部电阻。
 
 ```
 ooooooooo.   ooooooooooooo         ooooooooo.                            .   

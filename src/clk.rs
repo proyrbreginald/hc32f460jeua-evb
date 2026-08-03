@@ -415,12 +415,14 @@ pub fn xtal_init() -> Result<(), ClkError> {
         pull_up: false,
         drive: Drive::Low,
         initial_level: Level::Low,
+        invert: false,
     });
     Pin::<PortH, 1>::new().configure(Config {
         mode: Mode::Analog,
         pull_up: false,
         drive: Drive::Low,
         initial_level: Level::Low,
+        invert: false,
     });
 
     // 2. 解锁 CMU 寄存器

@@ -53,7 +53,85 @@ const PCR_NOD: u16 = 1 << 2; // 开漏
 const PCR_DRV_SHIFT: u16 = 4; // 驱动能力 (2 位)
 const PCR_DRV_MASK: u16 = 0x30;
 const PCR_PUU: u16 = 1 << 6; // 内部上拉
+const PCR_INVE: u16 = 1 << 9; // 输入反相
 const PCR_DDIS: u16 = 1 << 15; // 关闭数字输入 (模拟模式)
+
+// ================================ 功能复用号 (表 2-2) ================================
+
+/// 周边复用功能号 (PFSR.FSEL, 数据手册表 2-2, 与 DDL 的 GPIO_FUNC_* 一致)。
+///
+/// Func32~63 按引脚的 **Func_Grp1/Grp2 分组**映射 (组由硬件固定, 与引脚
+/// 相关): 同一功能号在不同引脚可能对应不同外设, 使用前请查数据手册
+/// "引脚功能表"。USART1/2 在 Grp1 (32~47), USART3/4 在 Grp2 (48~63)。
+pub mod func {
+    // ---- Func_Grp1: USART1 / USART2 / SPI1 / SPI2 ----
+    /// USART1_TX (如 PA9, PH1)
+    pub const USART1_TX: u8 = 32;
+    /// USART1_RX (如 PA10, PC1)
+    pub const USART1_RX: u8 = 33;
+    /// USART1_RTS
+    pub const USART1_RTS: u8 = 34;
+    /// USART1_CTS
+    pub const USART1_CTS: u8 = 35;
+    /// USART2_TX
+    pub const USART2_TX: u8 = 36;
+    /// USART2_RX
+    pub const USART2_RX: u8 = 37;
+    /// USART2_RTS
+    pub const USART2_RTS: u8 = 38;
+    /// USART2_CTS
+    pub const USART2_CTS: u8 = 39;
+    /// SPI1_MOSI
+    pub const SPI1_MOSI: u8 = 40;
+    /// SPI1_MISO
+    pub const SPI1_MISO: u8 = 41;
+    /// SPI1_SS0
+    pub const SPI1_SS0: u8 = 42;
+    /// SPI1_SCK
+    pub const SPI1_SCK: u8 = 43;
+    /// SPI2_MOSI
+    pub const SPI2_MOSI: u8 = 44;
+    /// SPI2_MISO
+    pub const SPI2_MISO: u8 = 45;
+    /// SPI2_SS0
+    pub const SPI2_SS0: u8 = 46;
+    /// SPI2_SCK
+    pub const SPI2_SCK: u8 = 47;
+
+    // ---- Func_Grp2: USART3 / USART4 / SPI3 / SPI4 ----
+    /// USART3_TX
+    pub const USART3_TX: u8 = 48;
+    /// USART3_RX
+    pub const USART3_RX: u8 = 49;
+    /// USART3_RTS
+    pub const USART3_RTS: u8 = 50;
+    /// USART3_CTS
+    pub const USART3_CTS: u8 = 51;
+    /// USART4_TX
+    pub const USART4_TX: u8 = 52;
+    /// USART4_RX
+    pub const USART4_RX: u8 = 53;
+    /// USART4_RTS
+    pub const USART4_RTS: u8 = 54;
+    /// USART4_CTS
+    pub const USART4_CTS: u8 = 55;
+    /// SPI3_MOSI
+    pub const SPI3_MOSI: u8 = 56;
+    /// SPI3_MISO
+    pub const SPI3_MISO: u8 = 57;
+    /// SPI3_SS0
+    pub const SPI3_SS0: u8 = 58;
+    /// SPI3_SCK
+    pub const SPI3_SCK: u8 = 59;
+    /// SPI4_MOSI
+    pub const SPI4_MOSI: u8 = 60;
+    /// SPI4_MISO
+    pub const SPI4_MISO: u8 = 61;
+    /// SPI4_SS0
+    pub const SPI4_SS0: u8 = 62;
+    /// SPI4_SCK
+    pub const SPI4_SCK: u8 = 63;
+}
 
 // ================================ 寄存器层 ================================
 
@@ -226,13 +304,16 @@ pub enum Drive {
 pub struct Config {
     /// 工作模式
     pub mode: Mode,
-    /// 内部上拉使能 (PCR.PUU=1)
+    /// 内部上拉使能 (PCR.PUU=1)。
+    /// 注: HC32F460 无内部下拉 (无 PUD 位), 下拉需外部电阻。
     pub pull_up: bool,
     /// 驱动能力 (PCR.DRV, 仅输出模式有效)
     pub drive: Drive,
     /// 配置完成时的初始输出电平 (PCR.POUT, 仅输出模式有效)。
     /// 输出数据位与输出使能位同一次写入, 使能瞬间即为目标电平, 无毛刺。
     pub initial_level: Level,
+    /// 输入反相 (PCR.INVE, 对齐 DDL GPIO_Init 的 u16Invert)
+    pub invert: bool,
 }
 
 impl Default for Config {
@@ -242,6 +323,7 @@ impl Default for Config {
             pull_up: false,
             drive: Drive::Medium,
             initial_level: Level::Low,
+            invert: false,
         }
     }
 }
@@ -318,12 +400,13 @@ impl<P: Port, const N: u8> Pin<P, N> {
         with_unlocked(|| self.pfsr().write(fsel as u16));
     }
 
-    /// 按配置初始化引脚: 选择 GPIO 功能 (PFSR.FSEL=0) 并设置模式/上拉/驱动/初始电平。
+    /// 按配置初始化引脚: 选择 GPIO 功能 (PFSR.FSEL=0) 并设置模式/上拉/驱动/
+    /// 初始电平/反相。
     ///
-    /// 寄存器值对齐 DDL 的 GPIO_Init (PCR 的 POUT/POUTE/NOD/DRV/PUU/DDIS,
-    /// 不设置 INTE/LTE/INVE —— 它们属于外部中断/锁存/输入反相功能)。
+    /// 寄存器值对齐 DDL 的 GPIO_Init (PCR 的 POUT/POUTE/NOD/DRV/PUU/DDIS/INVE,
+    /// 不设置 INTE/LTE —— 它们属于外部中断/输出锁存功能)。
     ///
-    /// 注意: 本方法**重置**该引脚的 PCR 全部可写位 (INVE/LTE/INTE 等会被清零),
+    /// 注意: 本方法**重置**该引脚的 PCR 全部可写位 (INTE/LTE 等会被清零),
     /// 适用于引脚生命周期内的一次性初始化。
     pub fn configure(&self, config: Config) {
         let bit = 1u16 << N;
@@ -386,6 +469,59 @@ impl<P: Port, const N: u8> Pin<P, N> {
             Level::Low => self.set_low(),
         }
     }
+
+    /// 使能/失能输出 (POER, 对齐 DDL `GPIO_OutputCmd`)。
+    /// 失能后引脚呈高阻, 可用于总线分时复用 (如共享数据线)。
+    pub fn set_output_enable(&self, enable: bool) {
+        set_output_enable_port::<P>(1u16 << N, enable);
+    }
+
+    /// 读取引脚输出状态 (PODR, 对齐 DDL `GPIO_ReadOutputPins`)。
+    /// 注意与 [`Pin::is_high`] (实时输入 PIDR) 的差别: 输入被外设占用/
+    /// 引脚外部钳位时, 两者可能不同。
+    pub fn output_is_high(&self) -> bool {
+        Reg::<u16>::new(P::DATA_OFFSET + PODR_OFF).read() & (1u16 << N) != 0
+    }
+
+    /// 读取引脚输出电平 (PODR)
+    pub fn output_level(&self) -> Level {
+        if self.output_is_high() {
+            Level::High
+        } else {
+            Level::Low
+        }
+    }
+}
+
+// ================================ 端口级操作 (DDL 对齐) ================================
+
+/// 读取整个端口的实时输入状态 (PIDR, 对齐 DDL `GPIO_ReadInputPort`)
+pub fn read_input_port<P: Port>() -> u16 {
+    Reg::<u16>::new(P::DATA_OFFSET + PIDR_OFF).read()
+}
+
+/// 读取整个端口的输出状态 (PODR, 对齐 DDL `GPIO_ReadOutputPort`)
+pub fn read_output_port<P: Port>() -> u16 {
+    Reg::<u16>::new(P::DATA_OFFSET + PODR_OFF).read()
+}
+
+/// 写入整个端口的输出数据 (PODR, 对齐 DDL `GPIO_WritePort`)
+pub fn write_output_port<P: Port>(value: u16) {
+    with_unlocked(|| Reg::<u16>::new(P::DATA_OFFSET + PODR_OFF).write(value));
+}
+
+/// 端口输出使能/失能 (POER, 对齐 DDL `GPIO_OutputCmd`)
+///
+/// `mask` 为引脚位掩码 (bit N = 引脚 N), 仅影响掩码位。
+pub fn set_output_enable_port<P: Port>(mask: u16, enable: bool) {
+    with_unlocked(|| {
+        let poer = Reg::<u16>::new(P::DATA_OFFSET + POER_OFF);
+        if enable {
+            poer.modify(|v| v | mask);
+        } else {
+            poer.modify(|v| v & !mask);
+        }
+    });
 }
 
 /// 由配置构造 PCR 寄存器值。
@@ -415,6 +551,9 @@ fn build_pcr_value(config: Config) -> u16 {
     }
     if config.mode == Mode::Analog {
         pcr |= PCR_DDIS; // 关闭数字输入
+    }
+    if config.invert {
+        pcr |= PCR_INVE; // 输入反相
     }
     pcr
 }

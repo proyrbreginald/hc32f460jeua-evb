@@ -207,7 +207,7 @@ fn cmd_help(_rest: &str) -> CmdResult {
 /// 系统信息
 fn cmd_sysinfo(_rest: &str) -> CmdResult {
     println!(
-        "{}  v{}  —  RT-Thread 架构的 Rust RTOS",
+        "{} v{} — RT-Thread 架构的 Rust RTOS",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
@@ -228,7 +228,15 @@ fn cmd_sysinfo(_rest: &str) -> CmdResult {
         crate::rtos::IDLE_PRIORITY
     );
     println!(
-        "构建       : {}  [{}]  {}",
+        "串口       : USART{} {:?}/{:?}/{:?}, {} bps",
+        config::UART_UNIT,
+        config::UART_DATA_BITS,
+        config::UART_PARITY,
+        config::UART_STOP_BITS,
+        config::UART_BAUDRATE
+    );
+    println!(
+        "构建       : {} [{}] {}",
         env!("RTOS_BUILD_DATE"),
         if cfg!(debug_assertions) {
             "debug"

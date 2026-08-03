@@ -15,15 +15,25 @@
 //! → USART_PR.PSC 预分频 (÷1/÷4/÷16/÷64) → 波特率发生器。
 //! **USART 时钟 = PCLK1 / 2^(2·PSC)**。
 //!
-//! # 引脚 (JEUA 48pin, 用户确认)
+//! # 引脚 (JEUA 48pin, 已对照数据手册表 2-1 核实)
 //!
 //! 各 USART 的可用引脚按封装不同, 需查数据手册表 2-1/2-2:
-//! - USART1: PA9=TX (FSEL 32), PA10=RX (FSEL 33), Func_Grp1;
-//! - 其他单元请按引脚表选择 (Func32~63 按引脚的 Func_Grp1/Grp2 映射)。
+//! - USART1: PA9=TX (Func32), PA10=RX (Func33), Func_Grp1;
+//! - USART2: 功能号 36/37/38/39 (TX/RX/RTS/CTS, Grp1);
+//! - USART3: 功能号 48/49/50/51 (TX/RX/RTS/CTS, Grp2);
+//! - USART4: 功能号 52/53/54/55 (TX/RX/RTS/CTS, Grp2);
+//! - 具体引脚是否支持某功能号以引脚功能表为准 (同一功能号在不同引脚
+//!   可能对应不同外设), 常量见 [`crate::gpio::func`]。
 //!
 //! Func_Grp1/Grp2 由引脚硬件固定, 无需软件配置。
 //! [`Uart::init`] 只配置外设本身, 引脚复用 (PFSR.FSEL) 需单独调用
 //! `gpio::Pin::set_func`。
+//!
+//! # 配置 (对齐 DDL `stc_usart_uart_init_t`)
+//!
+//! [`UartConfig`] 支持: 波特率 / 过采样 (8·16) / 时钟预分频 (1·4·16·64) /
+//! 数据位 (8·9) / 校验 (无·偶·奇) / 停止位 (1·2) / 首字节 (LSB·MSB) /
+//! CTS 流控 / 噪声滤波。默认 115200 8N1。
 //!
 //! # 波特率 (UART 模式, 8 位过采样)
 //!
@@ -105,14 +115,26 @@ const SR_PE: u32 = 1 << 0; // 奇偶校验错误
 const SR_FE: u32 = 1 << 1; // 帧错误
 const SR_ORE: u32 = 1 << 3; // 过载错误
 const SR_RXNE: u32 = 1 << 5; // 接收数据寄存器非空
+const SR_TC: u32 = 1 << 6; // 发送完成
 const SR_TXE: u32 = 1 << 7; // 发送数据寄存器空
 
 /// CR1 位
 const CR1_RE: u32 = 1 << 2; // 接收使能
 const CR1_TE: u32 = 1 << 3; // 发送使能
 const CR1_RIE: u32 = 1 << 5; // 接收中断使能 (RXNE + 接收错误)
+const CR1_PS: u32 = 1 << 9; // 校验选择: 0=偶, 1=奇
+const CR1_PCE: u32 = 1 << 10; // 校验使能
+const CR1_M: u32 = 1 << 12; // 数据位: 0=8, 1=9
 const CR1_OVER8: u32 = 1 << 15; // 8 位过采样
+const CR1_ML: u32 = 1 << 28; // 先发 MSB
 const CR1_FBME: u32 = 1 << 29; // 小数波特率使能
+const CR1_NFE: u32 = 1 << 30; // 噪声滤波 (RX 三取二采样)
+
+/// CR2 位
+const CR2_STOP: u32 = 1 << 13; // 停止位: 0=1, 1=2
+
+/// CR3 位
+const CR3_CTSE: u32 = 1 << 9; // CTS 硬件流控使能
 
 /// CR1 错误标志清除位 (写 1 清除, 对应 SR 的 PE/FE/ORE)
 const CR1_CPE: u32 = 1 << 16; // 清除奇偶校验错误
@@ -161,7 +183,56 @@ impl ClockDiv {
     }
 }
 
-/// UART 配置 (固定 8 数据位 / 1 停止位 / 无校验, 对齐 DDL StructInit 默认)
+/// UART 数据位 (CR1.M, 对齐 DDL USART_DATA_WIDTH_*)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataBits {
+    /// 8 位 (带校验时为 7 数据 + 1 校验)
+    Eight,
+    /// 9 位 (带校验时为 8 数据 + 1 校验)
+    Nine,
+}
+
+/// 校验位 (CR1.PCE/PS, 对齐 DDL USART_PARITY_*)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parity {
+    /// 无校验
+    None,
+    /// 偶校验
+    Even,
+    /// 奇校验
+    Odd,
+}
+
+/// 停止位 (CR2.STOP, 对齐 DDL USART_STOPBIT_*)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopBits {
+    /// 1 位停止位
+    One,
+    /// 2 位停止位
+    Two,
+}
+
+/// 发送顺序 (CR1.ML, 对齐 DDL USART_FIRST_BIT_*)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstBit {
+    /// 先发 LSB
+    Lsb,
+    /// 先发 MSB
+    Msb,
+}
+
+/// 硬件流控 (CR3.CTSE, 对齐 DDL USART_HW_FLOWCTRL_*)
+///
+/// 注: F460 的 RTS 为默认行为 (无独立使能位), 仅 CTS 可配置。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowControl {
+    /// 无硬件流控
+    None,
+    /// CTS 输入流控 (对端拉低即暂停发送)
+    Cts,
+}
+
+/// UART 配置 (对齐 DDL `stc_usart_uart_init_t` 的 UART 模式字段)
 #[derive(Clone, Copy, Debug)]
 pub struct UartConfig {
     /// 目标波特率 (bps)
@@ -170,6 +241,18 @@ pub struct UartConfig {
     pub oversample: Oversample,
     /// 时钟预分频
     pub clock_div: ClockDiv,
+    /// 数据位 (8/9)
+    pub data_bits: DataBits,
+    /// 校验位
+    pub parity: Parity,
+    /// 停止位
+    pub stop_bits: StopBits,
+    /// 发送顺序 (LSB/MSB)
+    pub first_bit: FirstBit,
+    /// 硬件流控 (CTS; RTS 为 F460 默认行为)
+    pub flow_control: FlowControl,
+    /// 噪声滤波 (CR1.NFE, 三取二采样)
+    pub noise_filter: bool,
 }
 
 impl Default for UartConfig {
@@ -178,6 +261,12 @@ impl Default for UartConfig {
             baudrate: 115_200,
             oversample: Oversample::Eight,
             clock_div: ClockDiv::Div1,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            first_bit: FirstBit::Lsb,
+            flow_control: FlowControl::None,
+            noise_filter: false,
         }
     }
 }
@@ -260,8 +349,9 @@ impl<const U: u8> Uart<U> {
 
     /// 初始化本 USART 为 UART 模式 (对齐 DDL USART_UART_Init + FuncCmd)
     ///
-    /// 序列: FCG1 时钟使能 → CR1/CR2/CR3 → PR 预分频 → BRR 波特率 →
-    /// 使能发送/接收。波特率计算在 RX/TX 使能前完成 (DDL 要求)。
+    /// 序列: FCG1 时钟使能 → CR1/CR2/CR3 (数据位/校验/停止位/过采样/噪声
+    /// 滤波/首字节/CTS 流控) → PR 预分频 → BRR 波特率 → 使能发送/接收。
+    /// 波特率计算在 RX/TX 使能前完成 (DDL 要求)。
     ///
     /// 注意: 本方法只配置 USART 外设, 引脚复用 (PFSR.FSEL) 需按封装
     /// 引脚表另行配置 (见数据手册表 2-1)。
@@ -278,28 +368,54 @@ impl<const U: u8> Uart<U> {
         let usart_clk = crate::clk::pclk1_hz() / config.clock_div.divisor();
         let (div_int, div_frac, fbme) = calc_brr(usart_clk, config.baudrate, config.oversample)?;
 
-        // 3. 控制寄存器: UART 模式 (MS=0), 8 位 (M=0), 无校验, LSB 先, 下降沿,
-        //    1 停止位, 内部时钟源, 无硬件流控 (对齐 DDL 8N1 默认)
-        let over8 = if config.oversample == Oversample::Eight {
-            CR1_OVER8
-        } else {
-            0
-        };
-        self.cr1().write(over8);
-        self.cr2().write(0);
-        self.cr3().write(0);
+        // 3. CR1: 过采样 / 数据位 / 校验 / 噪声滤波 / 首字节 / 起始位极性
+        //    (对齐 DDL USART_UART_Init: OVER8/M/PCE/PS/NFE/ML/SBS,
+        //    起始位极性取默认低电平 SBS=0)
+        let mut cr1 = 0u32;
+        if config.oversample == Oversample::Eight {
+            cr1 |= CR1_OVER8;
+        }
+        if config.data_bits == DataBits::Nine {
+            cr1 |= CR1_M;
+        }
+        match config.parity {
+            Parity::None => {}
+            Parity::Even => cr1 |= CR1_PCE,
+            Parity::Odd => cr1 |= CR1_PCE | CR1_PS,
+        }
+        if config.noise_filter {
+            cr1 |= CR1_NFE;
+        }
+        if config.first_bit == FirstBit::Msb {
+            cr1 |= CR1_ML;
+        }
+        self.cr1().write(cr1);
 
-        // 4. 预分频 (PR.PSC)
+        // 4. CR2: 停止位
+        let mut cr2 = 0u32;
+        if config.stop_bits == StopBits::Two {
+            cr2 |= CR2_STOP;
+        }
+        self.cr2().write(cr2);
+
+        // 5. CR3: CTS 硬件流控 (RTS 为 F460 默认行为, 无使能位)
+        let mut cr3 = 0u32;
+        if config.flow_control == FlowControl::Cts {
+            cr3 |= CR3_CTSE;
+        }
+        self.cr3().write(cr3);
+
+        // 6. 预分频 (PR.PSC)
         self.pr().write(config.clock_div.psc());
 
-        // 5. 波特率寄存器 (整数 + 小数)
+        // 7. 波特率寄存器 (整数 + 小数)
         self.brr()
             .write((div_int << BRR_DIV_INTEGER_POS) | div_frac);
         if fbme {
             self.cr1().modify(|v| v | CR1_FBME);
         }
 
-        // 6. 使能发送与接收 (对齐示例 USART_FuncCmd(USART_TX | USART_RX))
+        // 8. 使能发送与接收 (对齐示例 USART_FuncCmd(USART_TX | USART_RX))
         self.cr1().modify(|v| v | CR1_TE | CR1_RE);
 
         Ok(())
@@ -325,10 +441,37 @@ impl<const U: u8> Uart<U> {
         self.write(s.as_bytes());
     }
 
+    /// 发送 16 位数据 (TDR 为 16 位寄存器, 9 位数据模式下使用;
+    /// 8 位模式等价于 [`Uart::write_byte`])
+    pub fn write_word(&self, data: u16) {
+        while self.sr().read() & SR_TXE == 0 {
+            // 等待发送数据寄存器空
+        }
+        self.tdr().write_u16(data);
+    }
+
+    /// 等待发送完成 (SR.TC=1): 最后一个字节已移出移位寄存器并完成发送。
+    ///
+    /// 常用于断电/睡眠/切流控前确保数据完整送达 (对齐 DDL 发送流程)。
+    pub fn flush(&self) {
+        while self.sr().read() & SR_TC == 0 {
+            // 等待发送完成
+        }
+    }
+
     /// 非阻塞读取一个字节 (SR.RXNE=1 时有数据)
     pub fn read_byte(&self) -> Option<u8> {
         if self.sr().read() & SR_RXNE != 0 {
             Some(self.rdr().read_u16() as u8)
+        } else {
+            None
+        }
+    }
+
+    /// 非阻塞读取 16 位数据 (9 位数据模式下使用)
+    pub fn read_word(&self) -> Option<u16> {
+        if self.sr().read() & SR_RXNE != 0 {
+            Some(self.rdr().read_u16())
         } else {
             None
         }
@@ -435,6 +578,29 @@ static RX_SEMS: [crate::rtos::Semaphore; 4] = [
     crate::rtos::Semaphore::new(0, 255),
 ];
 
+/// 接收错误计数 (ISR 累加, 诊断串口噪声/接线/对端波特率用)
+struct RxErrorCounts {
+    parity: core::sync::atomic::AtomicU32,
+    frame: core::sync::atomic::AtomicU32,
+    overrun: core::sync::atomic::AtomicU32,
+}
+
+const fn new_rx_error_counts() -> RxErrorCounts {
+    RxErrorCounts {
+        parity: core::sync::atomic::AtomicU32::new(0),
+        frame: core::sync::atomic::AtomicU32::new(0),
+        overrun: core::sync::atomic::AtomicU32::new(0),
+    }
+}
+
+/// 各 USART 单元的接收错误计数 (PE/FE/ORE)
+static RX_ERRORS: [RxErrorCounts; 4] = [
+    new_rx_error_counts(),
+    new_rx_error_counts(),
+    new_rx_error_counts(),
+    new_rx_error_counts(),
+];
+
 /// 接收中断 ISR (对齐 DDL 示例 USART_RxFull_IrqCallback + USART_RxError_IrqCallback)
 ///
 /// - RXNE: 读 RDR 取数据入环形缓冲 (读 RDR 自动清 RXNE);
@@ -450,10 +616,27 @@ unsafe extern "C" fn rx_irq_handler<const U: u8>() {
             // 读 RDR: 清 RXNE/ORE, 同时取出数据 (对齐示例先读再判错)
             let byte = core::ptr::read_volatile((base + 0x06) as *const u16) as u8;
             let ring = &mut *RX_RINGS[U as usize - 1].0.get();
+            let errors = &RX_ERRORS[U as usize - 1];
             if sr & SR_RXNE != 0 {
                 ring.push(byte);
                 // 通知等待线程 (信号量计数截断: 缓冲满时退化为"有数据"提示)
                 RX_SEMS[U as usize - 1].release();
+            }
+            // 错误计数 (诊断用, 读 RDR 后仍可通过 SR 判断)
+            if sr & SR_PE != 0 {
+                errors
+                    .parity
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            if sr & SR_FE != 0 {
+                errors
+                    .frame
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            if sr & SR_ORE != 0 {
+                errors
+                    .overrun
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             if sr & (SR_PE | SR_FE | SR_ORE) != 0 {
                 // 读-改-写 CR1 清除错误标志 (CPE/CFE/CORE, 对齐 USART_ClearStatus)
@@ -468,6 +651,19 @@ unsafe extern "C" fn rx_irq_handler<const U: u8>() {
 }
 
 impl<const U: u8> Uart<U> {
+    /// 读取接收错误计数 (PE/FE/ORE, ISR 自上次读取后累计) 并清零。
+    ///
+    /// 用于诊断: 持续增长的 FE/PE 提示波特率或接线问题, ORE 提示
+    /// 应用读取不及时 (环形缓冲溢出)。
+    pub fn rx_error_counts(&self) -> (u32, u32, u32) {
+        let e = &RX_ERRORS[U as usize - 1];
+        (
+            e.parity.swap(0, core::sync::atomic::Ordering::Relaxed),
+            e.frame.swap(0, core::sync::atomic::Ordering::Relaxed),
+            e.overrun.swap(0, core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     /// 阻塞等待一个接收字节 (中断驱动, 无需轮询)
     ///
     /// 挂起在数据到达信号量上, 由 RX ISR 唤醒; 收到字节即返回。

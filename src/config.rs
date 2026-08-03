@@ -165,6 +165,53 @@ pub const UART_CLOCK_DIV: uart::ClockDiv = match parse_u32(env!("CFG_UART_CLOCK_
     64 => uart::ClockDiv::Div64,
     _ => panic!("CFG_UART_CLOCK_DIV 非法 (可用 1/4/16/64)"),
 };
+/// 数据位 (CFG_UART_DATA_BITS = 8/9)
+pub const UART_DATA_BITS: uart::DataBits = match parse_u32(env!("CFG_UART_DATA_BITS")) {
+    8 => uart::DataBits::Eight,
+    9 => uart::DataBits::Nine,
+    _ => panic!("CFG_UART_DATA_BITS 非法 (可用 8/9)"),
+};
+/// 校验位 (CFG_UART_PARITY = none/even/odd)
+pub const UART_PARITY: uart::Parity = if eq_str(env!("CFG_UART_PARITY"), "none") {
+    uart::Parity::None
+} else if eq_str(env!("CFG_UART_PARITY"), "even") {
+    uart::Parity::Even
+} else if eq_str(env!("CFG_UART_PARITY"), "odd") {
+    uart::Parity::Odd
+} else {
+    panic!("CFG_UART_PARITY 非法 (可用 none/even/odd)")
+};
+/// 停止位 (CFG_UART_STOP_BITS = 1/2)
+pub const UART_STOP_BITS: uart::StopBits = match parse_u32(env!("CFG_UART_STOP_BITS")) {
+    1 => uart::StopBits::One,
+    2 => uart::StopBits::Two,
+    _ => panic!("CFG_UART_STOP_BITS 非法 (可用 1/2)"),
+};
+/// 发送顺序 (CFG_UART_FIRST_BIT = lsb/msb)
+pub const UART_FIRST_BIT: uart::FirstBit = if eq_str(env!("CFG_UART_FIRST_BIT"), "lsb") {
+    uart::FirstBit::Lsb
+} else if eq_str(env!("CFG_UART_FIRST_BIT"), "msb") {
+    uart::FirstBit::Msb
+} else {
+    panic!("CFG_UART_FIRST_BIT 非法 (可用 lsb/msb)")
+};
+/// 硬件流控 (CFG_UART_FLOW_CTRL = none/cts; RTS 为 F460 默认行为)
+pub const UART_FLOW_CTRL: uart::FlowControl =
+    if eq_str(env!("CFG_UART_FLOW_CTRL"), "none") {
+        uart::FlowControl::None
+    } else if eq_str(env!("CFG_UART_FLOW_CTRL"), "cts") {
+        uart::FlowControl::Cts
+    } else {
+        panic!("CFG_UART_FLOW_CTRL 非法 (可用 none/cts)")
+    };
+/// 噪声滤波 (CFG_UART_NOISE_FILTER = true/false, CR1.NFE)
+pub const UART_NOISE_FILTER: bool = if eq_str(env!("CFG_UART_NOISE_FILTER"), "true") {
+    true
+} else if eq_str(env!("CFG_UART_NOISE_FILTER"), "false") {
+    false
+} else {
+    panic!("CFG_UART_NOISE_FILTER 非法 (可用 true/false)")
+};
 /// 接收环形缓冲大小 (字节) (CFG_UART_RX_BUF_SIZE)
 pub const UART_RX_BUF_SIZE: usize = parse_u32(env!("CFG_UART_RX_BUF_SIZE")) as usize;
 /// INTC 中断通道 (CFG_UART_IRQ_CHANNEL, INT000~INT007)

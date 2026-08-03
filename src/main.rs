@@ -313,6 +313,7 @@ fn hardware_init() -> config::ConsoleUart {
             pull_up: false,
             drive: Drive::Low,
             initial_level: config::LED_INITIAL_LEVEL,
+            invert: false,
         });
     // UART 引脚复用 (PA9=TX / PA10=RX; 引脚号/功能号来自配置)
     gpio.pin::<PortA, { config::UART_TX_PIN }>()
@@ -324,12 +325,18 @@ fn hardware_init() -> config::ConsoleUart {
     systick::init(SYSTICK_FREQ_HZ).expect("SysTick 配置失败!");
     log_debug!("SysTick: {} Hz", SYSTICK_FREQ_HZ);
 
-    // 控制台 USART (波特率/过采样/分频来自配置)
+    // 控制台 USART (波特率/数据位/校验/停止位/流控等来自配置)
     let uart = config::ConsoleUart::take();
     uart.init(UartConfig {
         baudrate: config::UART_BAUDRATE,
         oversample: config::UART_OVERSAMPLE,
         clock_div: config::UART_CLOCK_DIV,
+        data_bits: config::UART_DATA_BITS,
+        parity: config::UART_PARITY,
+        stop_bits: config::UART_STOP_BITS,
+        first_bit: config::UART_FIRST_BIT,
+        flow_control: config::UART_FLOW_CTRL,
+        noise_filter: config::UART_NOISE_FILTER,
     })
     .expect("UART 初始化失败!");
     log_debug!(
