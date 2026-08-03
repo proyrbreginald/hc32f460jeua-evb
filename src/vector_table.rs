@@ -238,8 +238,8 @@ pub static RESET_VECTOR: unsafe extern "C" fn() -> ! = crate::startup::reset_han
 #[unsafe(no_mangle)]
 pub static EXCEPTIONS: [Vector; 14] = [
     Vector {
-        handler: default_handler,
-    }, // 2: NMI
+        handler: crate::panic::nmi_handler,
+    }, // 2: NMI (SRAM 奇偶/ECC 等硬件事件, 输出诊断)
     Vector {
         handler: crate::panic::fault_handler,
     }, // 3: HardFault

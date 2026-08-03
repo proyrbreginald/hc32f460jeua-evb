@@ -149,6 +149,17 @@ extern "C" fn victim_thread(_param: usize) {
 /// 自然退出的线程: 入口返回后经 thread_exit → defunct → 空闲线程回收
 extern "C" fn exit_thread(_param: usize) {}
 
+/// 阻塞发送线程: 向容量 2 的邮箱连发 3 条 (第 3 条在满时阻塞,
+/// 由接收者取走消息后唤醒) —— 回归"唤醒不重试丢消息"缺陷
+static BLK_MB: rtos::Mailbox = rtos::Mailbox::new(2);
+
+extern "C" fn blk_sender(_param: usize) {
+    for i in 0..3 {
+        let r = BLK_MB.send(1000 + i, Timeout::Forever);
+        log_trace!("[selftest] 阻塞发送 {}: {:?}", i, r);
+    }
+}
+
 /// 检测用户是否按下 ESC (0x1B): 轮询并清空接收缓冲
 ///
 /// 自检期间终端输入一律丢弃 (ESC 除外); 返回 true 表示请求中断。
@@ -356,18 +367,38 @@ pub(crate) fn selftest_run() {
         victim.delete();
         log_debug!("[selftest] delete() 已返回, 延时 50ms");
         rtos::thread_delay_ms(50);
+        // 可观测断言: victim 已从线程列表消失
+        let gone = !rtos::thread_info_list().iter().any(|t| t.name == "victim");
         check(
-            true,
-            "线程删除: delete() 完成且系统正常",
+            gone,
+            "线程删除: victim 已删除并从列表消失",
             format_args!("victim 已删除, 系统无异常"),
         );
         log_debug!("[selftest] 创建 exit-me 线程");
         rtos::thread_create("exit-me", 1024, 25, 0, exit_thread, 0);
         rtos::thread_delay_ms(100);
+        let gone = !rtos::thread_info_list().iter().any(|t| t.name == "exit-me");
         check(
-            true,
+            gone,
             "线程退出: 入口返回后经 defunct 回收",
-            format_args!("exit-me 已退出并被回收"),
+            format_args!("exit-me 已退出并从列表消失"),
+        );
+    }
+
+    // IPC 阻塞唤醒回归 (P0): 发送者在满邮箱上阻塞, 接收者取走消息后
+    // 唤醒并完成发送 —— 旧实现唤醒后直接返回 Full, 消息丢失
+    if !aborted.get() {
+        let sender = rtos::thread_create("blk-send", 1024, 24, 0, blk_sender, 0);
+        let mut got = [usize::MAX; 3];
+        for slot in &mut got {
+            *slot = BLK_MB.recv(Timeout::Forever).unwrap_or(usize::MAX);
+        }
+        rtos::thread_delay_ms(20); // 让发送者线程退出并回收
+        let _ = sender;
+        check(
+            got == [1000, 1001, 1002],
+            "IPC: 满邮箱阻塞发送/接收, 消息不丢",
+            format_args!("got = {:?}", got),
         );
     }
 

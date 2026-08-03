@@ -287,6 +287,11 @@ fn pll_config() -> PllConfig {
     }
 }
 
+/// PLL 源是否为 XTAL (0=XTAL, 1=HRC)
+fn pll_src_is_xtal() -> bool {
+    crate::config::PLL_SRC == 0
+}
+
 /// 启动 MPLL 并等待锁定 (对齐 DDL CLK_PLLInit + CLK_PLLCmd)
 ///
 /// 前置条件: 时钟源 ([`PllConfig::src`] 选择的 XTAL/HRC) 必须已启动稳定。
@@ -346,8 +351,10 @@ pub fn switch_to_pll() {
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_PLL);
     delay_short();
     cmu_lock();
-    // 晶振作为 PLL 源仍在工作
-    XTAL_STATUS.store(STATUS_ACTIVE, Ordering::Relaxed);
+    // 仅当 PLL 源为 XTAL 时报告晶振激活 (HRC 源时 XTAL 未启动)
+    if pll_src_is_xtal() {
+        XTAL_STATUS.store(STATUS_ACTIVE, Ordering::Relaxed);
+    }
 }
 
 /// 总线时钟分频配置 (SCFGR), 分频系数来自 .cargo/config.toml `CFG_DIV_*`:

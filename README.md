@@ -256,6 +256,10 @@ extern "C" fn led_thread(_p: usize) {
 
 ### IPC 速查
 
+- **阻塞语义对齐 RT-Thread**: 所有阻塞等待 (take/lock/send/recv) 在唤醒后
+  **回到临界区重新检查条件**再完成操作 —— 满邮箱的发送者被取走后不丢
+  消息, 空队列的接收者被发送后不假超时 (selftest 含阻塞唤醒回归项);
+
 ```rust
 static SEM: Semaphore = Semaphore::new(0, 1);
 static MUT: Mutex = Mutex::new();                 // 优先级继承

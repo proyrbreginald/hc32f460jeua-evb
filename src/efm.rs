@@ -351,9 +351,11 @@ pub fn set_wait_cycle(hclk_hz: u32) {
             (EFM_BASE + FRMC) as *mut u32,
             (frmc & !FRMC_FLWT_MASK) | cycles,
         );
-        // 回读确认配置生效
-        while core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32) & FRMC_FLWT_MASK != cycles {
-            // 等待
+        // 回读确认配置生效 (带超时, 防解锁失败时永久自旋)
+        for _ in 0..10_000 {
+            if core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32) & FRMC_FLWT_MASK == cycles {
+                break;
+            }
         }
     }
     lock();

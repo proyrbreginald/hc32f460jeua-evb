@@ -429,18 +429,21 @@ impl<P: Port, const N: u8> Pin<P, N> {
     }
 
     /// 输出高电平 (POSR 写 1, 原子操作)
+    ///
+    /// POSR/PORR/POTR 是"写 1 生效"的数据寄存器, **不受 PWPR 保护**,
+    /// 单次 volatile 写天然原子, 无需临界区/解锁 (对齐 DDL `GPIO_SetPins`)。
     pub fn set_high(&self) {
-        with_unlocked(|| self.posr().write(1u16 << N));
+        self.posr().write(1u16 << N);
     }
 
     /// 输出低电平 (PORR 写 1, 原子操作)
     pub fn set_low(&self) {
-        with_unlocked(|| self.porr().write(1u16 << N));
+        self.porr().write(1u16 << N);
     }
 
     /// 翻转输出电平 (POTR 写 1, 原子操作)
     pub fn toggle(&self) {
-        with_unlocked(|| self.potr().write(1u16 << N));
+        self.potr().write(1u16 << N);
     }
 
     /// 读取引脚实时输入电平 (PIDR)

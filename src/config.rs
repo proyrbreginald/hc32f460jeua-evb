@@ -295,8 +295,12 @@ const _: () = assert!(
     UART_RX_IRQ_CHANNEL < 128,
     "CFG_UART_IRQ_CHANNEL 应为 INT000~INT127 (共享线 INT128+ 不支持)"
 );
-/// NVIC 抢占优先级 (CFG_UART_IRQ_PRIORITY, 0~15)
+/// NVIC 抢占优先级 (CFG_UART_IRQ_PRIORITY, 0~15, 越小越高)
 pub const UART_RX_IRQ_PRIORITY: u8 = parse_u8(env!("CFG_UART_IRQ_PRIORITY"));
+const _: () = assert!(
+    UART_RX_IRQ_PRIORITY <= 15,
+    "CFG_UART_IRQ_PRIORITY 非法 (可用 0~15)"
+);
 
 // ============================== [gpio] ==============================
 

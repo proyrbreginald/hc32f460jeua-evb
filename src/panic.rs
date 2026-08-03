@@ -26,6 +26,23 @@
 
 use crate::console::write_fmt_raw as write_fmt;
 
+/// NMI 处理器 (向量表异常 2)
+///
+/// HC32F460 的 SRAM 奇偶/ECC 错误默认经 **NMI** 上报 (见 `sram` 模块,
+/// CKCR.PYOAD/ECCOAD 可改为复位)。此处输出诊断后停机 —— 否则静默
+/// 死循环无法定位。无锁输出 (write_fmt_raw), 中断上下文安全。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmi_handler() {
+    write_fmt(core::format_args!(
+        "\r\n[NMI] SRAM 奇偶/ECC 错误? 状态 = {:#x}, 标志 = {:#x}\r\n",
+        crate::sram::status(),
+        crate::sram::status()
+    ));
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
 /// panic/fault 后的行为策略 (编译期常量, 修改此处即可切换)
 const STRATEGY: PanicStrategy = PanicStrategy::Halt;
 

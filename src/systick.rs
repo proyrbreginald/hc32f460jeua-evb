@@ -1,9 +1,6 @@
 //! SysTick 节拍驱动
 //!
-//! 对齐 DDL `hc32_ll_utility.c` 的 SysTick 驱动:
-//! [`init`](SysTick_Init) / [`on_tick`](SysTick_IncTick) /
-//! [`get_tick_ms`](SysTick_GetTick) / [`delay_ms`](SysTick_Delay) /
-//! [`suspend`](SysTick_Suspend) / [`resume`](SysTick_Resume)。
+//! 对齐 DDL `hc32_ll_utility.c` 的 SysTick 驱动 (仅保留 [`init`])。
 //!
 //! # 时钟源
 //!
@@ -14,25 +11,18 @@
 //! # 时序
 //!
 //! 中断频率 = `HCLK / (reload + 1)`, 其中 `reload` 为 24 位。
-//! 节拍计数以毫秒为单位: 每次中断累加 `1000 / freq`
-//! (与 DDL `SysTick_Init` 的 `m_u32TickStep` 一致), 因此 **仅当
-//! `freq ≤ 1000 Hz` 时 tick 计数与 [`delay_ms`] 有效**; 更高频率下
-//! SysTick 仍按配置触发中断, 但节拍功能不可用。
+//! 中断服务函数由应用层实现 (RTOS 节拍, 见 `main::sys_tick_handler`),
+//! 由向量表 [`crate::vector_table::EXCEPTIONS`] 的 SysTick 槽位
+//! (异常 15) 指向, ISR 末尾留意 Arm Errata 838869 (DSB)。
 //!
-//! # 中断安全
-//!
-//! 节拍计数使用原子类型, [`on_tick`] 在中断上下文自增,
-//! 主循环可随时查询, 无竞争。
-//!
-//! 中断服务函数由应用层实现 (翻转 LED 等业务), 由向量表
-//! [`crate::vector_table::EXCEPTIONS`] 的 SysTick 槽位 (异常 15) 指向,
-//! 函数体内应首先调用 [`on_tick`] 并留意 Arm Errata 838869 (ISR 末尾 DSB)。
+//! 注意: 本模块**不维护独立节拍计数** —— RTOS 已内置节拍
+//! ([`crate::rtos::tick`]), 避免双计数源; 节拍类 API 请使用 RTOS 的。
 //!
 //! HAL 提供完整 API, 但应用往往只使用其中一部分 (节拍/延时/暂停恢复等),
 //! 因此忽略未使用项的死代码警告。
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicU32, Ordering};
+// 无原子状态: 本模块不维护独立节拍计数 (RTOS 内置)
 
 /// SysTick 外设基地址 (Cortex-M4 内核外设)
 const SYST_BASE: usize = 0xE000_E010;
@@ -78,12 +68,6 @@ const CSR_ENABLE: u32 = 1 << 0; // 计数器使能
 const CSR_TICKINT: u32 = 1 << 1; // 中断使能
 const CSR_CLKSOURCE: u32 = 1 << 2; // 时钟源: 1 = 处理器时钟 (HCLK)
 
-/// 节拍计数 (毫秒), 由 [`on_tick`] 在中断中累加
-static TICK_MS: AtomicU32 = AtomicU32::new(0);
-
-/// 每次中断累加的毫秒数 (1000 / freq)
-static TICK_STEP_MS: AtomicU32 = AtomicU32::new(0);
-
 /// SysTick 配置失败原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystickError {
@@ -115,41 +99,5 @@ pub fn init(freq_hz: u32) -> Result<(), SystickError> {
     RVR.write(ticks - 1);
     CVR.write(0);
     CSR.write(CSR_CLKSOURCE | CSR_TICKINT | CSR_ENABLE);
-
-    // 毫秒步进: freq ≤ 1000 时为 1~1000; 更高频率下为 0, 节拍功能不可用
-    TICK_STEP_MS.store(1000 / freq_hz, Ordering::Relaxed);
     Ok(())
-}
-
-/// SysTick 中断服务函数内调用: 累加节拍计数 (对齐 DDL `SysTick_IncTick`)
-pub fn on_tick() {
-    TICK_MS.fetch_add(TICK_STEP_MS.load(Ordering::Relaxed), Ordering::Relaxed);
-}
-
-/// 查询节拍计数 (毫秒, 对齐 DDL `SysTick_GetTick`)
-///
-/// 无符号回绕安全: 约 49.7 天 (2^32 ms) 回绕, 差值计算不受影响。
-pub fn get_tick_ms() -> u32 {
-    TICK_MS.load(Ordering::Relaxed)
-}
-
-/// 基于节拍计数的忙等待 (对齐 DDL `SysTick_Delay`)
-///
-/// 仅在 `freq ≤ 1000 Hz` 时有效 (见模块文档)。
-/// 注意: 若中断被 [`suspend`] 暂停或 SysTick 未配置, 本函数可能无法返回。
-pub fn delay_ms(ms: u32) {
-    let start = get_tick_ms();
-    while get_tick_ms().wrapping_sub(start) < ms {
-        // 空转等待
-    }
-}
-
-/// 暂停 SysTick 中断 (计数器继续运行, 对齐 DDL `SysTick_Suspend`)
-pub fn suspend() {
-    CSR.modify(|v| v & !CSR_TICKINT);
-}
-
-/// 恢复 SysTick 中断 (对齐 DDL `SysTick_Resume`)
-pub fn resume() {
-    CSR.modify(|v| v | CSR_TICKINT);
 }

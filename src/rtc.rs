@@ -408,6 +408,12 @@ pub fn clear_alarm_flag() {
 static BASE_DAYS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static BASE_SECS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// 运行时长缓存 (键 = SEC 寄存器值; 秒未变则复用, 避免每次读全部寄存器)。
+/// 注: thumbv7em 无 64 位原子, 天/时分秒分存两个 u32。
+static CACHE_SEC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
+static CACHE_DAYS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static CACHE_HMS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// 记录基准 (由 [`start`] 调用; 未设置日期时按 2000-01-01)
 fn record_base() {
     let d = get_date();
@@ -428,19 +434,39 @@ fn secs_of_day(t: Time) -> u32 {
 ///
 /// 由日历寄存器推导 (跨月/跨年正确, Howard Hinnant 公历算法);
 /// RTC 未运行 (未初始化/未启动) 时返回 None —— 日志时间戳据此省略。
+///
+/// **性能**: 秒未变化时复用缓存 (键 = SEC 寄存器), 避免每条日志
+/// 都进出 RW 模式读全部时间寄存器; 运行期改时间导致回退时按 0 计
+/// (下溢保护)。
 pub fn elapsed_dhms() -> Option<(u32, u32, u32, u32)> {
     if !running() {
         return None;
     }
+    use core::sync::atomic::Ordering;
+    // 快速路径: 秒未变 → 复用上次结果 (日志高频场景仅 2 次寄存器读)
+    let sec_reg = read8(SEC);
+    if CACHE_SEC.load(Ordering::Relaxed) == sec_reg {
+        let days = CACHE_DAYS.load(Ordering::Relaxed);
+        let v = CACHE_HMS.load(Ordering::Relaxed);
+        return Some((days, v >> 16, (v >> 8) & 0xFF, v & 0xFF));
+    }
+    // 全量计算 (每秒至多一次)
     let d = get_date();
     let t = get_time();
     let now_days = days_from_civil(2000 + d.year as i64, d.month as u32, d.day as u32) as u32;
     let now_secs = secs_of_day(t);
-    let base_days = BASE_DAYS.load(core::sync::atomic::Ordering::Relaxed);
-    let base_secs = BASE_SECS.load(core::sync::atomic::Ordering::Relaxed);
+    let base_days = BASE_DAYS.load(Ordering::Relaxed);
+    let base_secs = BASE_SECS.load(Ordering::Relaxed);
 
-    let total = (now_days - base_days) * 86_400 + now_secs - base_secs;
-    Some((total / 86_400, (total / 3600) % 24, (total / 60) % 60, total % 60))
+    // 下溢保护: 运行期回拨时间/日期使 now < base 时按 0 计
+    let total = (now_days as i64 - base_days as i64) * 86_400 + now_secs as i64 - base_secs as i64;
+    let total = total.max(0) as u32;
+    let dhms = (total / 86_400, (total / 3600) % 24, (total / 60) % 60, total % 60);
+
+    CACHE_SEC.store(sec_reg, Ordering::Relaxed);
+    CACHE_DAYS.store(dhms.0, Ordering::Relaxed);
+    CACHE_HMS.store((dhms.1 << 16) | (dhms.2 << 8) | dhms.3, Ordering::Relaxed);
+    Some(dhms)
 }
 
 /// 公历天数 (自 1970-01-01, Howard Hinnant 算法, const)
