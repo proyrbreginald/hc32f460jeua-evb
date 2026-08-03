@@ -297,8 +297,9 @@ extern "C" fn timer_cb(_param: usize) {
 ///
 /// 各参数 (时钟源/引脚/波特率/节拍频率等) 均来自 .cargo/config.toml。
 fn hardware_init() -> config::ConsoleUart {
-    // 时钟初始化 (时钟源来自配置, 失败自动回退)
-    let _ = clk::init(config::CLOCK_SOURCE);
+    // 时钟初始化: 按配置选择时钟源 (mrc/hrc/xtal/pll, PLL 源可配 XTAL 或
+    // HRC), 失败自动回退 (见 clk::init)
+    let _ = clk::init();
     log_debug!(
         "时钟: {} Hz (源 {:?})",
         clk::system_clock_hz(),

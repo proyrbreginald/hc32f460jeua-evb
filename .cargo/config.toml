@@ -13,16 +13,26 @@ target = "thumbv7em-none-eabihf"
 CFG_CHIP_MODEL = "HC32F460JEUA"
 CFG_CORE = "Cortex-M4F"
 
-# [clk] 外部晶振频率 (4~25MHz) / 时钟源 (mrc|xtal|pll)
+# HRC 频率 16|20 MHz (ICG1.HRCFREQSEL, 经 flash 0x404 ICG 配置字生效,
+# 复位时硬件载入, 运行期只读)
+CFG_HRC_FREQ = "16"
+# HRC 复位后是否停止 (ICG1.HRCSTOP): true=停止 (需 clk::hrc_cmd 启动,
+# 默认安全) / false=持续振荡 (复位即运行, 无需 hrc_cmd)
+CFG_HRC_STOP = "false"
+# [clk] 外部晶振频率 (4~25MHz)
 CFG_XTAL_HZ = "8000000"
-CFG_CLK_SOURCE = "pll"
+# XTAL 起振配置: 稳定时间 1~9 (≈133µs~32ms, 5=2ms) / 驱动 ulow|low|mid|high
+CFG_XTAL_STABLE_TIME = "5"
+CFG_XTAL_DRV = "ulow"
 # MPLL 倍频分频 (PLLCLK = src ÷(m+1) ×(n+1) ÷(p+1); src: 0=XTAL, 1=HRC)
-CFG_PLL_SRC = "0"
-CFG_PLL_M = "0"
+CFG_PLL_SRC = "1"
+CFG_PLL_M = "1"
 CFG_PLL_N = "49"
 CFG_PLL_P = "1"
 CFG_PLL_Q = "1"
 CFG_PLL_R = "1"
+# 时钟源 (mrc|hrc|xtal|pll)
+CFG_CLK_SOURCE = "pll"
 # 总线分频 (1/2/4/8/16); 200MHz 方案: HCLK÷1, PCLK0÷1, PCLK1÷2,
 # PCLK2/3÷4, PCLK4/EXCLK÷2 (200MHz 下外设总线必须分频!)
 CFG_DIV_HCLK = "1"

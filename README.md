@@ -24,8 +24,10 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | 前缀 | 内容 |
 |---|---|
 | `CFG_CHIP_MODEL` / `CFG_CORE` | 芯片型号 / 内核名 (横幅与 shell 提示符显示) |
-| `CFG_XTAL_HZ` / `CFG_CLK_SOURCE` | 晶振频率 / 时钟源 (mrc/xtal/pll) |
-| `CFG_PLL_*` | MPLL 倍频分频 |
+| `CFG_XTAL_HZ` / `CFG_CLK_SOURCE` | 晶振频率 / 时钟源 (mrc/hrc/xtal/pll) |
+| `CFG_XTAL_STABLE_TIME` / `CFG_XTAL_DRV` | 晶振起振稳定时间 (1~9) / 驱动能力 (ulow~high) |
+| `CFG_HRC_FREQ` / `CFG_HRC_STOP` | HRC 频率 16/20MHz / 复位后停止·振荡 (写 flash ICG1 配置字, 复位生效) |
+| `CFG_PLL_*` | MPLL 倍频分频 (含源选择 0=XTAL/1=HRC; 位宽/VCO 范围编译期校验) |
 | `CFG_DIV_*` | 总线分频 (1/2/4/8/16) |
 | `CFG_SYSTICK_HZ` / `CFG_TICKS_PER_SEC` | 节拍频率 (两者必须一致, 编译期校验) |
 | `CFG_PRIORITY_MAX` / `CFG_IDLE_*` | RTOS 优先级与空闲线程 |
@@ -55,7 +57,7 @@ src/
 ├── panic.rs           # panic 与硬件 fault 诊断 (CFSR/HFSR 解码, 栈回溯)
 ├── critical_section.rs# PRIMASK 临界区 (嵌套安全, 中断安全的基础)
 ├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
-├── icg.rs             # ICG 硬件配置段 (flash 0x400, 全 0xFF)
+├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
 ├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
 ├── gpio.rs            # GPIO: 寄存器→端口→引脚→接口四层, const 泛型校验
 ├── systick.rs         # SysTick 1kHz 节拍 (RTOS 时钟源)
@@ -74,6 +76,34 @@ src/
     └── context.rs     # Cortex-M4 PendSV 上下文切换汇编 (含 FPU)
 ```
 
+## 时钟管理 (clk, CMU 模块)
+
+- **配置驱动**: `clk::init()` 按 `.cargo/config.toml` 编排, 无参数;
+- 时钟源: MRC 8MHz (复位默认) / HRC 16·20MHz (无需外部器件) / XTAL 直通 /
+  MPLL 倍频, 经 `CFG_CLK_SOURCE` 选择, 非法值编译期报错;
+- **PLL 源可配**: `CFG_PLL_SRC` 选 0=XTAL / 1=HRC —— `init()` 自动启动
+  对应振荡器, 无晶振的板子可用 HRC 源倍频 (如 16MHz×15÷2=120MHz);
+  PLL 锁定失败自动降级为 **PLL 源直通**;
+- 切换序列对齐 DDL `CLK_SetSysClockSrc`: 先按目标频率配置 FLASH/SRAM
+  等待周期与 GPIO 读等待, 高性能模式切换, 再写 CKSWR;
+- 晶振起振参数 (稳定时间/驱动能力) 来自 `CFG_XTAL_*`, 对齐 DDL
+  `CLK_XTAL_STB_*` / `CLK_XTAL_DRV_*`;
+- **HRC 频率 (16/20MHz) 与复位状态经配置设置**: `CFG_HRC_FREQ` +
+  `CFG_HRC_STOP` → 生成 flash `0x404` 的 ICG1 配置字 (HRCFREQSEL/
+  HRCSTOP), 复位时硬件载入运行期只读的 ICG1 寄存器 (`icg` 模块);
+  `clk::hrc_hz()` 按该位查询;
+- 振荡器命令: `hrc_cmd` / `xtal_cmd` (对齐 DDL `CLK_HrcCmd`/`CLK_XtalCmd`);
+- 配置摘要可由 shell `info`/`sysinfo` 命令输出 (时钟源/振荡器/总线分频/
+  UART/日志/线程等编译期常量);
+- 总线分频来自 `CFG_DIV_*`, 各总线频率查询: `system_clock_hz` /
+  `hclk_hz` / `pclk0_hz` / `pclk1_hz` / `pclk2_hz` / `pclk3_hz` /
+  `pclk4_hz` / `exclk_hz` (对齐 DDL `CLK_GetBusClockFreq`);
+- MCO1 时钟输出 (PA8): `mco1_config(source, div)` + `mco1_cmd`,
+  用于示波器/频率计测量 (对齐 DDL `CLK_MCOConfig`/`CLK_MCOCmd`);
+- MPLL 参数编译期校验: 寄存器位宽 + 有效倍频/分频范围 + XTAL 源下
+  VCO 输入 (1~25MHz) 与输出 (240~480MHz) 范围;
+- 所有 CMU 寄存器偏移已与 DDL v3.3.0 头文件逐项核对一致。
+
 ## 启动流程
 
 ```
@@ -81,7 +111,7 @@ reset_handler (startup.rs)
  ├─ SRAMC 等待周期 / FLASH 等待周期 / FPU 使能
  ├─ .data 拷贝 / .bss 清零
  └─ main
-     ├─ clk::init(Pll200)          # 200MHz, 失败回退 MRC/XTAL
+     ├─ clk::init()                # 按配置选源 (默认 pll), 失败自动回退
      ├─ GPIO (LED/串口引脚) / SysTick 1kHz / USART1 115200
      ├─ rtos::init()               # PendSV/SysTick 优先级 + 空闲线程
      ├─ rtos::thread_create(...)   # 创建演示线程

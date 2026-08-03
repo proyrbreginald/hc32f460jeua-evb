@@ -204,48 +204,238 @@ fn cmd_help(_rest: &str) -> CmdResult {
     CmdResult::Ok
 }
 
-/// 系统信息
+/// 系统信息 (info/sysinfo): 运行状态 + 配置摘要
 fn cmd_sysinfo(_rest: &str) -> CmdResult {
     println!(
         "{} v{} — RT-Thread 架构的 Rust RTOS",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
-    println!("芯片型号   : {}", config::CHIP_MODEL);
-    println!("内核       : {}", config::CORE);
-    println!(
-        "CPU 频率   : {} MHz",
-        crate::clk::system_clock_hz() / 1_000_000
+
+    // ---- 系统信息 (运行时状态) ----
+    sysinfo_section("系统信息");
+    sysinfo_line(
+        "芯片",
+        format_args!(
+            "{} ({}) @ {} MHz [{}]",
+            config::CHIP_MODEL,
+            config::CORE,
+            crate::clk::system_clock_hz() / 1_000_000,
+            config::CLOCK_SOURCE.name()
+        ),
     );
-    println!(
-        "节拍       : {} ms ({} Hz)",
-        1000 / crate::rtos::TICKS_PER_SEC,
-        crate::rtos::TICKS_PER_SEC
+    sysinfo_line(
+        "总线",
+        format_args!(
+            "HCLK {} | PCLK0 {} | PCLK1 {} | PCLK2 {} | PCLK3 {} | PCLK4 {} MHz",
+            crate::clk::hclk_hz() / 1_000_000,
+            crate::clk::pclk0_hz() / 1_000_000,
+            crate::clk::pclk1_hz() / 1_000_000,
+            crate::clk::pclk2_hz() / 1_000_000,
+            crate::clk::pclk3_hz() / 1_000_000,
+            crate::clk::pclk4_hz() / 1_000_000
+        ),
     );
-    println!(
-        "优先级     : {} 级 (空闲 = {})",
-        crate::rtos::PRIORITY_MAX,
-        crate::rtos::IDLE_PRIORITY
+    sysinfo_line(
+        "节拍",
+        format_args!(
+            "{} ms ({} Hz), 优先级 {} 级 (空闲 {})",
+            1000 / crate::rtos::TICKS_PER_SEC,
+            crate::rtos::TICKS_PER_SEC,
+            crate::rtos::PRIORITY_MAX,
+            crate::rtos::IDLE_PRIORITY
+        ),
     );
-    println!(
-        "串口       : USART{} {:?}/{:?}/{:?}, {} bps",
-        config::UART_UNIT,
-        config::UART_DATA_BITS,
-        config::UART_PARITY,
-        config::UART_STOP_BITS,
-        config::UART_BAUDRATE
+    let ms = crate::rtos::uptime_ms();
+    sysinfo_line(
+        "运行",
+        format_args!(
+            "{:02}:{:02}:{:02}, 就绪 {} 线程",
+            ms / 3_600_000,
+            (ms / 60_000) % 60,
+            (ms / 1000) % 60,
+            crate::rtos::sched::ready_thread_count()
+        ),
     );
-    println!(
-        "构建       : {} [{}] {}",
-        env!("RTOS_BUILD_DATE"),
-        if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
+    sysinfo_line(
+        "构建",
+        format_args!(
+            "v{} [{}] {}, {}",
+            env!("CARGO_PKG_VERSION"),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            env!("RTOS_BUILD_DATE"),
+            env!("RTOS_RUSTC")
+        ),
+    );
+
+    // ---- 配置 (编译期常量, 来源 .cargo/config.toml) ----
+    sysinfo_section("配置 (config)");
+    sysinfo_line(
+        "时钟源",
+        format_args!(
+            "{} — MPLL: 源={}, ÷{} ×{} ÷{}",
+            config::CLOCK_SOURCE.name(),
+            if config::PLL_SRC == 0 { "XTAL" } else { "HRC" },
+            config::PLL_M + 1,
+            config::PLL_N + 1,
+            config::PLL_P + 1
+        ),
+    );
+    sysinfo_line(
+        "振荡器",
+        format_args!(
+            "XTAL {} MHz (稳定 {}, 驱动 {}), HRC {} MHz (复位{})",
+            config::XTAL_HZ / 1_000_000,
+            config::XTAL_STABLE_TIME,
+            match config::XTAL_DRV {
+                0 => "high",
+                1 => "mid",
+                2 => "low",
+                _ => "ulow",
+            },
+            config::HRC_FREQ_MHZ,
+            if config::HRC_STOP { "停止" } else { "振荡" }
+        ),
+    );
+    sysinfo_line(
+        "分频",
+        format_args!(
+            "HCLK÷{} PCLK0÷{} PCLK1÷{} PCLK2÷{} PCLK3÷{} PCLK4÷{} EXCLK÷{}",
+            config::DIV_HCLK,
+            config::DIV_PCLK0,
+            config::DIV_PCLK1,
+            config::DIV_PCLK2,
+            config::DIV_PCLK3,
+            config::DIV_PCLK4,
+            config::DIV_EXCLK
+        ),
+    );
+    // UART 帧格式缩写 (如 8N1) 与参数
+    use crate::uart::{ClockDiv, DataBits, FlowControl, Oversample, Parity, StopBits};
+    let (db, par, sb) = (
+        match config::UART_DATA_BITS {
+            DataBits::Eight => "8",
+            DataBits::Nine => "9",
         },
-        env!("RTOS_RUSTC")
+        match config::UART_PARITY {
+            Parity::None => "N",
+            Parity::Even => "E",
+            Parity::Odd => "O",
+        },
+        match config::UART_STOP_BITS {
+            StopBits::One => "1",
+            StopBits::Two => "2",
+        },
+    );
+    let (os, cd, fc) = (
+        match config::UART_OVERSAMPLE {
+            Oversample::Eight => "8",
+            Oversample::Sixteen => "16",
+        },
+        match config::UART_CLOCK_DIV {
+            ClockDiv::Div1 => "1",
+            ClockDiv::Div4 => "4",
+            ClockDiv::Div16 => "16",
+            ClockDiv::Div64 => "64",
+        },
+        match config::UART_FLOW_CTRL {
+            FlowControl::None => "无",
+            FlowControl::Cts => "CTS",
+        },
+    );
+    sysinfo_line(
+        "UART",
+        format_args!(
+            "USART{} {} bps {}{}{} (过采样 {}, 分频 {}, 流控 {}, 噪声滤波 {})",
+            config::UART_UNIT,
+            config::UART_BAUDRATE,
+            db,
+            par,
+            sb,
+            os,
+            cd,
+            fc,
+            if config::UART_NOISE_FILTER { "开" } else { "关" }
+        ),
+    );
+    sysinfo_line(
+        "接收",
+        format_args!(
+            "缓冲 {} B, 中断 INT{:03} (NVIC {})",
+            crate::uart::RX_BUF_SIZE,
+            config::UART_RX_IRQ_CHANNEL,
+            config::UART_RX_IRQ_PRIORITY
+        ),
+    );
+    sysinfo_line(
+        "LED",
+        format_args!(
+            "PC{} (初始{})",
+            config::LED_PIN,
+            if config::LED_INITIAL_LEVEL == crate::gpio::Level::High {
+                "高电平"
+            } else {
+                "低电平"
+            }
+        ),
+    );
+    sysinfo_line(
+        "日志",
+        format_args!(
+            "默认{}, 阈值 {}",
+            if config::LOG_ENABLE { "开启" } else { "关闭" },
+            config::LOG_LEVEL.name()
+        ),
+    );
+    sysinfo_line(
+        "终端",
+        format_args!(
+            "用户 {}, 失败次数 {}",
+            config::SHELL_USERNAME, config::SHELL_LOGIN_TRIES
+        ),
+    );
+    sysinfo_line(
+        "线程",
+        format_args!(
+            "led P{} T{} {}B | shell P{} T{} {}B | 自检 P{} {}B",
+            config::APP_LED_PRIORITY,
+            config::APP_LED_TIMESLICE,
+            config::APP_LED_STACK,
+            config::APP_SHELL_PRIORITY,
+            config::APP_SHELL_TIMESLICE,
+            config::APP_SHELL_STACK,
+            config::APP_SELFTEST_PRIORITY,
+            config::APP_SELFTEST_STACK
+        ),
     );
     CmdResult::Ok
+}
+
+/// CJK 显示宽度 (ASCII 计 1 列, 其余计 2 列)
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+/// 输出 info 分节标题 (标题 + 分隔线, 总宽 48 列)
+fn sysinfo_section(title: &str) {
+    print!("── {} ", title);
+    for _ in display_width(title)..44 {
+        print!("─");
+    }
+    println!();
+}
+
+/// 输出 info 一行 (标签按显示宽度对齐到 12 列)
+fn sysinfo_line(label: &str, args: core::fmt::Arguments<'_>) {
+    print!("  {}", label);
+    for _ in display_width(label)..12 {
+        print!(" ");
+    }
+    println!(": {}", args);
 }
 
 /// 运行时间 (仿 uptime)

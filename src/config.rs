@@ -82,15 +82,58 @@ const _: () = assert!(
     XTAL_HZ >= 4_000_000 && XTAL_HZ <= 25_000_000,
     "CFG_XTAL_HZ 超出合法范围 4~25MHz"
 );
-/// 系统时钟源 (CFG_CLK_SOURCE = mrc/xtal/pll)
+/// 系统时钟源 (CFG_CLK_SOURCE = mrc/hrc/xtal/pll)
 pub const CLOCK_SOURCE: clk::ClockSource = if eq_str(env!("CFG_CLK_SOURCE"), "pll") {
-    clk::ClockSource::Pll200
+    clk::ClockSource::Pll
 } else if eq_str(env!("CFG_CLK_SOURCE"), "xtal") {
     clk::ClockSource::Xtal
+} else if eq_str(env!("CFG_CLK_SOURCE"), "hrc") {
+    clk::ClockSource::Hrc
 } else if eq_str(env!("CFG_CLK_SOURCE"), "mrc") {
     clk::ClockSource::Mrc
 } else {
-    panic!("CFG_CLK_SOURCE 非法 (可用 mrc/xtal/pll)")
+    panic!("CFG_CLK_SOURCE 非法 (可用 mrc/hrc/xtal/pll)")
+};
+/// XTAL 稳定时间编码 (CFG_XTAL_STABLE_TIME = 1~9, ≈133µs~32ms,
+/// 对齐 DDL CLK_XTAL_STB_*; 默认 5 = 2ms)
+pub const XTAL_STABLE_TIME: u32 = parse_u32(env!("CFG_XTAL_STABLE_TIME"));
+const _: () = assert!(
+    XTAL_STABLE_TIME >= 1 && XTAL_STABLE_TIME <= 9,
+    "CFG_XTAL_STABLE_TIME 非法 (可用 1~9)"
+);
+/// XTAL 驱动能力 (CFG_XTAL_DRV = ulow/low/mid/high, 编码对齐 DDL
+/// CLK_XTAL_DRV_*: ulow 典型 4~8MHz 晶振)
+pub const XTAL_DRV: u32 = if eq_str(env!("CFG_XTAL_DRV"), "ulow") {
+    3
+} else if eq_str(env!("CFG_XTAL_DRV"), "low") {
+    2
+} else if eq_str(env!("CFG_XTAL_DRV"), "mid") {
+    1
+} else if eq_str(env!("CFG_XTAL_DRV"), "high") {
+    0
+} else {
+    panic!("CFG_XTAL_DRV 非法 (可用 ulow/low/mid/high)")
+};
+/// HRC 频率 (MHz) (CFG_HRC_FREQ = 16/20)
+///
+/// 写入 flash 0x404 的 ICG1 配置字 (bit0 = HRCFREQSEL, 0=20MHz/1=16MHz),
+/// 复位时由硬件载入运行期只读的 ICG1 寄存器 (见 `icg` 模块)。
+pub const HRC_FREQ_MHZ: u32 = parse_u32(env!("CFG_HRC_FREQ"));
+const _: () = assert!(
+    HRC_FREQ_MHZ == 16 || HRC_FREQ_MHZ == 20,
+    "CFG_HRC_FREQ 非法 (可用 16/20)"
+);
+/// HRC 复位后是否停止 (CFG_HRC_STOP = true/false; ICG1.HRCSTOP, 与
+/// HRCFREQSEL 同写于 flash ICG1 配置字)
+///
+/// true = 复位后 HRC 停止 (默认安全, 需要时经 `clk::hrc_cmd` 启动);
+/// false = 复位后持续振荡 (复位即运行, 启动零等待)。
+pub const HRC_STOP: bool = if eq_str(env!("CFG_HRC_STOP"), "true") {
+    true
+} else if eq_str(env!("CFG_HRC_STOP"), "false") {
+    false
+} else {
+    panic!("CFG_HRC_STOP 非法 (可用 true/false)")
 };
 /// MPLL 倍频分频 (CFG_PLL_*; PLLCLK = src ÷(m+1) ×(n+1) ÷(p+1))
 pub const PLL_SRC: u32 = parse_u32(env!("CFG_PLL_SRC"));
@@ -99,6 +142,40 @@ pub const PLL_N: u32 = parse_u32(env!("CFG_PLL_N"));
 pub const PLL_P: u32 = parse_u32(env!("CFG_PLL_P"));
 pub const PLL_Q: u32 = parse_u32(env!("CFG_PLL_Q"));
 pub const PLL_R: u32 = parse_u32(env!("CFG_PLL_R"));
+// ---- MPLL 参数编译期校验 (对齐 DDL: 位宽 + VCO 输入/输出范围) ----
+/// 位宽与有效倍频/分频范围 (寄存器值+1 才是实际值: N→20~480, P/Q/R→2~16)
+const fn assert_pll_width(m: u32, n: u32, p: u32, q: u32, r: u32) {
+    assert!(m <= 31, "CFG_PLL_M 超出寄存器位宽 (0~31)");
+    assert!(n <= 511, "CFG_PLL_N 超出寄存器位宽 (0~511)");
+    assert!(
+        p <= 15 && q <= 15 && r <= 15,
+        "CFG_PLL_P/Q/R 超出寄存器位宽 (0~15)"
+    );
+    assert!(n >= 19 && n <= 479, "CFG_PLL_N 对应倍频 (N+1) 应为 20~480");
+    assert!(
+        p >= 1 && p <= 15 && q >= 1 && q <= 15 && r >= 1 && r <= 15,
+        "CFG_PLL_P/Q/R 对应分频 (值+1) 应为 2~16"
+    );
+}
+
+/// XTAL 源 (PLL_SRC=0) 时的 VCO 输入/输出范围 (参考手册;
+/// HRC 源频率运行时决定, 无法静态校验)
+const fn assert_pll_xtal_range(xtal_hz: u32, m: u32, n: u32) {
+    assert!(
+        xtal_hz / (m + 1) >= 1_000_000 && xtal_hz / (m + 1) <= 25_000_000,
+        "PLL 输入频率 XTAL/(M+1) 应为 1~25MHz"
+    );
+    assert!(
+        xtal_hz / (m + 1) * (n + 1) >= 240_000_000
+            && xtal_hz / (m + 1) * (n + 1) <= 480_000_000,
+        "PLL VCO 输出频率应为 240~480MHz"
+    );
+}
+
+const _: () = assert_pll_width(PLL_M, PLL_N, PLL_P, PLL_Q, PLL_R);
+const _: () = if PLL_SRC == 0 {
+    assert_pll_xtal_range(XTAL_HZ, PLL_M, PLL_N)
+};
 /// 总线分频系数 (CFG_DIV_*), 非法值编译期报错
 pub const DIV_HCLK: u32 = parse_u32(env!("CFG_DIV_HCLK"));
 pub const DIV_PCLK0: u32 = parse_u32(env!("CFG_DIV_PCLK0"));

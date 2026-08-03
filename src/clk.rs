@@ -1,7 +1,9 @@
-//! 时钟管理: 系统时钟源 (MRC/XTAL/PLL) 配置与切换
+//! 时钟管理 (CMU 模块): 系统时钟源 (MRC/HRC/XTAL/PLL) 配置与切换
 //!
-//! 参考 DDL `CLK_XtalInit` / `CLK_PLLInit` / `CLK_SetSysClockSrc` 与
+//! 参考 DDL `CLK_XtalInit` / `CLK_PLLInit` / `CLK_SetSysClockSrc` /
+//! `CLK_HrcCmd` / `CLK_MCOConfig` / `CLK_GetBusClockFreq` 与
 //! `BSP_CLK_Init`, 参考手册 CMU/SRAMC/EFM 章节。
+//! 所有寄存器偏移已与 DDL v3.3.0 头文件逐项核对一致。
 //!
 //! # 时钟链 (200MHz 方案)
 //!
@@ -16,12 +18,16 @@
 //!
 //! # 使用
 //!
-//! 一键完成全部时钟配置: [`init(ClockSource::Pll200)`]—— 晶振启动、
+//! 一键完成全部时钟配置: [`init()`]—— 按 `.cargo/config.toml` 的
+//! `CFG_CLK_SOURCE` 选择时钟源 (mrc/hrc/xtal/pll), 完成振荡器启动、
 //! 总线分频、PLL 锁定、FLASH/SRAM/GPIO 等待周期、高性能电源、
 //! 时钟源切换。任一步失败自动回退, 结果经 [`xtal_status`] 查询。
+//! **PLL 源 (XTAL 或 HRC) 由 `CFG_PLL_SRC` 决定**, 无晶振的板子
+//! 可配 HRC 源 (16/20MHz × 倍频)。
 //!
-//! 各外设通过 [`system_clock_hz`] / [`pclk1_hz`] 查询实际频率
-//! (systick/uart 模块已接入)。
+//! 各外设通过 [`system_clock_hz`] / [`hclk_hz`] / [`pclk1_hz`] 等查询
+//! 实际频率 (systick/uart 模块已接入); 频率测量可用 [`mco1_config`]
+//! 把时钟输出到 PA8。
 //!
 //! # 限制
 //!
@@ -60,15 +66,19 @@ const FPRC_UNLOCK: u16 = 0xA503;
 /// FPRC 锁定值 (键值 0xA5, 无解锁位)
 const FPRC_LOCK: u16 = 0xA500;
 
-/// CMU 寄存器偏移 (SVD)
+/// CMU 寄存器偏移 (SVD/DDL v3.3.0 逐项核对一致)
 const CMU_CKSWR: usize = 0x26; // 系统时钟源选择 (8 位)
-const CMU_XTALCR: usize = 0x32; // XTAL 控制 (8 位)
-const CMU_OSCSTBSR: usize = 0x3C; // 振荡器稳定状态 (8 位)
 const CMU_PLLCR: usize = 0x2A; // MPLL 控制 (8 位)
+const CMU_XTALCR: usize = 0x32; // XTAL 控制 (8 位)
+const CMU_HRCCR: usize = 0x36; // HRC 控制 (8 位, HRCSTP=0 开启)
+const CMU_MRCCR: usize = 0x3A; // MRC 控制 (8 位, MRCSTP=0 开启)
+const CMU_OSCSTBSR: usize = 0x3C; // 振荡器稳定状态 (8 位)
+const CMU_MCO1CFGR: usize = 0x3D; // MCO1 配置 (MCOSEL/MCODIV/MCOEN)
+const CMU_MCO2CFGR: usize = 0x3E; // MCO2 配置
 const CMU_SCFGR: usize = 0x20; // 总线时钟分频 (32 位)
 const CMU_XTALSTBCR: usize = 0xA2; // XTAL 稳定时间 (8 位)
-const CMU_XTALCFGR: usize = 0x410; // XTAL 配置 (8 位)
 const CMU_PLLCFGR: usize = 0x100; // MPLL 配置 (32 位)
+const CMU_XTALCFGR: usize = 0x410; // XTAL 配置 (8 位)
 
 /// 系统时钟源编码 (CKSW[2:0])
 pub const CLK_SRC_HRC: u32 = 0;
@@ -107,6 +117,10 @@ const SCFGR_PCLK4S_POS: u32 = 16; // [18:16] PCLK4 分频
 const SCFGR_EXCKS_POS: u32 = 20; // [22:20] EXCLK 分频
 const SCFGR_HCLKS_POS: u32 = 24; // [26:24] HCLK 分频
 
+/// MCO1CFGR/MCO2CFGR 位 (共用定义)
+const MCOCFGR_MCODIV_POS: u32 = 4; // [6:4] 输出分频
+const MCOCFGR_MCOEN: u32 = 1 << 7; // [7] 输出使能
+
 /// 总线分频编码 (SCFGR): 0=÷1, 1=÷2, 2=÷4, 3=÷8, 4=÷16
 ///
 /// 分频系数 → 寄存器编码 (1/2/4/8/16; 合法性已在 config.rs 编译期校验)
@@ -121,47 +135,78 @@ fn div_code(div: u32) -> u32 {
     }
 }
 
-/// 稳定时间: 约 2ms (对齐 DDL CLK_XTAL_STB_2MS)
-const XTAL_STABLE_TIME: u32 = 0x05;
-/// 驱动能力: 超低驱动 (对齐 DDL CLK_XTAL_DRV_ULOW), 典型 4~8MHz 晶振
-const XTAL_DRV: u32 = 0x03 << XTALCFGR_XTALDRV_POS;
+/// 稳定时间: 编码 1~9 (≈133µs~32ms), 来自配置 CFG_XTAL_STABLE_TIME
+/// (对齐 DDL CLK_XTAL_STB_*, 默认 0x05 = 2ms)
+const XTAL_STABLE_TIME: u32 = crate::config::XTAL_STABLE_TIME;
+/// 驱动能力编码 (0=HIGH, 1=MID, 2=LOW, 3=ULOW), 来自配置 CFG_XTAL_DRV
+/// (对齐 DDL CLK_XTAL_DRV_*; ULOW 典型 4~8MHz 晶振)
+const XTAL_DRV: u32 = crate::config::XTAL_DRV << XTALCFGR_XTALDRV_POS;
 /// 振荡模式 (对齐 DDL CLK_XTAL_MD_OSC)
 const XTAL_MODE_OSC: u32 = 0x00;
 
-/// 系统时钟方案 (由 [`init`] 统一编排)
+/// 系统时钟方案 (由 [`init`] 按配置统一编排)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClockSource {
     /// 内部中速 RC 8MHz (复位默认, 无需配置)
     Mrc,
+    /// 内部高速 RC 16/20MHz (频率由 ICG1.HRCFREQSEL 决定, 见 [`hrc_hz`])
+    Hrc,
     /// 外部晶振直通 (频率 [`XTAL_HZ`])
     Xtal,
-    /// 外部晶振 + MPLL 倍频至 200MHz
-    Pll200,
+    /// MPLL 倍频 (PLL 源 XTAL 或 HRC, 目标频率由 `CFG_PLL_*` 决定)
+    Pll,
 }
 
-/// 时钟初始化编排: 启动时钟源并切换系统时钟
+impl ClockSource {
+    /// 名称 (与 `CFG_CLK_SOURCE` 取值一致, shell 显示用)
+    pub const fn name(self) -> &'static str {
+        match self {
+            ClockSource::Mrc => "mrc",
+            ClockSource::Hrc => "hrc",
+            ClockSource::Xtal => "xtal",
+            ClockSource::Pll => "pll",
+        }
+    }
+}
+
+/// 时钟初始化: **按 .cargo/config.toml 配置**启动时钟源并切换系统时钟。
 ///
-/// 任一步失败自动回退并记录状态 (经 [`xtal_status`] 查询):
-/// - [`ClockSource::Mrc`]: 无操作 (复位默认);
-/// - [`ClockSource::Xtal`]: 晶振启动 → FLASH/SRAM 等待 → 切换;
-/// - [`ClockSource::Pll200`]: 晶振 → 总线分频 → PLL 锁定 → FLASH/SRAM/
-///   GPIO 等待 + 高性能电源 → 切换。
-pub fn init(src: ClockSource) -> Result<(), ClkError> {
-    match src {
+/// 编排 (任一步失败自动回退, 结果经 [`xtal_status`] 查询):
+/// - mrc: 无操作 (复位默认);
+/// - hrc: HRC 启动 → FLASH/SRAM 等待 → 切换;
+/// - xtal: 晶振启动 → FLASH/SRAM 等待 → 切换;
+/// - pll: **按 `CFG_PLL_SRC` 启动对应源** (0=XTAL/1=HRC) → 总线分频 →
+///   PLL 锁定 → FLASH/SRAM/GPIO 等待 + 高性能电源 → 切换; 失败降级为
+///   PLL 源直通 (无晶振的板子可配 HRC 源)。
+pub fn init() -> Result<(), ClkError> {
+    match crate::config::CLOCK_SOURCE {
         ClockSource::Mrc => Ok(()),
+        ClockSource::Hrc => {
+            hrc_cmd(true)?;
+            switch_to_hrc();
+            Ok(())
+        }
         ClockSource::Xtal => {
             xtal_init()?;
             switch_to_xtal();
             Ok(())
         }
-        ClockSource::Pll200 => {
-            xtal_init()?;
+        ClockSource::Pll => {
+            let pll = pll_config();
+            // 按 PLL 源启动对应振荡器 (PLLCFGR.PLLSRC: 0=XTAL, 1=HRC)
+            match pll.src {
+                0 => xtal_init()?,
+                _ => hrc_cmd(true)?,
+            }
             set_bus_clock_div();
-            if pll_init(pll_config()).is_ok() {
+            if pll_init(pll).is_ok() {
                 switch_to_pll();
             } else {
-                // PLL 锁定失败: 降级为晶振直通 (总线分频在低频下无害)
-                switch_to_xtal();
+                // PLL 锁定失败: 降级为 PLL 源直通 (总线分频在低频下无害)
+                match pll.src {
+                    0 => switch_to_xtal(),
+                    _ => switch_to_hrc(),
+                }
             }
             Ok(())
         }
@@ -169,10 +214,13 @@ pub fn init(src: ClockSource) -> Result<(), ClkError> {
 }
 
 /// 时钟配置失败原因
+#[allow(clippy::enum_variant_names)] // 各振荡器同名超时, 语义清晰
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClkError {
     /// 晶振起振超时 (检查电路/引脚/稳定时间)
     XtalStableTimeout,
+    /// HRC 起振超时
+    HrcStableTimeout,
     /// MPLL 锁定超时 (检查倍频/分频参数与 VCO 范围)
     PllStableTimeout,
 }
@@ -448,6 +496,52 @@ pub fn xtal_init() -> Result<(), ClkError> {
     Ok(())
 }
 
+/// HRC 使能/失能 (CMU_HRCCR.HRCSTP=0 开启, 对齐 DDL `CLK_HrcCmd`)
+///
+/// 使能后等待 OSCSTBSR.HRCSTBF 稳定。HRC 频率 16/20MHz 由硬件决定
+/// (ICG1.HRCFREQSEL, 见 [`hrc_hz`]), 可作为系统时钟或 MPLL 源
+/// (PLLCFGR.PLLSRC=1, 见 [`pll_init`])。
+pub fn hrc_cmd(enable: bool) -> Result<(), ClkError> {
+    cmu_unlock();
+    write8(CMU_BASE + CMU_HRCCR, if enable { 0 } else { 1 });
+    if enable && !wait_stable(OSCSTBSR_HRCSTBF) {
+        cmu_lock();
+        return Err(ClkError::HrcStableTimeout);
+    }
+    cmu_lock();
+    Ok(())
+}
+
+/// XTAL 使能/失能 (CMU_XTALCR.XTALSTP=0 开启, 对齐 DDL `CLK_XtalCmd`)
+///
+/// 使能后等待稳定。仅用于晶振已由 [`xtal_init`] 配置过的场景
+/// (参数/驱动/稳定时间已写入), 失能前请确保 XTAL 不再是系统时钟
+/// 或 PLL 源, 否则系统时钟丢失。
+pub fn xtal_cmd(enable: bool) -> Result<(), ClkError> {
+    cmu_unlock();
+    write8(CMU_BASE + CMU_XTALCR, if enable { 0 } else { 1 });
+    if enable && !wait_stable(OSCSTBSR_XTALSTBF) {
+        cmu_lock();
+        XTAL_STATUS.store(STATUS_FAILED, Ordering::Relaxed);
+        return Err(ClkError::XtalStableTimeout);
+    }
+    cmu_lock();
+    Ok(())
+}
+
+/// 切换系统时钟源到内部高速 RC (HRC 16/20MHz)
+///
+/// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1),
+/// 顺序不可颠倒 (高时钟下取指/栈操作必须先满足时序)。
+pub fn switch_to_hrc() {
+    set_flash_wait_cycle(hrc_hz());
+    set_sram_wait_cycle(hrc_hz());
+    cmu_unlock();
+    write8(CMU_BASE + CMU_CKSWR, CLK_SRC_HRC);
+    delay_short();
+    cmu_lock();
+}
+
 /// 切换系统时钟源到外部晶振
 ///
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1):
@@ -477,10 +571,106 @@ pub fn system_clock_hz() -> u32 {
     }
 }
 
-/// PCLK1 频率 (Hz), 由系统时钟与 SCFGR.PCLK1S 分频推导
+/// SCFGR 中某总线的分频编码值 (0=÷1 ... 4=÷16)
+fn bus_div(pos: u32) -> u32 {
+    (read32(CMU_BASE + CMU_SCFGR) >> pos) & 0x7
+}
+
+/// HCLK 频率 (Hz): 系统时钟 ÷ SCFGR.HCLKS (CPU/SysTick/FLASH 总线)
+pub fn hclk_hz() -> u32 {
+    system_clock_hz() >> bus_div(SCFGR_HCLKS_POS)
+}
+
+/// PCLK0 频率 (Hz) (GPIO/ADC 等 AHB1 高速外设)
+pub fn pclk0_hz() -> u32 {
+    system_clock_hz() >> bus_div(SCFGR_PCLK0S_POS)
+}
+
+/// PCLK1 频率 (Hz) (UART/TIM 等 APB 外设, 见 uart 模块)
 pub fn pclk1_hz() -> u32 {
-    let pclk1s = (read32(CMU_BASE + CMU_SCFGR) >> SCFGR_PCLK1S_POS) & 0x7;
-    system_clock_hz() >> pclk1s
+    system_clock_hz() >> bus_div(SCFGR_PCLK1S_POS)
+}
+
+/// PCLK2 频率 (Hz)
+pub fn pclk2_hz() -> u32 {
+    system_clock_hz() >> bus_div(SCFGR_PCLK2S_POS)
+}
+
+/// PCLK3 频率 (Hz)
+pub fn pclk3_hz() -> u32 {
+    system_clock_hz() >> bus_div(SCFGR_PCLK3S_POS)
+}
+
+/// PCLK4 频率 (Hz)
+pub fn pclk4_hz() -> u32 {
+    system_clock_hz() >> bus_div(SCFGR_PCLK4S_POS)
+}
+
+/// EXCLK 频率 (Hz)
+pub fn exclk_hz() -> u32 {
+    system_clock_hz() >> bus_div(SCFGR_EXCKS_POS)
+}
+
+// ============================== MCO 时钟输出 (对齐 DDL CLK_MCOConfig/Cmd) ==============================
+
+/// MCO 时钟输出源 (MCO1CFGR.MCOSEL, 与 DDL `CLK_MCO_SRC_*` 一致)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum McoSource {
+    /// 内部高速 RC (16/20MHz)
+    Hrc = 0x0,
+    /// 内部中速 RC (8MHz)
+    Mrc = 0x1,
+    /// 内部低速 RC (32.768kHz)
+    Lrc = 0x2,
+    /// 外部晶振 (XTAL_HZ)
+    Xtal = 0x3,
+    /// 外部低速晶振 (32.768kHz)
+    Xtal32 = 0x4,
+    /// MPLL 的 P 输出
+    PllP = 0x6,
+    /// MPLL 的 Q 输出
+    PllQ = 0x8,
+    /// HCLK
+    Hclk = 0xB,
+}
+
+/// MCO 输出分频 (MCO1CFGR.MCODIV, 与 DDL `CLK_MCO_DIV*` 一致)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum McoDiv {
+    Div1 = 0,
+    Div2 = 1,
+    Div4 = 2,
+    Div8 = 3,
+    Div16 = 4,
+    Div32 = 5,
+    Div64 = 6,
+    Div128 = 7,
+}
+
+/// 配置并启动 MCO1 时钟输出 (MCOSEL/MCODIV/MCOEN 一次写入)
+///
+/// 输出引脚: **PA8** (MCO_1, Func_Grp1, `gpio::Pin::<PortA, 8>::set_func(1)`),
+/// 用于示波器/频率计测量内部时钟。MCO2 (CMU_MCO2CFGR) 布局相同, 未封装。
+pub fn mco1_config(source: McoSource, div: McoDiv) {
+    cmu_unlock();
+    write8(
+        CMU_BASE + CMU_MCO1CFGR,
+        (source as u32) | ((div as u32) << MCOCFGR_MCODIV_POS) | MCOCFGR_MCOEN,
+    );
+    cmu_lock();
+}
+
+/// 使能/失能 MCO1 输出 (MCO1CFGR.MCOEN, 对齐 DDL `CLK_MCOCmd`)
+pub fn mco1_cmd(enable: bool) {
+    cmu_unlock();
+    let mut v = read8(CMU_BASE + CMU_MCO1CFGR);
+    if enable {
+        v |= MCOCFGR_MCOEN;
+    } else {
+        v &= !MCOCFGR_MCOEN;
+    }
+    write8(CMU_BASE + CMU_MCO1CFGR, v);
+    cmu_lock();
 }
 
 /// 表 8-1: SRAM 读写访问等待周期设定与 CPU 时钟频率的关系
@@ -590,7 +780,10 @@ fn cmu_lock() {
     }
 }
 
-/// HRC 频率: 由 ICG1.HRCFREQSEL (0x4001_0684 bit0) 决定, 1→16MHz, 0→20MHz
+/// HRC 频率: 由运行期只读的 ICG1.HRCFREQSEL (bit0) 决定: 1→16MHz, 0→20MHz
+///
+/// 该位由复位时从 flash 0x404 ICG1 配置字载入 (见 [`crate::icg`] 模块),
+/// 即由配置 `CFG_HRC_FREQ` 决定 —— 两者恒一致 (flash 字由配置生成)。
 fn hrc_hz() -> u32 {
     unsafe {
         if core::ptr::read_volatile(0x4001_0684 as *const u32) & 1 != 0 {
