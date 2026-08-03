@@ -360,10 +360,7 @@ impl<const U: u8> Uart<U> {
                 (NVIC_ISER_BASE + 4 * (irq_n / 32)) as *mut u32,
                 1 << (irq_n % 32),
             );
-            core::ptr::write_volatile(
-                (NVIC_IPR_BASE + irq_n) as *mut u8,
-                (priority & 0x0F) << 4,
-            );
+            core::ptr::write_volatile((NVIC_IPR_BASE + irq_n) as *mut u8, (priority & 0x0F) << 4);
 
             // 3. CR1.RIE: 接收满 + 接收错误中断使能 (对齐 USART_FuncCmd(USART_INT_RX))
             self.cr1().modify(|v| v | CR1_RIE);

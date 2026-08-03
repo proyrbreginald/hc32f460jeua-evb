@@ -11,7 +11,7 @@
 use crate::critical_section;
 use crate::rtos::klist::{KCell, ListHead};
 use crate::rtos::sched;
-use crate::rtos::thread::{free_thread, thread_create, Thread};
+use crate::rtos::thread::{Thread, free_thread, thread_create};
 
 /// 僵尸队列: 已退出/被删除的线程等待空闲线程回收
 static DEFUNCT: KCell<ListHead> = KCell::new(ListHead::const_new());

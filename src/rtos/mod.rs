@@ -103,8 +103,8 @@ pub fn tick_increase() {
 pub use ipc::{Error, Event, EventOpt, Mailbox, MessageQueue, Mutex, Semaphore, Timeout};
 #[allow(unused_imports)]
 pub use thread::{
-    thread_create, thread_delay, thread_delay_ms, thread_info_list, thread_state_name, yield_now,
-    Thread, ThreadInfo,
+    Thread, ThreadInfo, thread_create, thread_delay, thread_delay_ms, thread_info_list,
+    thread_state_name, yield_now,
 };
 #[allow(unused_imports)]
 pub use timer::Timer;

@@ -158,7 +158,10 @@ fn cmd_sysinfo() {
     );
     println!("芯片型号   : {}", env!("RTOS_CHIP_MODEL"));
     println!("内核       : {}", env!("RTOS_CORE"));
-    println!("CPU 频率   : {} MHz", crate::clk::system_clock_hz() / 1_000_000);
+    println!(
+        "CPU 频率   : {} MHz",
+        crate::clk::system_clock_hz() / 1_000_000
+    );
     println!(
         "节拍       : {} ms ({} Hz)",
         1000 / crate::rtos::TICKS_PER_SEC,
@@ -172,7 +175,11 @@ fn cmd_sysinfo() {
     println!(
         "构建       : {}  [{}]  {}",
         env!("RTOS_BUILD_DATE"),
-        if cfg!(debug_assertions) { "debug" } else { "release" },
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
         env!("RTOS_RUSTC")
     );
 }

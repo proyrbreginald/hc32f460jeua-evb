@@ -36,8 +36,7 @@ struct IrqHandlerCell(core::cell::UnsafeCell<[Option<IrqHandler>; 8]>);
 // 不经过该类型共享引用读取内部, 因此 Send/Sync 是安全的。
 unsafe impl Sync for IrqHandlerCell {}
 
-static IRQ_HANDLERS: IrqHandlerCell =
-    IrqHandlerCell(core::cell::UnsafeCell::new([None; 8]));
+static IRQ_HANDLERS: IrqHandlerCell = IrqHandlerCell(core::cell::UnsafeCell::new([None; 8]));
 
 /// 注册外设中断回调 (仅支持 INT000~INT007 槽位)
 ///

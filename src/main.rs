@@ -8,24 +8,24 @@ extern crate alloc;
 
 // -- 启动与内核基础设施 --
 mod critical_section; // PRIMASK 临界区 (中断安全的基础)
-mod heap;             // 全局堆分配器 (边界标记 + 首次适配)
-mod icg;              // ICG 硬件配置段
-mod startup;          // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
-mod vector_table;     // 复位/异常/144 外设中断向量表
-mod panic;            // panic 与硬件 fault 诊断
+mod heap; // 全局堆分配器 (边界标记 + 首次适配)
+mod icg; // ICG 硬件配置段
+mod panic;
+mod startup; // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
+mod vector_table; // 复位/异常/144 外设中断向量表 // panic 与硬件 fault 诊断
 
 // -- 外设驱动 (寄存器级, 零依赖) --
-mod clk;              // 时钟链: XTAL + MPLL → 200MHz, 失败自动回退
-mod gpio;             // GPIO: 寄存器/端口/引脚分层, const 泛型封装
-mod systick;          // SysTick 节拍 (1kHz, RTOS 的时钟源)
-mod uart;             // USART1~4: 波特率/过采样/小数分频
-mod console;          // 控制台: 打印锁 (优先级继承) + 原子整行输出
+mod clk; // 时钟链: XTAL + MPLL → 200MHz, 失败自动回退
+mod console;
+mod gpio; // GPIO: 寄存器/端口/引脚分层, const 泛型封装
+mod systick; // SysTick 节拍 (1kHz, RTOS 的时钟源)
+mod uart; // USART1~4: 波特率/过采样/小数分频 // 控制台: 打印锁 (优先级继承) + 原子整行输出
 
 // -- RTOS 内核 (RT-Thread 架构移植) --
 mod rtos;
 // -- 应用 --
 mod banner; // 启动横幅 (应用层, 依赖 clk/heap/rtos 公共状态)
-mod shell;  // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
+mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use gpio::{Config, Drive, Gpio, Level, Mode, Pin, PortA, PortC};
@@ -126,7 +126,10 @@ extern "C" fn selftest_thread(_param: usize) {
 
     // 信号量: 计数获取 / 立即超时 / release 唤醒
     static SEM: rtos::Semaphore = rtos::Semaphore::new(1, 1);
-    check(SEM.take(Timeout::Ticks(0)).is_ok(), "信号量: 初始计数可获取");
+    check(
+        SEM.take(Timeout::Ticks(0)).is_ok(),
+        "信号量: 初始计数可获取",
+    );
     check(
         SEM.take(Timeout::Ticks(0)).is_err(),
         "信号量: 计数 0 立即超时",
@@ -140,10 +143,7 @@ extern "C" fn selftest_thread(_param: usize) {
     // 互斥量: 获取 / 递归持有 / 释放
     static MTX: rtos::Mutex = rtos::Mutex::new();
     check(MTX.lock(Timeout::Ticks(0)).is_ok(), "互斥量: 可获取");
-    check(
-        MTX.lock(Timeout::Ticks(0)).is_ok(),
-        "互斥量: 递归持有合法",
-    );
+    check(MTX.lock(Timeout::Ticks(0)).is_ok(), "互斥量: 递归持有合法");
     MTX.unlock();
     MTX.unlock();
     check(
@@ -169,21 +169,16 @@ extern "C" fn selftest_thread(_param: usize) {
         "事件: OR 匹配返回实际位",
     );
     check(
-        EVT.recv(0x10, EventOpt::OrClear, Timeout::Ticks(0)).is_err(),
+        EVT.recv(0x10, EventOpt::OrClear, Timeout::Ticks(0))
+            .is_err(),
         "事件: 无匹配位立即超时",
     );
 
     // 邮箱: 收发 / 紧急插队 / 满返回 Full / 空返回 TimedOut
     static MB: rtos::Mailbox = rtos::Mailbox::new(4);
     check(MB.send(100, Timeout::Ticks(0)).is_ok(), "邮箱: 发送");
-    check(
-        MB.recv(Timeout::Ticks(0)) == Ok(100),
-        "邮箱: 接收一致",
-    );
-    check(
-        MB.recv(Timeout::Ticks(0)).is_err(),
-        "邮箱: 空立即超时",
-    );
+    check(MB.recv(Timeout::Ticks(0)) == Ok(100), "邮箱: 接收一致");
+    check(MB.recv(Timeout::Ticks(0)).is_err(), "邮箱: 空立即超时");
     for i in 0..4 {
         MB.send(1000 + i, Timeout::Ticks(0)).ok();
     }
@@ -193,10 +188,7 @@ extern "C" fn selftest_thread(_param: usize) {
     );
     // 取出一条腾出空间后再紧急发送 (urgent 在满时同样返回 Full)
     MB.recv(Timeout::Ticks(0)).ok();
-    check(
-        MB.urgent(42, Timeout::Ticks(0)).is_ok(),
-        "邮箱: 紧急发送",
-    );
+    check(MB.urgent(42, Timeout::Ticks(0)).is_ok(), "邮箱: 紧急发送");
     check(
         MB.recv(Timeout::Ticks(0)) == Ok(42),
         "邮箱: 紧急消息插到队首",
@@ -219,10 +211,7 @@ extern "C" fn selftest_thread(_param: usize) {
     // 延时: uptime 前进
     let t0 = rtos::uptime_ms();
     rtos::thread_delay_ms(20);
-    check(
-        rtos::uptime_ms() >= t0 + 20,
-        "线程延时: uptime 前进 ≥ 20ms",
-    );
+    check(rtos::uptime_ms() >= t0 + 20, "线程延时: uptime 前进 ≥ 20ms");
 
     // 线程删除 (delete API) 与自然退出 (defunct 回收)
     println!("  [info] 创建 victim 线程");
@@ -239,10 +228,7 @@ extern "C" fn selftest_thread(_param: usize) {
     rtos::thread_delay_ms(100);
     check(true, "线程退出: 入口返回后经 defunct 回收");
 
-    println!(
-        "[selftest] 完成: {} 通过, {} 失败",
-        pass, fail
-    );
+    println!("[selftest] 完成: {} 通过, {} 失败", pass, fail);
 }
 
 /// 周期定时器回调 (中断上下文): 仅做计数, 不调用阻塞 API

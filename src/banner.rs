@@ -69,15 +69,8 @@ pub fn show() {
         clk::system_clock_hz() / 1_000_000,
         xtal
     );
-    println!(
-        "节拍 : {} ms ({} Hz)",
-        1000 / TICKS_PER_SEC,
-        TICKS_PER_SEC
-    );
-    println!(
-        "优先级 : {} 级 (空闲 = {})",
-        PRIORITY_MAX, IDLE_PRIORITY
-    );
+    println!("节拍 : {} ms ({} Hz)", 1000 / TICKS_PER_SEC, TICKS_PER_SEC);
+    println!("优先级 : {} 级 (空闲 = {})", PRIORITY_MAX, IDLE_PRIORITY);
     println!("堆 : {} KB", heap::capacity() / 1024);
     println!("{}", SEP);
     println!("构建 : {} [{}] {}", BUILD_DATE, PROFILE, RUSTC);

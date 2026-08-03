@@ -10,13 +10,13 @@
 
 use core::ptr;
 
-use alloc::alloc::{alloc, dealloc, Layout};
+use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::boxed::Box;
 
 use crate::critical_section;
 use crate::rtos::context;
 use crate::rtos::idle::defunct_push;
-use crate::rtos::ipc::{mutex_release_all_held, Error, EventOpt, MutexInner};
+use crate::rtos::ipc::{Error, EventOpt, MutexInner, mutex_release_all_held};
 use crate::rtos::klist::{KCell, ListHead};
 use crate::rtos::sched;
 use crate::rtos::timer::Timer;
@@ -37,8 +37,6 @@ static SLEEP_LIST: KCell<ListHead> = KCell::new(ListHead::const_new());
 
 /// 全部已创建线程链表 (供 `ps` 等诊断遍历)
 static ALL_THREADS: KCell<ListHead> = KCell::new(ListHead::const_new());
-
-
 
 /// 线程控制块 (TCB) — RT-Thread `struct rt_thread` 的 Rust 移植
 ///
@@ -283,8 +281,6 @@ pub fn thread_info_list() -> alloc::vec::Vec<ThreadInfo> {
     list
 }
 
-
-
 /// 线程入口返回后由硬件跳入 (初始帧 lr), 执行退出清理并切换, 永不返回
 unsafe extern "C" fn thread_exit() -> ! {
     unsafe { exit_and_schedule(sched::current()) };
@@ -340,7 +336,9 @@ pub fn yield_now() {
 unsafe fn delay_suspend(cur: *mut Thread, ticks: u32) {
     (*cur).error = 0;
     (*cur).suspend_node.remove();
-    (*cur).thread_timer.start_internal(ticks, 0, thread_timer_cb, cur as usize);
+    (*cur)
+        .thread_timer
+        .start_internal(ticks, 0, thread_timer_cb, cur as usize);
     (*SLEEP_LIST.get_mut()).push_back(&mut (*cur).suspend_node);
     (*cur).state = TS_SUSPEND;
     sched::ready_remove(cur);

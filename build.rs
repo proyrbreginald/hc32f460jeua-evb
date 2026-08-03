@@ -11,10 +11,7 @@ fn main() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let (y, m, d) = unix_to_ymd(secs);
-    println!(
-        "cargo:rustc-env=RTOS_BUILD_DATE={:04}-{:02}-{:02}",
-        y, m, d
-    );
+    println!("cargo:rustc-env=RTOS_BUILD_DATE={:04}-{:02}-{:02}", y, m, d);
 
     // rustc 版本
     if let Ok(out) = std::process::Command::new("rustc")
@@ -44,9 +41,18 @@ fn inject_shell_conf() {
         }
     }
     // 密码等敏感字段不随编译命令输出
-    let username = values.get("USERNAME").cloned().unwrap_or_else(|| "root".into());
-    let password = values.get("PASSWORD").cloned().unwrap_or_else(|| "root123".into());
-    let tries = values.get("LOGIN_TRIES").cloned().unwrap_or_else(|| "3".into());
+    let username = values
+        .get("USERNAME")
+        .cloned()
+        .unwrap_or_else(|| "root".into());
+    let password = values
+        .get("PASSWORD")
+        .cloned()
+        .unwrap_or_else(|| "root123".into());
+    let tries = values
+        .get("LOGIN_TRIES")
+        .cloned()
+        .unwrap_or_else(|| "3".into());
     println!("cargo:rustc-env=SHELL_USERNAME={}", username);
     println!("cargo:rustc-env=SHELL_PASSWORD={}", password);
     println!("cargo:rustc-env=SHELL_LOGIN_TRIES={}", tries);

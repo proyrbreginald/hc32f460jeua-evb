@@ -30,8 +30,8 @@ use crate::critical_section;
 use crate::rtos::klist::ListHead;
 use crate::rtos::sched;
 use crate::rtos::thread::{
-    blocked_wait, resched_needed, thread_from_suspend, thread_timer_cb, wakeup_thread, Thread,
-    TS_SUSPEND,
+    TS_SUSPEND, Thread, blocked_wait, resched_needed, thread_from_suspend, thread_timer_cb,
+    wakeup_thread,
 };
 
 /// 阻塞超时
@@ -90,7 +90,9 @@ unsafe fn suspend_current(list: *mut ListHead, ticks: u32) {
     (*cur).suspend_node.remove();
     (*list).push_back(&mut (*cur).suspend_node);
     if ticks != u32::MAX {
-        (*cur).thread_timer.start_internal(ticks, 0, thread_timer_cb, cur as usize);
+        (*cur)
+            .thread_timer
+            .start_internal(ticks, 0, thread_timer_cb, cur as usize);
     }
     (*cur).state = TS_SUSPEND;
     sched::ready_remove(cur);
@@ -124,7 +126,9 @@ unsafe fn suspend_prio(list: *mut ListHead, ticks: u32) {
         (*before).insert_before(&mut (*cur).suspend_node);
     }
     if ticks != u32::MAX {
-        (*cur).thread_timer.start_internal(ticks, 0, thread_timer_cb, cur as usize);
+        (*cur)
+            .thread_timer
+            .start_internal(ticks, 0, thread_timer_cb, cur as usize);
     }
     (*cur).state = TS_SUSPEND;
     sched::ready_remove(cur);
@@ -437,7 +441,11 @@ impl Event {
             let head = &mut e.base.suspend_list as *mut ListHead;
             while let Some(node) = n {
                 let nn = (*node).next_node();
-                let next = if nn.is_null() || nn == head { None } else { Some(nn) };
+                let next = if nn.is_null() || nn == head {
+                    None
+                } else {
+                    Some(nn)
+                };
                 let w = thread_from_suspend(node);
                 let wanted = (*w).event_wanted;
                 let opt = (*w).event_opt;
@@ -841,7 +849,11 @@ impl MessageQueueInner {
         let (pool, _, _) = v.into_raw_parts();
         self.pool = pool;
         for i in 0..max_msgs {
-            let next = if i + 1 < max_msgs { (i + 1) as u32 } else { BLOCK_END };
+            let next = if i + 1 < max_msgs {
+                (i + 1) as u32
+            } else {
+                BLOCK_END
+            };
             self.set_block_next(i as u32, next);
         }
     }
