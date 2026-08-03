@@ -31,7 +31,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_PRIORITY_MAX` / `CFG_IDLE_*` | RTOS 优先级与空闲线程 |
 | `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 过采样 / 缓冲 / 中断参数 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
-| `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 (原 `shell.conf` 并入) |
+| `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
 | `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
 
 约束:
@@ -194,8 +194,13 @@ continue
   的 `CFG_SHELL_*` (编译期读取, 改密码无需改代码);
 - 密码错误次数可配置 (默认 3 次), 超限提示 "Too many login failures";
 - 命令提示符 `root@HC32F460JEUA:~$` (用户名@芯片型号);
-- 命令: `help` / `sysinfo` / `uptime` / `ps` / `free` / `echo` /
-  `led on|off` / `selftest` / `clear` / `whoami` / `reboot` / `logout|exit`;
+- **命令系统**: 命令注册在 `src/shell.rs` 的静态命令表 [`COMMANDS`]
+  (名称/别名/帮助/执行函数), 分发与实现解耦; **新增命令 = 表内追加一项
+  + 加入 `CFG_SHELL_COMMANDS` 启用列表**, 无需修改分发/帮助逻辑;
+- **每个命令可单独启用/禁用**: `CFG_SHELL_COMMANDS` 为逗号分隔的命令名
+  列表, 未列出的命令执行时提示 "未启用" 且不出现在 `help` 中;
+- 命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) / `echo` /
+  `led on|off` / `selftest` / `clear` / `whoami` / `reboot` / `logout`(exit);
 - 输入: 回车提交, 退格删除, Ctrl+C 清行;
 - 输入采用中断驱动 (RX ISR 释放信号量, 线程阻塞等待, 无轮询)。
 

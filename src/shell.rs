@@ -10,20 +10,20 @@
 //!
 //! `root@hc32f460:~$` — 仿 Ubuntu PS1 风格 (主机名取编译期芯片型号)。
 //!
-//! # 命令
+//! # 命令系统
 //!
-//! - `help` — 命令列表;
-//! - `sysinfo` — 系统信息 (型号/CPU 频率/节拍/构建/版本);
-//! - `uptime` — 运行时间;
-//! - `ps` — 线程列表 (仿 ps);
-//! - `free` — 堆内存统计 (仿 free);
-//! - `echo` — 回显参数;
-//! - `led on|off` — 控制板载 LED;
-//! - `selftest` — 内核自检 (手动启动, 受 `CFG_APP_SELFTEST_ENABLE` 控制);
-//! - `clear` — 清屏;
-//! - `logout` / `exit` — 重新登录;
-//! - `reboot` — 软复位重启;
-//! - `whoami` — 显示当前用户。
+//! 命令注册在静态表 [`COMMANDS`] 中 (名称/别名/帮助/执行函数), 分发逻辑
+//! 与命令实现解耦。**新增命令 = 表内追加一项 + 加入 `CFG_SHELL_COMMANDS`
+//! 启用列表**, 无需修改分发/帮助代码。
+//!
+//! 每个命令可单独通过 `CFG_SHELL_COMMANDS` (逗号分隔列表) 启用/禁用
+//! (见 [`crate::config::cmd_enabled`]); 未列出的命令执行时提示"未启用",
+//! 且不显示在 `help` 中。命令内部参数 (如 `led` 的引脚、`selftest` 的
+//! 开关) 仍由各自的 `CFG_*` 配置控制。
+//!
+//! 当前命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) /
+//! `echo` / `led on|off` / `selftest` / `clear` / `whoami` / `reboot` /
+//! `logout`(exit)。
 //!
 //! # 输入处理
 //!
@@ -47,6 +47,60 @@ const HOSTNAME: &str = config::CHIP_MODEL;
 
 /// 输入行缓冲区大小 (.cargo/config.toml `CFG_SHELL_LINE_BUF`)
 const LINE_BUF: usize = config::SHELL_LINE_BUF_SIZE;
+
+// ============================== 命令系统 ==============================
+
+/// 命令执行结果
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CmdResult {
+    /// 命令执行完毕, 继续命令循环
+    Ok,
+    /// 退出 shell (重新登录)
+    Logout,
+}
+
+/// 命令描述符: 注册在静态命令表中, 由 [`dispatch`] 统一查找/执行
+struct Command {
+    /// 主命令名 (`CFG_SHELL_COMMANDS` 按此名控制启用)
+    name: &'static str,
+    /// 别名 (可为空)
+    aliases: &'static [&'static str],
+    /// 帮助文本 (一行说明, 不含命令名)
+    help: &'static str,
+    /// 执行函数: 参数为命令名之后的剩余文本 (含前导空白)
+    handler: fn(&str) -> CmdResult,
+}
+
+/// 命令表项构造器
+const fn cmd(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    help: &'static str,
+    handler: fn(&str) -> CmdResult,
+) -> Command {
+    Command {
+        name,
+        aliases,
+        help,
+        handler,
+    }
+}
+
+/// 命令表: 新增命令 = 追加一项, 并加入 `CFG_SHELL_COMMANDS` 启用列表
+static COMMANDS: &[Command] = &[
+    cmd("help", &[], "命令列表", cmd_help),
+    cmd("sysinfo", &["info"], "系统信息 (型号/频率/节拍/构建)", cmd_sysinfo),
+    cmd("uptime", &[], "运行时间", cmd_uptime),
+    cmd("ps", &[], "线程列表", cmd_ps),
+    cmd("free", &["mem"], "堆内存统计", cmd_free),
+    cmd("echo", &[], "回显 <文本>", cmd_echo),
+    cmd("led", &[], "板载 LED on|off", cmd_led),
+    cmd("selftest", &[], "内核自检 (rtos 功能自检)", cmd_selftest),
+    cmd("clear", &[], "清屏", cmd_clear),
+    cmd("whoami", &[], "当前用户", cmd_whoami),
+    cmd("reboot", &[], "软复位重启", cmd_reboot),
+    cmd("logout", &["exit"], "重新登录", cmd_logout),
+];
 
 /// shell 线程入口: 登录 → 命令循环 (永不返回)
 pub extern "C" fn shell_entry(_param: usize) {
@@ -109,50 +163,46 @@ fn command_loop() {
 }
 
 /// 执行命令; 返回 false 表示退出 shell (重新登录)
+///
+/// 在 [`COMMANDS`] 表中按主名/别名查找, 命中后检查 `CFG_SHELL_COMMANDS`
+/// 启用列表, 通过则调用执行函数 (参数 = 命令名之后的剩余文本)。
 fn dispatch(line: &str) -> bool {
     let mut words = line.split_whitespace();
-    let Some(cmd) = words.next() else {
+    let Some(name) = words.next() else {
         return true;
     };
-    match cmd {
-        "help" => cmd_help(),
-        "sysinfo" | "info" => cmd_sysinfo(),
-        "uptime" => cmd_uptime(),
-        "ps" => cmd_ps(),
-        "free" | "mem" => cmd_free(),
-        "echo" => {
-            let rest: alloc::string::String = words.collect::<alloc::vec::Vec<_>>().join(" ");
-            println!("{}", rest);
-        }
-        "led" => cmd_led(words.next()),
-        "selftest" => cmd_selftest(),
-        "clear" => cmd_clear(),
-        "whoami" => println!("{}", SHELL_USERNAME),
-        "reboot" => cmd_reboot(),
-        "logout" | "exit" => return false,
-        _ => println!("{}: command not found (try `help`)", cmd),
+    let rest = &line[name.len()..];
+    let Some(cmd) = COMMANDS
+        .iter()
+        .find(|c| c.name == name || c.aliases.contains(&name))
+    else {
+        println!("{}: command not found (try `help`)", name);
+        return true;
+    };
+    if !config::cmd_enabled(cmd.name) {
+        println!("{}: 命令未启用 (CFG_SHELL_COMMANDS)", name);
+        return true;
     }
-    true
+    (cmd.handler)(rest) == CmdResult::Ok
 }
 
-/// 命令帮助
-fn cmd_help() {
-    println!("可用命令:");
-    println!("  sysinfo         系统信息 (型号/频率/节拍/构建)");
-    println!("  uptime          运行时间");
-    println!("  ps              线程列表");
-    println!("  free            堆内存统计");
-    println!("  echo <文本>     回显");
-    println!("  led on|off      板载 LED");
-    println!("  selftest        内核自检 (rtos 功能自检)");
-    println!("  clear           清屏");
-    println!("  whoami          当前用户");
-    println!("  reboot          软复位重启");
-    println!("  logout|exit     重新登录");
+/// 命令帮助: 仅列出 `CFG_SHELL_COMMANDS` 中启用的命令 (含别名)
+fn cmd_help(_rest: &str) -> CmdResult {
+    println!("可用命令 (CFG_SHELL_COMMANDS 控制启用):");
+    for c in COMMANDS {
+        if !config::cmd_enabled(c.name) {
+            continue;
+        }
+        println!("  {:<14} {}", c.name, c.help);
+        for alias in c.aliases {
+            println!("  {:<14} ({} 的别名)", alias, c.name);
+        }
+    }
+    CmdResult::Ok
 }
 
 /// 系统信息
-fn cmd_sysinfo() {
+fn cmd_sysinfo(_rest: &str) -> CmdResult {
     println!(
         "{}  v{}  —  RT-Thread 架构的 Rust RTOS",
         env!("CARGO_PKG_NAME"),
@@ -184,10 +234,11 @@ fn cmd_sysinfo() {
         },
         env!("RTOS_RUSTC")
     );
+    CmdResult::Ok
 }
 
 /// 运行时间 (仿 uptime)
-fn cmd_uptime() {
+fn cmd_uptime(_rest: &str) -> CmdResult {
     let ms = crate::rtos::uptime_ms();
     let (h, m, s) = (ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60);
     println!(
@@ -199,10 +250,11 @@ fn cmd_uptime() {
         crate::rtos::TICKS_PER_SEC,
         crate::rtos::sched::ready_thread_count()
     );
+    CmdResult::Ok
 }
 
 /// 线程列表 (仿 ps)
-fn cmd_ps() {
+fn cmd_ps(_rest: &str) -> CmdResult {
     let list = crate::rtos::thread_info_list();
     println!("NAME                 PRIO  STATE   (count={})", list.len());
     for t in list {
@@ -213,10 +265,11 @@ fn cmd_ps() {
             crate::rtos::thread_state_name(t.state)
         );
     }
+    CmdResult::Ok
 }
 
 /// 堆内存统计 (仿 free)
-fn cmd_free() {
+fn cmd_free(_rest: &str) -> CmdResult {
     let total = heap::capacity();
     let used = heap::used();
     // 整数百分比 (避免浮点格式化在 no_std 下的问题)
@@ -229,41 +282,57 @@ fn cmd_free() {
         total - used,
         pct
     );
+    CmdResult::Ok
+}
+
+/// 回显剩余参数
+fn cmd_echo(rest: &str) -> CmdResult {
+    println!("{}", rest.trim());
+    CmdResult::Ok
 }
 
 /// LED 控制
-fn cmd_led(arg: Option<&str>) {
+fn cmd_led(rest: &str) -> CmdResult {
     let gpio = Gpio::take();
     let led = gpio.pin::<PortC, { config::LED_PIN }>();
-    match arg {
-        Some("on") => {
+    match rest.trim() {
+        "on" => {
             led.set_high();
             println!("LED on");
         }
-        Some("off") => {
+        "off" => {
             led.set_low();
             println!("LED off");
         }
         _ => println!("用法: led on|off"),
     }
+    CmdResult::Ok
 }
 
 /// 内核自检: 通过命令手动启动 (受 CFG_APP_SELFTEST_ENABLE 控制)
-fn cmd_selftest() {
+fn cmd_selftest(_rest: &str) -> CmdResult {
     if config::APP_SELFTEST_ENABLE {
         crate::start_selftest();
     } else {
         println!("selftest 未启用 (CFG_APP_SELFTEST_ENABLE=false)");
     }
+    CmdResult::Ok
 }
 
 /// 清屏 (ANSI)
-fn cmd_clear() {
+fn cmd_clear(_rest: &str) -> CmdResult {
     println!("\x1b[2J\x1b[H");
+    CmdResult::Ok
+}
+
+/// 当前用户
+fn cmd_whoami(_rest: &str) -> CmdResult {
+    println!("{}", SHELL_USERNAME);
+    CmdResult::Ok
 }
 
 /// 软复位 (AIRCR.SYSRESETREQ)
-fn cmd_reboot() {
+fn cmd_reboot(_rest: &str) -> CmdResult {
     println!("rebooting...");
     crate::rtos::thread_delay_ms(50);
     unsafe {
@@ -272,6 +341,11 @@ fn cmd_reboot() {
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
+}
+
+/// 退出 shell (重新登录)
+fn cmd_logout(_rest: &str) -> CmdResult {
+    CmdResult::Logout
 }
 
 /// 从 UART 读取一行 (阻塞, 支持退格/Ctrl+C)

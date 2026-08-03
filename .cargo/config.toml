@@ -64,6 +64,8 @@ CFG_SHELL_USERNAME = "root"
 CFG_SHELL_PASSWORD = "root123"
 CFG_SHELL_LOGIN_TRIES = "3" # 登录失败允许次数
 CFG_SHELL_LINE_BUF = "128"  # 输入行缓冲区 (字节)
+# 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
+CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,led,selftest,clear,whoami,reboot,logout"
 
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
 CFG_APP_SELFTEST_STACK = "4096"

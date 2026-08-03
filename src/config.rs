@@ -195,6 +195,46 @@ pub const SHELL_LOGIN_TRIES: u32 = parse_u32(env!("CFG_SHELL_LOGIN_TRIES"));
 /// 输入行缓冲区大小 (字节) (CFG_SHELL_LINE_BUF)
 pub const SHELL_LINE_BUF_SIZE: usize = parse_u32(env!("CFG_SHELL_LINE_BUF")) as usize;
 
+/// 命令是否在启用列表中 (CFG_SHELL_COMMANDS, 逗号分隔, 忽略首尾空格)
+///
+/// 每个 shell 命令可单独通过该列表启用/禁用: 新增命令需在
+/// `src/shell.rs` 命令表注册并加入此列表。const 求值, 结果编译期确定。
+pub const fn cmd_enabled(name: &str) -> bool {
+    let list = env!("CFG_SHELL_COMMANDS").as_bytes();
+    let name = name.as_bytes();
+    let mut i = 0;
+    let mut start = 0;
+    while i <= list.len() {
+        if i == list.len() || list[i] == b',' {
+            // 定位一项并去除首尾空格 (就地比较, 不做切片)
+            let mut a = start;
+            let mut b = i;
+            while a < b && list[a] == b' ' {
+                a += 1;
+            }
+            while b > a && list[b - 1] == b' ' {
+                b -= 1;
+            }
+            if b - a == name.len() {
+                let mut same = true;
+                let mut j = 0;
+                while j < name.len() {
+                    if list[a + j] != name[j] {
+                        same = false;
+                    }
+                    j += 1;
+                }
+                if same {
+                    return true;
+                }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    false
+}
+
 // ============================== [app] ==============================
 
 /// 演示线程参数 (CFG_APP_*)
