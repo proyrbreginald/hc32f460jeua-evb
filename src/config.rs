@@ -321,6 +321,20 @@ pub const SHELL_LOGIN_TRIES: u32 = parse_u32(env!("CFG_SHELL_LOGIN_TRIES"));
 /// 输入行缓冲区大小 (字节) (CFG_SHELL_LINE_BUF)
 pub const SHELL_LINE_BUF_SIZE: usize = parse_u32(env!("CFG_SHELL_LINE_BUF")) as usize;
 
+// ============================== [rtc] ==============================
+
+/// 是否启用 RTC 并作为日志时间戳 (CFG_RTC_ENABLE = true/false)
+///
+/// 启用时 main 初始化 RTC (LRC 源, 24H, 基准 2000-01-01 00:00:00),
+/// 日志输出带 `[天:时:分:秒]` 前缀 (自启动起的运行时长)。
+pub const RTC_ENABLE: bool = if eq_str(env!("CFG_RTC_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_RTC_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_RTC_ENABLE 非法 (可用 true/false)")
+};
+
 // ============================== [log] ==============================
 
 /// 日志默认开关 (CFG_LOG_ENABLE = true/false)

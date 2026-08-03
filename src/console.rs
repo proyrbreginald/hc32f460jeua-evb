@@ -38,12 +38,22 @@
 //! 应限制输出速率或改用带流控的接口。
 
 use crate::rtos::{Mutex, Timeout};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// 控制台输出串口 (编译期绑定: `.cargo/config.toml` 的 `CFG_UART_UNIT`)
 pub type ConsoleUart = crate::config::ConsoleUart;
 
 /// 打印互斥量 (优先级继承): 串行化线程上下文的打印输出
 static PRINT_MUTEX: Mutex = Mutex::new();
+
+/// 控制台是否就绪: UART 初始化前 (`mark_ready` 前) 的打印**静默丢弃**,
+/// 防止在 UART 时钟未使能时访问 USART (TXE 读回 0 导致等待死循环)。
+static READY: AtomicBool = AtomicBool::new(false);
+
+/// 标记控制台就绪 (由应用在 UART 初始化完成后调用一次)
+pub fn mark_ready() {
+    READY.store(true, Ordering::Relaxed);
+}
 
 /// 向控制台输出格式化内容 (由 `print!` 宏调用)
 ///
@@ -54,6 +64,9 @@ static PRINT_MUTEX: Mutex = Mutex::new();
 /// 避免在 `rtos::init()` 之前使用互斥量 (此时 `sched::current()`
 /// 为空, 内核阻塞原语不可用)。
 pub fn write_fmt(args: core::fmt::Arguments<'_>) {
+    if !READY.load(Ordering::Relaxed) {
+        return; // UART 未就绪: 静默丢弃, 防止 TXE 等待死循环
+    }
     if crate::rtos::scheduler_started() {
         PRINT_MUTEX.lock(Timeout::Forever).ok();
         write_fmt_raw(args);
@@ -68,6 +81,9 @@ pub fn write_fmt(args: core::fmt::Arguments<'_>) {
 /// 内容与换行在同一把锁内完成, 任意时刻至多一个线程占用串口,
 /// 行与行之间不会交错。
 pub fn write_fmt_line(args: core::fmt::Arguments<'_>) {
+    if !READY.load(Ordering::Relaxed) {
+        return; // UART 未就绪: 静默丢弃, 防止 TXE 等待死循环
+    }
     if crate::rtos::scheduler_started() {
         PRINT_MUTEX.lock(Timeout::Forever).ok();
         // 自检: 打印期间锁必须仍归当前线程持有 (定位锁丢失)

@@ -87,6 +87,9 @@ CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,led,log,selftest,clear,wh
 CFG_LOG_ENABLE = "true" # 日志默认开关 (运行时可用 shell `log on|off` 切换)
 CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出 ≤ 阈值)
 
+# [rtc] 实时时钟 (LRC 源), 同时作为日志时间戳 (天:时:分:秒)
+CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
+
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
 # 是否启用内核自检 (true/false); 启用后通过 shell 命令 `selftest` 手动启动,
 # 不再开机自动运行; false 时命令提示未启用

@@ -138,16 +138,27 @@ pub fn should_log(l: Level) -> bool {
     enabled() && l <= level()
 }
 
-/// 输出一条日志: 彩色标签 + 消息, 整行原子输出 (仅线程上下文)
+/// 输出一条日志: 时间戳 + 彩色标签 + 消息, 整行原子输出 (仅线程上下文)
 ///
-/// 不满足 (开关 × 阈值) 时整行省略 — 与内核打印 ([`crate::println`])
-/// 无关, 后者不受本模块任何状态影响。
+/// 时间戳 `[天:时:分:秒]` 来自 RTC 运行时长 (见 [`crate::rtc::elapsed_dhms`]);
+/// RTC 未初始化/未启动时省略前缀 (boot 阶段)。
 pub fn log(level: Level, args: core::fmt::Arguments<'_>) {
     if !should_log(level) {
         return;
     }
+    // 时间戳 (运行时长): RTC 未运行时为空串
+    let (d, h, m, s, has_stamp) = match crate::rtc::elapsed_dhms() {
+        Some((d, h, m, s)) => (d, h, m, s, true),
+        None => (0, 0, 0, 0, false),
+    };
+    let stamp = if has_stamp {
+        core::format_args!("[{}:{:02}:{:02}:{:02}] ", d, h, m, s)
+    } else {
+        core::format_args!("")
+    };
     crate::console::write_fmt_line(core::format_args!(
-        "{}{}\x1b[0m {}",
+        "{}{}{}\x1b[0m {}",
+        stamp,
         level.color(),
         level.tag(),
         args

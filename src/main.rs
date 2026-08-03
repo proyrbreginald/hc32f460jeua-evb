@@ -8,6 +8,7 @@ extern crate alloc;
 
 // -- 启动与内核基础设施 --
 mod crc; // CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
+mod rtc; // 实时时钟 (RTC): LRC 源/时间日期/闹钟, 日志时间戳
 mod critical_section; // PRIMASK 临界区 (中断安全的基础)
 mod efm; // 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
 mod heap; // 全局堆分配器 (边界标记 + 首次适配)
@@ -484,6 +485,9 @@ fn hardware_init() -> config::ConsoleUart {
         noise_filter: config::UART_NOISE_FILTER,
     })
     .expect("UART 初始化失败!");
+    // 控制台就绪: 此后 println!/log! 才真正输出 (就绪前打印被静默丢弃,
+    // 防止 UART 时钟未使能时 TXE 等待死循环)
+    console::mark_ready();
     log_debug!(
         "控制台 UART: USART{} {} bps (过采样 {:?}, 分频 {:?})",
         config::UART_UNIT,
@@ -491,5 +495,31 @@ fn hardware_init() -> config::ConsoleUart {
         config::UART_OVERSAMPLE,
         config::UART_CLOCK_DIV
     );
+
+    // RTC (LRC 源, 24H; 基准 2000-01-01 00:00:00) — 日志时间戳 [天:时:分:秒]
+    //
+    // 注意: 必须在 UART 就绪后初始化 —— 确认日志为 info 级会实际打印,
+    // 若在 UART 使能前打印, TXE 等待将死循环 (时钟未开, SR 读回 0)。
+    if config::RTC_ENABLE {
+        rtc::init(rtc::Config {
+            clock_src: rtc::ClockSource::Lrc,
+            hour_format: rtc::HourFormat::H24,
+            int_period: rtc::IntPeriod::Sec,
+        });
+        rtc::set_date(rtc::Date {
+            year: 0,
+            month: 1,
+            day: 1,
+            weekday: 6,
+        });
+        rtc::set_time(rtc::Time {
+            hour: 0,
+            minute: 0,
+            second: 0,
+            pm: false,
+        });
+        rtc::start();
+        log_info!("RTC 已启动 (LRC 源, 24H), 日志时间戳生效 [天:时:分:秒]");
+    }
     uart
 }

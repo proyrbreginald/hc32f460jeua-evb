@@ -60,6 +60,7 @@ src/
 ├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
 ├── efm.rs             # 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
 ├── crc.rs             # CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
+├── rtc.rs             # 实时时钟 (RTC): LRC 源/时间日期/闹钟, 日志时间戳
 ├── sram.rs            # 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
 ├── intc.rs            # 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 ├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
@@ -186,6 +187,23 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
 - 自检 (`selftest` 命令) 含 CRC 实测: 四个标准配置计算 "123456789"
   并与标准向量比对。
 
+## 实时时钟 (rtc)
+
+对齐 DDL v3.3.0 `hc32_ll_rtc.c/h`:
+
+- 时钟源: **LRC** (内部 32.768kHz, 无外部器件, 默认; JEUA 48pin 无
+  XTAL32 引脚对) / XTAL32 (需自行启动晶振);
+- 时间/日期寄存器 **BCD** 编码, 24/12 小时制可配; 读/写自动进出
+  **RW 模式** (CR2.RWREQ/RWEN); `set_time`/`get_time`/`set_date`/`get_date`;
+- 周期中断: 0.5s/1s/1min/1hour/1day/1month (CR1.PRDS);
+- 闹钟: 时+分匹配 + 星期位掩码 (0x7F=每天), 事件源 `intc::src::RTC_ALM`
+  (81) / `RTC_PRD` (82);
+- 无 VBAT 备份域: VDD 供电, 掉电后需重新初始化 (软件复位 + 重设);
+- **日志时间戳**: `CFG_RTC_ENABLE` 启用时开机初始化 (LRC/24H, 基准
+  2000-01-01 00:00:00), 日志输出带 **`[天:时:分:秒]`** 前缀
+  (自启动起的运行时长, Howard Hinnant 公历算法跨月/闰年正确,
+  RTC 未运行时省略)。
+
 ## 启动流程
 
 ```
@@ -258,6 +276,9 @@ MQ.send(b"hi", Timeout::Forever);    MQ.recv(&mut buf, Timeout::Forever);
 - `println!` 整行原子输出:内容 + CRLF 在同一次加锁内完成 (优先级继承互斥量),
   多线程输出不交错;等待打印锁的高优先级线程会把持有者提升到自己的优先级,
   **不会出现高优先级线程无界等待低优先级线程**;
+- **就绪门**: UART 初始化完成前 (`console::mark_ready` 前) 的打印静默丢弃,
+  防止在 UART 时钟未使能时访问 USART 导致 TXE 等待死循环 (早期 boot 日志
+  不会丢失 —— 它们本就低于默认日志阈值);
 - 中断上下文 / panic 诊断走无锁通道 `write_fmt_raw` (仅诊断, 可能交错);
 - 调度器启动前 (boot 阶段) 自动退化为无锁输出;
 - 注意:UART 为 115200 无流控,输出速率接近 PC 读取能力时 CH340 缓冲可能
