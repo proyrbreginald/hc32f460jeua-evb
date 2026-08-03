@@ -179,9 +179,14 @@ pub(crate) fn check() {
                 cb(param);
                 // 周期定时器重新入队 (回调内已 stop/重新 start 时跳过)
                 let t = &mut *t;
-                if t.started && t.period_ticks != 0 && !t.node.is_linked() {
-                    t.timeout_tick = tick().wrapping_add(t.period_ticks);
-                    insert_sorted(t);
+                if t.period_ticks != 0 && !t.node.is_linked() {
+                    if t.started {
+                        t.timeout_tick = tick().wrapping_add(t.period_ticks);
+                        insert_sorted(t);
+                    }
+                } else {
+                    // 一次性定时器: 触发后清除 started (is_active 不再误报)
+                    t.started = false;
                 }
                 true
             } else {

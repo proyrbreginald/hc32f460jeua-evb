@@ -140,6 +140,10 @@ impl Thread {
     }
 
     /// 恢复挂起的线程 (含延时/IPC 等待中的线程)
+    ///
+    /// 注意: 对挂在**信号量/互斥量**等待队列上的线程恢复属于未定义语义
+    /// (唤醒即"获得"是 release/unlock 的职责), 本 API 仅应在延时/显式
+    /// 挂起场景使用; 邮箱/消息队列等待者被恢复后经重查条件自洽。
     pub fn resume(&self) -> Result<(), Error> {
         let t = self as *const Thread as *mut Thread;
         let mut need = false;
@@ -298,6 +302,10 @@ unsafe fn exit_and_schedule(t: *mut Thread) -> ! {
 
 /// 临界区内: 线程删除/退出公共清理
 unsafe fn delete_bookkeeping(t: *mut Thread) {
+    // 已回收 (TS_CLOSE, 僵尸队列中): 拒绝重复删除, 防二次释放
+    if (*t).state == TS_CLOSE {
+        return;
+    }
     // 释放持有的互斥量 (所有权转移给等待者)
     mutex_release_all_held(t);
     // 停止线程定时器 (防止超时回调唤醒已删除线程)
@@ -355,6 +363,7 @@ pub(crate) extern "C" fn thread_timer_cb(param: usize) {
             return;
         }
         (*t).error = -1; // -RT_ETIMEDOUT
+        (*t).pending_mutex = core::ptr::null_mut(); // 超时: 清理继承链残留
         (*t).suspend_node.remove();
         wakeup_thread(t);
         need = resched_needed(t);

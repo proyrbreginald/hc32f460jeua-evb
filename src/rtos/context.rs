@@ -130,7 +130,7 @@ pub(crate) unsafe fn request_switch(from_sp: *mut usize, to_sp: *mut usize) {
 /// PendSV 必须低于所有中断, 确保切换发生在所有中断返回之后。
 pub(crate) fn scb_priority_init() {
     // SHPR3: [23:16] = PendSV (优先级 15), [31:24] = SysTick (优先级 14)
-    unsafe { core::ptr::write_volatile(0xE000_ED20 as *mut u32, 0xF0FF_0000) };
+    unsafe { core::ptr::write_volatile(0xE000_ED20 as *mut u32, 0xE0F0_0000) };
 }
 
 #[inline]

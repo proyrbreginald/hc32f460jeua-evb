@@ -38,12 +38,12 @@ pub(crate) mod timer;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// 时钟节拍频率 (Hz), 须与 SysTick 配置一致
-pub const TICKS_PER_SEC: u32 = 1000;
-/// 优先级数量 (0 = 最高, 31 = 最低)
-pub const PRIORITY_MAX: u8 = 32;
-/// 空闲线程优先级 (最低)
-pub const IDLE_PRIORITY: u8 = 31;
+/// 时钟节拍频率 (Hz), 须与 SysTick 配置一致 (.cargo/config.toml)
+pub const TICKS_PER_SEC: u32 = crate::config::TICKS_PER_SEC;
+/// 优先级数量 (0 = 最高, 31 = 最低) (.cargo/config.toml)
+pub const PRIORITY_MAX: u8 = crate::config::PRIORITY_MAX;
+/// 空闲线程优先级 (最低) (.cargo/config.toml)
+pub const IDLE_PRIORITY: u8 = crate::config::IDLE_PRIORITY;
 
 /// 全局节拍计数 (由 [`tick_increase`] 在时钟中断中累加)
 static TICK: AtomicU32 = AtomicU32::new(0);

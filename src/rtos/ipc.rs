@@ -175,6 +175,9 @@ impl Semaphore {
     }
 
     /// 获取信号量 (可超时)
+    ///
+    /// **唤醒即获得资源**: `release` 对等待者是"唤醒或计数+1"二选一,
+    /// 被唤醒即代表资源已移交, 不得重查计数 (重查必为 0 导致再挂起死锁)。
     pub fn take(&self, timeout: Timeout) -> Result<(), Error> {
         let mut outcome = Ok(());
         let mut blocked = false;
@@ -257,6 +260,9 @@ impl Mutex {
     }
 
     /// 获取互斥量 (递归持有合法; 可超时)
+    ///
+    /// **唤醒即获得持有权**: [`Mutex::unlock`] 会把所有权转移给被唤醒
+    /// 的等待者, 唤醒后不得重查持有权。
     pub fn lock(&self, timeout: Timeout) -> Result<(), Error> {
         let mut outcome = Ok(());
         let mut blocked = false;
@@ -586,71 +592,86 @@ impl Mailbox {
     }
 
     fn send_impl(&self, msg: usize, timeout: Timeout, urgent: bool) -> Result<(), Error> {
-        let mut outcome = Err(Error::Full);
-        let mut need = false;
-        let mut blocked = false;
-        critical_section::with(|| unsafe {
-            let mb = &mut *self.ptr();
-            mb.ensure_pool();
-            if mb.count < mb.size {
-                if urgent {
-                    mb.out_idx = (mb.out_idx + mb.size - 1) % mb.size;
-                    *mb.pool.add(mb.out_idx as usize) = msg;
+        loop {
+            let mut outcome = Err(Error::Full);
+            let mut need = false;
+            let mut blocked = false;
+            critical_section::with(|| unsafe {
+                let mb = &mut *self.ptr();
+                mb.ensure_pool();
+                if mb.count < mb.size {
+                    if urgent {
+                        mb.out_idx = (mb.out_idx + mb.size - 1) % mb.size;
+                        *mb.pool.add(mb.out_idx as usize) = msg;
+                    } else {
+                        *mb.pool.add(mb.in_idx as usize) = msg;
+                        mb.in_idx = (mb.in_idx + 1) % mb.size;
+                    }
+                    mb.count += 1;
+                    outcome = Ok(());
+                    if let Some(w) = wake_head(&mut mb.base.suspend_list) {
+                        need = resched_needed(w);
+                    }
+                } else if timeout == Timeout::Ticks(0) {
+                    outcome = Err(Error::Full);
                 } else {
-                    *mb.pool.add(mb.in_idx as usize) = msg;
-                    mb.in_idx = (mb.in_idx + 1) % mb.size;
+                    suspend_current(&mut mb.sender_list, timeout.ticks());
+                    blocked = true;
                 }
-                mb.count += 1;
-                outcome = Ok(());
-                if let Some(w) = wake_head(&mut mb.base.suspend_list) {
-                    need = resched_needed(w);
-                }
-            } else if timeout == Timeout::Ticks(0) {
-                outcome = Err(Error::Full);
-            } else {
-                suspend_current(&mut mb.sender_list, timeout.ticks());
-                blocked = true;
+            });
+            if need {
+                sched::schedule();
             }
-        });
-        if need {
-            sched::schedule();
+            if blocked {
+                // 唤醒后: 超时返回, 否则重试发送 (消息不得丢失)
+                if blocked_wait() {
+                    return Err(Error::TimedOut);
+                }
+                continue;
+            }
+            return outcome;
         }
-        if blocked && blocked_wait() {
-            return Err(Error::TimedOut);
-        }
-        outcome
     }
 
     /// 接收消息 (空时按超时阻塞)
+    ///
+    /// 阻塞等待者被 [`Mailbox::send`] 唤醒后回到循环重新检查
+    /// (对齐 RT-Thread 语义), 消息不会滞留。
     pub fn recv(&self, timeout: Timeout) -> Result<usize, Error> {
-        let mut outcome = Err(Error::TimedOut);
-        let mut need = false;
-        let mut blocked = false;
-        critical_section::with(|| unsafe {
-            let mb = &mut *self.ptr();
-            mb.ensure_pool();
-            if mb.count > 0 {
-                let msg = *mb.pool.add(mb.out_idx as usize);
-                mb.out_idx = (mb.out_idx + 1) % mb.size;
-                mb.count -= 1;
-                outcome = Ok(msg);
-                if let Some(w) = wake_head(&mut mb.sender_list) {
-                    need = resched_needed(w);
+        loop {
+            let mut outcome = Err(Error::TimedOut);
+            let mut need = false;
+            let mut blocked = false;
+            critical_section::with(|| unsafe {
+                let mb = &mut *self.ptr();
+                mb.ensure_pool();
+                if mb.count > 0 {
+                    let msg = *mb.pool.add(mb.out_idx as usize);
+                    mb.out_idx = (mb.out_idx + 1) % mb.size;
+                    mb.count -= 1;
+                    outcome = Ok(msg);
+                    if let Some(w) = wake_head(&mut mb.sender_list) {
+                        need = resched_needed(w);
+                    }
+                } else if timeout == Timeout::Ticks(0) {
+                    outcome = Err(Error::TimedOut);
+                } else {
+                    suspend_current(&mut mb.base.suspend_list, timeout.ticks());
+                    blocked = true;
                 }
-            } else if timeout == Timeout::Ticks(0) {
-                outcome = Err(Error::TimedOut);
-            } else {
-                suspend_current(&mut mb.base.suspend_list, timeout.ticks());
-                blocked = true;
+            });
+            if need {
+                sched::schedule();
             }
-        });
-        if need {
-            sched::schedule();
+            if blocked {
+                // 唤醒后: 超时返回, 否则重试接收
+                if blocked_wait() {
+                    return Err(Error::TimedOut);
+                }
+                continue;
+            }
+            return outcome;
         }
-        if blocked && blocked_wait() {
-            return Err(Error::TimedOut);
-        }
-        outcome
     }
 
     #[inline]
@@ -741,11 +762,12 @@ impl MessageQueue {
     }
 
     fn send_impl(&self, buf: &[u8], timeout: Timeout, urgent: bool) -> Result<(), Error> {
-        let mut outcome = Err(Error::Full);
-        let mut need = false;
-        let mut blocked = false;
-        critical_section::with(|| unsafe {
-            let q = &mut *self.ptr();
+        loop {
+            let mut outcome = Err(Error::Full);
+            let mut need = false;
+            let mut blocked = false;
+            critical_section::with(|| unsafe {
+                let q = &mut *self.ptr();
             q.ensure_pool();
             if q.free != BLOCK_END {
                 let b = q.free;
@@ -784,14 +806,20 @@ impl MessageQueue {
         if need {
             sched::schedule();
         }
-        if blocked && blocked_wait() {
-            return Err(Error::TimedOut);
+        if blocked {
+            // 唤醒后: 超时返回, 否则重试发送 (消息不得丢失)
+            if blocked_wait() {
+                return Err(Error::TimedOut);
+            }
+            continue;
         }
-        outcome
+        return outcome;
+        }
     }
 
     /// 接收消息: 拷贝到 `buf`, 返回实际字节数 (空时按超时阻塞)
     pub fn recv(&self, buf: &mut [u8], timeout: Timeout) -> Result<usize, Error> {
+        loop {
         let mut outcome = Err(Error::TimedOut);
         let mut need = false;
         let mut blocked = false;
@@ -821,10 +849,15 @@ impl MessageQueue {
         if need {
             sched::schedule();
         }
-        if blocked && blocked_wait() {
-            return Err(Error::TimedOut);
+        if blocked {
+            // 唤醒后: 超时返回, 否则重试接收
+            if blocked_wait() {
+                return Err(Error::TimedOut);
+            }
+            continue;
         }
-        outcome
+        return outcome;
+        }
     }
 
     #[inline]

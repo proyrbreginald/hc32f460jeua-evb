@@ -1,6 +1,6 @@
 MEMORY
 {
-    FLASH       (rwx) : ORIGIN = 0x00000000, LENGTH = 512K
+    FLASH       (rx)  : ORIGIN = 0x00000000, LENGTH = 512K
     OTP_DATA    (rw)  : ORIGIN = 0x03000C00, LENGTH = 960
     OTP_LOCK    (rw)  : ORIGIN = 0x03000FC0, LENGTH = 60
     RAM         (rwx) : ORIGIN = 0x1FFF8000, LENGTH = 188K

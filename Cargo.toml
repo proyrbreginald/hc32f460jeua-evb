@@ -13,7 +13,16 @@ bench = false        # 禁用基准测试
 [dependencies]
 
 [profile.dev]
+# 默认 opt-level=0 时无任何优化, debug 固件 flash 占用约 2 倍于 release
+# (格式化/字符串/泛型单态化等代码全部原样保留)。
+# opt-level=1 在保持可调试性 (debuginfo 不变, 帧指针由 rustflags 强制保留,
+# panic 栈回溯仍有效) 的前提下, 固件从 ~104KB 降到 ~61KB。
+opt-level = 1 # "s" 可再降到 ~56KB, 但调试跳步/变量可见性略差
 panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开
 
 [profile.release]
+# 体积优先 (对串口/RTOS 类负载无感): ~53KB → ~38KB (-28%)。
+# 实测本工程 (单 crate, 无外部依赖): LTO 无收益甚至更差, cgu=1 仅 -3% 且拖慢编译,
+# 均不启用。
+opt-level = "z" # 若需兼顾速度可改 "s" (~42KB)
 panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开

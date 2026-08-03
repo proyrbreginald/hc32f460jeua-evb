@@ -23,7 +23,14 @@ pub(crate) unsafe fn defunct_push(t: *mut Thread) {
 
 /// 创建空闲线程 (由 [`crate::rtos::init`] 调用)
 pub(crate) fn create_idle() {
-    let _ = thread_create("idle", 1024, crate::rtos::IDLE_PRIORITY, 1, idle_entry, 0);
+    let _ = thread_create(
+        "idle",
+        crate::config::IDLE_STACK_SIZE,
+        crate::rtos::IDLE_PRIORITY,
+        1,
+        idle_entry,
+        0,
+    );
 }
 
 /// 空闲线程主循环: 回收僵尸线程 → 让出 CPU → 等待中断

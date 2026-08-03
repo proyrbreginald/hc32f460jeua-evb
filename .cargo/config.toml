@@ -1,10 +1,107 @@
 [build]
 target = "thumbv7em-none-eabihf"
 
-# 板级信息: 编译期注入 (启动横幅显示用), 更换芯片/开发板时只改这里
+# =====================================================================
+# 工程配置 (编译期读取, 见 src/config.rs)
+#
+# 值均为字符串; 整数在编译期解析并校验, 非法值直接编译报错。
+# 修改后重新编译即生效 (cargo 会自动追踪本文件变化并重编译)。
+# 注: UART/LED 的端口 (PortA/PortC) 编码在代码中, 引脚号可在此配置。
+# =====================================================================
 [env]
-RTOS_CHIP_MODEL = "HC32F460JEUA"
-RTOS_CORE = "Cortex-M4F"
+# [board] 芯片型号 / 内核名 (启动横幅与 shell 提示符显示)
+CFG_CHIP_MODEL = "HC32F460JEUA"
+CFG_CORE = "Cortex-M4F"
+
+# HRC 频率 16|20 MHz (ICG1.HRCFREQSEL, 经 flash 0x404 ICG 配置字生效,
+# 复位时硬件载入, 运行期只读)
+CFG_HRC_FREQ = "16"
+# HRC 复位后是否停止 (ICG1.HRCSTOP): true=停止 (需 clk::hrc_cmd 启动,
+# 默认安全) / false=持续振荡 (复位即运行, 无需 hrc_cmd)
+CFG_HRC_STOP = "false"
+# [clk] 外部晶振频率 (4~25MHz)
+CFG_XTAL_HZ = "8000000"
+# XTAL 起振配置: 稳定时间 1~9 (≈133µs~32ms, 5=2ms) / 驱动 ulow|low|mid|high
+CFG_XTAL_STABLE_TIME = "5"
+CFG_XTAL_DRV = "ulow"
+# MPLL 倍频分频 (PLLCLK = src ÷(m+1) ×(n+1) ÷(p+1); src: 0=XTAL, 1=HRC)
+CFG_PLL_SRC = "1"
+CFG_PLL_M = "1"
+CFG_PLL_N = "49"
+CFG_PLL_P = "1"
+CFG_PLL_Q = "1"
+CFG_PLL_R = "1"
+# 时钟源 (mrc|hrc|xtal|pll)
+CFG_CLK_SOURCE = "pll"
+# 总线分频 (1/2/4/8/16); 200MHz 方案: HCLK÷1, PCLK0÷1, PCLK1÷2,
+# PCLK2/3÷4, PCLK4/EXCLK÷2 (200MHz 下外设总线必须分频!)
+CFG_DIV_HCLK = "1"
+CFG_DIV_PCLK0 = "1"
+CFG_DIV_PCLK1 = "2"
+CFG_DIV_PCLK2 = "4"
+CFG_DIV_PCLK3 = "4"
+CFG_DIV_PCLK4 = "2"
+CFG_DIV_EXCLK = "2"
+
+# [systick] SysTick 中断频率 (Hz), RTOS 节拍源
+CFG_SYSTICK_HZ = "1000"
+
+# [rtos] 节拍频率 (须与 CFG_SYSTICK_HZ 一致) / 优先级数量 / 空闲线程
+CFG_TICKS_PER_SEC = "1000"
+CFG_PRIORITY_MAX = "32"
+CFG_IDLE_PRIORITY = "31"
+CFG_IDLE_STACK = "1024"
+
+# [uart] 控制台 USART: 单元 (1~4) / 引脚复用 (PA9=TX FSEL32, PA10=RX FSEL33)
+CFG_UART_UNIT = "1"
+CFG_UART_TX_PIN = "9"
+CFG_UART_TX_FSEL = "32"
+CFG_UART_RX_PIN = "10"
+CFG_UART_RX_FSEL = "33"
+CFG_UART_BAUDRATE = "115200"
+CFG_UART_OVERSAMPLE = "8"       # 8 或 16
+CFG_UART_CLOCK_DIV = "1"        # 1/4/16/64
+CFG_UART_DATA_BITS = "8"        # 8/9 (带校验时 8 = 7 数据 + 1 校验)
+CFG_UART_PARITY = "none"        # none/even/odd
+CFG_UART_STOP_BITS = "1"        # 1/2
+CFG_UART_FIRST_BIT = "lsb"      # lsb/msb
+CFG_UART_FLOW_CTRL = "none"     # none/cts (RTS 为 F460 默认行为)
+CFG_UART_NOISE_FILTER = "false" # 噪声滤波 (三取二采样)
+CFG_UART_RX_BUF_SIZE = "512"    # 中断接收环形缓冲 (字节)
+CFG_UART_IRQ_CHANNEL = "1"      # INTC 通道 INT000~INT007
+CFG_UART_IRQ_PRIORITY = "8"     # NVIC 抢占优先级 0~15 (越小越高)
+
+# [gpio] 板载 LED (PC13)
+CFG_LED_PIN = "13"
+CFG_LED_LEVEL = "high" # high / low
+
+# [shell] 终端登录 (改密码无需改代码)
+CFG_SHELL_USERNAME = "root"
+CFG_SHELL_PASSWORD = "root"
+CFG_SHELL_LOGIN_TRIES = "3"    # 登录失败允许次数
+CFG_SHELL_LINE_BUF = "128"     # 输入行缓冲区 (字节)
+# 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
+CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,led,log,selftest,clear,whoami,reboot,logout"
+
+# [log] 应用日志 (可开关+分级+彩色, 与内核打印分离)
+CFG_LOG_ENABLE = "true" # 日志默认开关 (运行时可用 shell `log on|off` 切换)
+CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出 ≤ 阈值)
+
+# [rtc] 实时时钟 (LRC 源), 同时作为日志时间戳 (天:时:分:秒)
+CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
+
+# [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
+# 是否启用内核自检 (true/false); 启用后通过 shell 命令 `selftest` 手动启动,
+# 不再开机自动运行; false 时命令提示未启用
+CFG_APP_SELFTEST_ENABLE = "true"
+CFG_APP_SHELL_STACK = "8192"     # 自检在 shell 线程内同步执行, 需更大栈 (调试格式化机器栈较深)
+CFG_APP_SHELL_PRIORITY = "1"
+CFG_APP_SHELL_TIMESLICE = "10"
+CFG_APP_TIMER_PERIOD_MS = "2000"
+CFG_APP_LED_STACK = "4096"
+CFG_APP_LED_PRIORITY = "2"
+CFG_APP_LED_TIMESLICE = "10"
+CFG_APP_LED_BLINK_MS = "500"
 
 [target.thumbv7em-none-eabihf]
 rustflags = [
