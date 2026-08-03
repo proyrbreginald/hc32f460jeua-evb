@@ -162,6 +162,11 @@ cargo build --release                # release 构建
 cargo run                            # 构建 + 烧录 (pyocd, 见 scripts/flash.sh)
 ```
 
+`debug` 构建默认已启用 `opt-level = 1` (见 `Cargo.toml` `[profile.dev]`):
+保持可调试性 (debuginfo/帧指针/栈回溯不变) 的同时, 固件 flash 占用约为
+无优化时的 60% (~61KB, 可换 `"s"` 再降 ~8%); `release` 构建采用
+`opt-level = "z"` (体积优先), 固件 ~37KB。
+
 ### 烧录 (pyocd)
 
 ```bash
