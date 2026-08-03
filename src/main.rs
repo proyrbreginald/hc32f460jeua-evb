@@ -160,18 +160,21 @@ pub(crate) fn start_selftest() {
 }
 
 /// rtos 自检线程: 依次验证信号量/互斥量/事件/邮箱/消息队列/
-/// 延时/线程删除/线程退出, 全部通过打印 PASS。
+/// 延时/线程删除/线程退出。
+///
+/// 逐项结果走**应用日志** (info 级, 可经 `log` 命令控制/关闭);
+/// 汇总一行始终打印 (命令的执行结果, 不受日志开关影响)。
 extern "C" fn selftest_thread(_param: usize) {
-    println!("[selftest] 开始 (rtos 内核功能自检)");
+    log_info!("[selftest] 开始 (rtos 内核功能自检)");
     let mut pass = 0u32;
     let mut fail = 0u32;
     let mut check = |ok: bool, name: &str| {
         if ok {
             pass += 1;
-            println!("  [PASS] {}", name);
+            log_info!("[PASS] {}", name);
         } else {
             fail += 1;
-            println!("  [FAIL] {}", name);
+            log_info!("[FAIL] {}", name);
         }
     };
 
@@ -265,20 +268,21 @@ extern "C" fn selftest_thread(_param: usize) {
     check(rtos::uptime_ms() >= t0 + 20, "线程延时: uptime 前进 ≥ 20ms");
 
     // 线程删除 (delete API) 与自然退出 (defunct 回收)
-    println!("  [info] 创建 victim 线程");
+    log_debug!("[selftest] 创建 victim 线程");
     let victim = rtos::thread_create("victim", 1024, 24, 0, victim_thread, 0);
-    println!("  [info] victim 已创建, 延时 50ms");
+    log_debug!("[selftest] victim 已创建, 延时 50ms");
     rtos::thread_delay_ms(50);
-    println!("  [info] 调用 victim.delete()");
+    log_debug!("[selftest] 调用 victim.delete()");
     victim.delete();
-    println!("  [info] delete() 已返回, 延时 50ms");
+    log_debug!("[selftest] delete() 已返回, 延时 50ms");
     rtos::thread_delay_ms(50);
     check(true, "线程删除: delete() 完成且系统正常");
-    println!("  [info] 创建 exit-me 线程");
+    log_debug!("[selftest] 创建 exit-me 线程");
     rtos::thread_create("exit-me", 1024, 25, 0, exit_thread, 0);
     rtos::thread_delay_ms(100);
     check(true, "线程退出: 入口返回后经 defunct 回收");
 
+    // 汇总始终打印 (内核打印, 不受日志开关影响)
     println!("[selftest] 完成: {} 通过, {} 失败", pass, fail);
     // 允许再次通过 `selftest` 命令启动
     SELFTEST_RUNNING.store(false, Ordering::SeqCst);
@@ -295,6 +299,11 @@ extern "C" fn timer_cb(_param: usize) {
 fn hardware_init() -> config::ConsoleUart {
     // 时钟初始化 (时钟源来自配置, 失败自动回退)
     let _ = clk::init(config::CLOCK_SOURCE);
+    log_debug!(
+        "时钟: {} Hz (源 {:?})",
+        clk::system_clock_hz(),
+        config::CLOCK_SOURCE
+    );
 
     // GPIO
     let gpio = Gpio::take();
@@ -313,6 +322,7 @@ fn hardware_init() -> config::ConsoleUart {
 
     // SysTick (RTOS 节拍源)
     systick::init(SYSTICK_FREQ_HZ).expect("SysTick 配置失败!");
+    log_debug!("SysTick: {} Hz", SYSTICK_FREQ_HZ);
 
     // 控制台 USART (波特率/过采样/分频来自配置)
     let uart = config::ConsoleUart::take();
@@ -322,5 +332,12 @@ fn hardware_init() -> config::ConsoleUart {
         clock_div: config::UART_CLOCK_DIV,
     })
     .expect("UART 初始化失败!");
+    log_debug!(
+        "控制台 UART: USART{} {} bps (过采样 {:?}, 分频 {:?})",
+        config::UART_UNIT,
+        config::UART_BAUDRATE,
+        config::UART_OVERSAMPLE,
+        config::UART_CLOCK_DIV
+    );
     uart
 }
