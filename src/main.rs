@@ -9,6 +9,7 @@ extern crate alloc;
 // -- 启动与内核基础设施 --
 mod crc; // CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
 mod rtc; // 实时时钟 (RTC): LRC 源/时间日期/闹钟, 日志时间戳
+mod ots; // 片内温度传感器 (OTS): XTAL/HRC 源轮询测温, shell temp 命令
 mod critical_section; // PRIMASK 临界区 (中断安全的基础)
 mod efm; // 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
 mod heap; // 全局堆分配器 (边界标记 + 首次适配)
@@ -551,6 +552,39 @@ fn hardware_init() -> config::ConsoleUart {
         });
         rtc::start();
         log_info!("RTC 已启动 (LRC 源, 24H), 日志时间戳生效 [天:时:分:秒]");
+    }
+
+    // OTS 片内温度传感器 (时钟源/定标参数/自关断来自配置; shell `temp`
+    // 命令实时查看, `temp on|off` 可运行时切换, 重启恢复配置默认)
+    if config::OTS_ENABLE {
+        match ots::init(ots::Config {
+            clock_src: config::OTS_CLOCK_SOURCE,
+            slope_k: config::OTS_SLOPE_K,
+            offset_m: config::OTS_OFFSET_M,
+            auto_off: if config::OTS_AUTO_OFF {
+                ots::AutoOff::Enable
+            } else {
+                ots::AutoOff::Disable
+            },
+        }) {
+            Ok(()) => {
+                let (kw, kh, kt, ku) = ots::split_milli(config::OTS_SLOPE_K);
+                let (mw, mh, mt, mu) = ots::split_milli(config::OTS_OFFSET_M);
+                log_info!(
+                    "OTS 已初始化 (源 {}, K {}.{}{}{} M {}.{}{}{}), `temp` 查看芯片温度",
+                    config::OTS_CLOCK_SOURCE.name(),
+                    kw,
+                    kh,
+                    kt,
+                    ku,
+                    mw,
+                    mh,
+                    mt,
+                    mu
+                );
+            }
+            Err(e) => log_warn!("OTS 初始化失败: {:?} (检查时钟源/晶振配置)", e),
+        }
     }
     uart
 }

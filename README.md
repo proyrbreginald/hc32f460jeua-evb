@@ -35,6 +35,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
 | `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
+| `CFG_OTS_*` | OTS 片内温度传感器开关 / 时钟源 / 定标参数 K·M / 自关断 / 超时 (运行时可用 `temp` 命令切换与查看) |
 | `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
 
 约束:
@@ -61,6 +62,7 @@ src/
 ├── efm.rs             # 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
 ├── crc.rs             # CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
 ├── rtc.rs             # 实时时钟 (RTC): LRC 源/时间日期/闹钟, 日志时间戳
+├── ots.rs             # 片内温度传感器 (OTS): XTAL/HRC 源轮询测温 + 定标实验
 ├── sram.rs            # 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
 ├── intc.rs            # 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 ├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
@@ -204,7 +206,48 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
   (自启动起的运行时长, Howard Hinnant 公历算法跨月/闰年正确,
   RTC 未运行时省略)。
 
-## 启动流程
+## 片内温度传感器 (ots)
+
+对齐 DDL v3.3.0 `hc32_ll_ots.c/h` 与例程 `ots_base` (寄存器基址
+0x4004A400, 16 位 CTL/DR1/DR2/ECR 已与 SFR 逐项核对):
+
+- **原理**: OTS 以 LRC (32.768kHz) 为工作时序基准、XTAL/HRC 计数,
+  采样结果存 DR1/DR2 (HRC 源另有误差校准值 ECR);
+  温度 `T = K × (1/DR1 − 1/DR2) × ECR + M`;
+- **时钟依赖** (参考手册 17.2 节): LRC 必须使能 (`clk::lrc_cmd`,
+  对齐 DDL `CLK_LrcCmd`); **HRC 源必须同时启动 XTAL32** (PC14/PC15
+  外接 32.768kHz 晶振, 本板 JEUA UU 板载 Y2) 消除 HRC 频率误差,
+  否则采样永不完成 (`clk::xtal32_cmd`, 对齐 DDL `CLK_Xtal32Cmd`);
+  XTAL 源经 `clk::xtal_init` 完整配置引脚并启动; 外设时钟
+  FCG3.bit12 (清位使能, 无写保护);
+- **纯整数定点** (本工程**禁止浮点**, 见验证记录: 浮点代码进入固件后
+  系统出现随机的格式化/调度器内存破坏): 定标参数按 **×1000 千分度
+  整数** 存储 (K=3002.59 → 3002590), 温度计算用 i64/i128 定点:
+  `T_milli = (K1000 × ECR × A) / 1e12 + M1000`,
+  `A = 1e12/DR1 − 1e12/DR2`; 输出全部为整数 (`to_deci` 十分度 /
+  `split_milli` 千分度), 与真机实测误差 <0.1°C;
+- **定标参数**: K/M 每颗芯片不同, 可由定标实验获得 (`temp raw` 输出
+  DR1/DR2/ECR 反推); 默认采用 DDL 例程内置参数, **必须与时钟源配套**:
+  hrc → K=3002.59, M=27.92; xtal → K=737272.73, M=27.55
+  (`.cargo/config.toml` `CFG_OTS_SLOPE_K` / `CFG_OTS_OFFSET_M`,
+  定点字符串, 如 "3002.59" → 3002590);
+- **自动关断** (CTL.TSSTP): 采样完成自动关断 (默认, 轮询依赖 OTSST
+  自动清零; 注: DDL 头文件 `OTS_AUTO_OFF_*` 两条注释写反, 驱动按实际
+  位语义命名);
+- **API**: `init`/`deinit`/`polling` (轮询采样, 超时返回)/`polling_until`
+  (按 uptime 时间预算, shell 命令用)/`calculate_temp`/
+  `read_raw`/`scaling_experiment` (定标实验, 返回 A 参数)/`int_enable`
+  (中断模式, 事件源 `intc::src::OTS`=435, 独立线 INT110, 路由由应用
+  接入, 默认轮询);
+- **开关**: 编译期 `CFG_OTS_ENABLE` 控制开机是否初始化; shell `temp on|off`
+  运行时切换 (重启恢复配置默认);
+- **查看温度**: shell `temp` 输出当前温度, `temp raw` 附加 DR1/DR2/ECR/
+  K/M (千分度); 超时预算 `CFG_OTS_TIMEOUT_MS` (默认 100ms, 覆盖冷启动
+  传感器稳定时间); `sysinfo` 含 OTS 状态行 (开关/时钟源/定标参数);
+- 开机初始化日志 (info 级): `OTS 已初始化 (源 hrc, K 3002.590 M 27.920),
+  \`temp\` 查看芯片温度`。
+
+## 启动流程## 启动流程
 
 ```
 reset_handler (startup.rs)
@@ -362,8 +405,8 @@ continue
 - **每个命令可单独启用/禁用**: `CFG_SHELL_COMMANDS` 为逗号分隔的命令名
   列表, 未列出的命令执行时提示 "未启用" 且不出现在 `help` 中;
 - 命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) / `echo` /
-  `led on|off` / `log` / `selftest` / `clear` / `whoami` / `reboot` /
-  `logout`(exit);
+  `led on|off` / `temp [raw|on|off]` / `log` / `selftest` / `clear` /
+  `whoami` / `reboot` / `logout`(exit);
 - 输入: 回车提交, 退格删除, Ctrl+C 清行;
 - 输入采用中断驱动 (RX ISR 释放信号量, 线程阻塞等待, 无轮询)。
 
@@ -463,6 +506,9 @@ python3 -m venv .venv && .venv/bin/pip install pyocd
 ## 验证记录
 
 - debug 与 release 构建均已在真机烧录验证:0 panic,稳定运行 60s+;
+- OTS 测温 (shell `temp`):多次实测 29~31°C (室温 + 芯片温升),`temp raw`
+  输出 DR1/DR2/ECR 与定点计算值一致 (误差 <0.1°C),连续 10 次采样 + 3 次
+  复位循环零 panic/fault;
 - 内核自检 (selftest) 连续 5 次复位全部 22 项通过;
 - RX 中断接收:ASCII/二进制/混合数据完整回显, 90 秒后系统仍正常响应;
 - 大包高速输入 (超 512B 缓冲) 按设计丢弃新字节, 不崩溃;

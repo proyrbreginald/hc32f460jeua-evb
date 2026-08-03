@@ -81,7 +81,7 @@ CFG_SHELL_PASSWORD = "root"
 CFG_SHELL_LOGIN_TRIES = "3"    # 登录失败允许次数
 CFG_SHELL_LINE_BUF = "128"     # 输入行缓冲区 (字节)
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
-CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,led,log,selftest,clear,whoami,reboot,logout"
+CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,led,temp,log,selftest,clear,whoami,reboot,logout"
 
 # [log] 应用日志 (可开关+分级+彩色, 与内核打印分离)
 CFG_LOG_ENABLE = "true" # 日志默认开关 (运行时可用 shell `log on|off` 切换)
@@ -89,6 +89,16 @@ CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出
 
 # [rtc] 实时时钟 (LRC 源), 同时作为日志时间戳 (天:时:分:秒)
 CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
+
+# [ots] 片内温度传感器 (OTS), shell `temp` 命令查看; 运行时可用 `temp on|off` 切换
+CFG_OTS_ENABLE = "true"              # 开机是否初始化 OTS (true/false)
+CFG_OTS_CLK_SOURCE = "hrc"           # 时钟源 xtal|hrc (定标参数需配套, 见下)
+CFG_OTS_AUTO_OFF = "true"            # 采样完成自动关断 (true/false, 省电)
+# 定标参数 (DDL 例程内置参数, 不同时钟源不同!):
+#   hrc  → K=3002.59, M=27.92;  xtal → K=737272.73, M=27.55
+CFG_OTS_SLOPE_K = "3002.59"
+CFG_OTS_OFFSET_M = "27.92"
+CFG_OTS_TIMEOUT_MS = "100"           # 轮询采样超时 (ms, 绝对时间预算, 覆盖冷采样稳定时间)
 
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
 # 是否启用内核自检 (true/false); 启用后通过 shell 命令 `selftest` 手动启动,
