@@ -68,6 +68,9 @@ CFG_SHELL_LINE_BUF = "128"  # 输入行缓冲区 (字节)
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
 CFG_APP_SELFTEST_STACK = "4096"
 CFG_APP_SELFTEST_PRIORITY = "0"
+# 是否启用内核自检 (true/false); 启用后通过 shell 命令 `selftest` 手动启动,
+# 不再开机自动运行; false 时命令提示未启用
+CFG_APP_SELFTEST_ENABLE = "true"
 CFG_APP_SHELL_STACK = "4096"
 CFG_APP_SHELL_PRIORITY = "1"
 CFG_APP_SHELL_TIMESLICE = "10"

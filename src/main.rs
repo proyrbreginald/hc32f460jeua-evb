@@ -28,7 +28,7 @@ mod banner; // 启动横幅 (应用层, 依赖 clk/heap/rtos 公共状态)
 mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
 mod config; // 编译期配置 (.cargo/config.toml [env] → env!)
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use gpio::{Config, Drive, Gpio, Mode, Pin, PortA, PortC};
 use uart::UartConfig;
 
@@ -67,20 +67,14 @@ pub(crate) fn main() -> ! {
     rtos::init();
 
     // 创建演示线程 (栈/优先级/时间片来自 .cargo/config.toml)
+    // 注: selftest 线程不在此创建, 由 shell 命令 `selftest` 手动启动
+    // (见 start_selftest, 受 CFG_APP_SELFTEST_ENABLE 控制)
     rtos::thread_create(
         "led",
         config::APP_LED_STACK,
         config::APP_LED_PRIORITY,
         config::APP_LED_TIMESLICE,
         led_thread,
-        0,
-    );
-    rtos::thread_create(
-        "selftest",
-        config::APP_SELFTEST_STACK,
-        config::APP_SELFTEST_PRIORITY,
-        0,
-        selftest_thread,
         0,
     );
     rtos::thread_create(
@@ -134,6 +128,28 @@ extern "C" fn victim_thread(_param: usize) {
 
 /// 自然退出的线程: 入口返回后经 thread_exit → defunct → 空闲线程回收
 extern "C" fn exit_thread(_param: usize) {}
+
+/// 内核自检线程是否正在运行 (防止 `selftest` 命令重复启动)
+static SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 启动内核自检线程 (由 shell 命令 `selftest` 调用)
+///
+/// 受 `CFG_APP_SELFTEST_ENABLE` 控制 (见 shell::cmd_selftest),
+/// 线程运行结束后可再次启动。
+pub(crate) fn start_selftest() {
+    if SELFTEST_RUNNING.swap(true, Ordering::SeqCst) {
+        println!("[selftest] 已在运行");
+        return;
+    }
+    rtos::thread_create(
+        "selftest",
+        config::APP_SELFTEST_STACK,
+        config::APP_SELFTEST_PRIORITY,
+        0,
+        selftest_thread,
+        0,
+    );
+}
 
 /// rtos 自检线程: 依次验证信号量/互斥量/事件/邮箱/消息队列/
 /// 延时/线程删除/线程退出, 全部通过打印 PASS。
@@ -256,6 +272,8 @@ extern "C" fn selftest_thread(_param: usize) {
     check(true, "线程退出: 入口返回后经 defunct 回收");
 
     println!("[selftest] 完成: {} 通过, {} 失败", pass, fail);
+    // 允许再次通过 `selftest` 命令启动
+    SELFTEST_RUNNING.store(false, Ordering::SeqCst);
 }
 
 /// 周期定时器回调 (中断上下文): 仅做计数, 不调用阻塞 API

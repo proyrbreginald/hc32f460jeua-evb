@@ -32,7 +32,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 过采样 / 缓冲 / 中断参数 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 (原 `shell.conf` 并入) |
-| `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / LED 翻转周期 / 定时器周期 |
+| `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
 
 约束:
 - 数值均为字符串, 编译期解析 (支持 `_` 分隔), 溢出/非法字符/非法枚举
@@ -46,7 +46,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 
 ```
 src/
-├── main.rs            # 应用入口: 硬件初始化 + 演示线程 (led/selftest/rx) + 定时器
+├── main.rs            # 应用入口: 硬件初始化 + 演示线程 (led/shell) + 定时器 + selftest 启动
 ├── config.rs          # 编译期配置入口 (.cargo/config.toml [env] → 类型化常量)
 ├── banner.rs          # 启动横幅 (应用层): 块字符大标题 + 内核信息面板
 ├── startup.rs         # 复位入口: SRAM 等待周期/FPU/.data/.bss → main
@@ -195,15 +195,19 @@ continue
 - 密码错误次数可配置 (默认 3 次), 超限提示 "Too many login failures";
 - 命令提示符 `root@HC32F460JEUA:~$` (用户名@芯片型号);
 - 命令: `help` / `sysinfo` / `uptime` / `ps` / `free` / `echo` /
-  `led on|off` / `clear` / `whoami` / `reboot` / `logout|exit`;
+  `led on|off` / `selftest` / `clear` / `whoami` / `reboot` / `logout|exit`;
 - 输入: 回车提交, 退格删除, Ctrl+C 清行;
 - 输入采用中断驱动 (RX ISR 释放信号量, 线程阻塞等待, 无轮询)。
 
 ### 内核自检 (selftest)
 
-- `selftest_thread` 在启动后自动运行, 依次验证信号量 / 互斥量 (递归) /
-  事件 (AND/OR/清除) / 邮箱 (含紧急插队) / 消息队列 (含二进制) /
-  线程延时 / 线程删除 (delete) / 线程自然退出 (defunct 回收);
+- 不再开机自动运行: 由 `CFG_APP_SELFTEST_ENABLE` 控制启用 (默认 `true`),
+  启用后在 shell 中输入 `selftest` **手动启动** (运行中再次执行会提示
+  "已在运行", 结束后可再次启动);
+- `CFG_APP_SELFTEST_ENABLE = false` 时命令提示 "未启用";
+- 自检依次验证信号量 / 互斥量 (递归) / 事件 (AND/OR/清除) / 邮箱 (含紧急
+  插队) / 消息队列 (含二进制) / 线程延时 / 线程删除 (delete) / 线程自然
+  退出 (defunct 回收);
 - 全部通过输出 `[selftest] 完成: N 通过, 0 失败` (失败项逐条标 `[FAIL]`)。
 
 ### UART 中断接收 (USART1)

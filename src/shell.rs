@@ -19,6 +19,7 @@
 //! - `free` — 堆内存统计 (仿 free);
 //! - `echo` — 回显参数;
 //! - `led on|off` — 控制板载 LED;
+//! - `selftest` — 内核自检 (手动启动, 受 `CFG_APP_SELFTEST_ENABLE` 控制);
 //! - `clear` — 清屏;
 //! - `logout` / `exit` — 重新登录;
 //! - `reboot` — 软复位重启;
@@ -60,7 +61,7 @@ fn login() {
     let mut tries = 0;
     loop {
         println!();
-        println!("{} login: ", HOSTNAME);
+        print!("{} login: ", HOSTNAME);
         let user = read_line(false, LINE_BUF);
         println!();
         if user.trim() != SHELL_USERNAME {
@@ -71,7 +72,6 @@ fn login() {
             let pass = read_line(true, LINE_BUF);
             println!();
             if pass == SHELL_PASSWORD {
-                println!();
                 println!(
                     "Welcome to RT-RUST {} ({} kernel, {}).",
                     env!("CARGO_PKG_VERSION"),
@@ -125,6 +125,7 @@ fn dispatch(line: &str) -> bool {
             println!("{}", rest);
         }
         "led" => cmd_led(words.next()),
+        "selftest" => cmd_selftest(),
         "clear" => cmd_clear(),
         "whoami" => println!("{}", SHELL_USERNAME),
         "reboot" => cmd_reboot(),
@@ -143,6 +144,7 @@ fn cmd_help() {
     println!("  free            堆内存统计");
     println!("  echo <文本>     回显");
     println!("  led on|off      板载 LED");
+    println!("  selftest        内核自检 (rtos 功能自检)");
     println!("  clear           清屏");
     println!("  whoami          当前用户");
     println!("  reboot          软复位重启");
@@ -232,7 +234,7 @@ fn cmd_free() {
 /// LED 控制
 fn cmd_led(arg: Option<&str>) {
     let gpio = Gpio::take();
-    let led = gpio.pin::<PortC, 13>();
+    let led = gpio.pin::<PortC, { config::LED_PIN }>();
     match arg {
         Some("on") => {
             led.set_high();
@@ -243,6 +245,15 @@ fn cmd_led(arg: Option<&str>) {
             println!("LED off");
         }
         _ => println!("用法: led on|off"),
+    }
+}
+
+/// 内核自检: 通过命令手动启动 (受 CFG_APP_SELFTEST_ENABLE 控制)
+fn cmd_selftest() {
+    if config::APP_SELFTEST_ENABLE {
+        crate::start_selftest();
+    } else {
+        println!("selftest 未启用 (CFG_APP_SELFTEST_ENABLE=false)");
     }
 }
 

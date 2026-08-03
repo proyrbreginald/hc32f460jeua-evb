@@ -204,6 +204,15 @@ pub const APP_LED_TIMESLICE: u32 = parse_u32(env!("CFG_APP_LED_TIMESLICE"));
 pub const APP_LED_BLINK_MS: u32 = parse_u32(env!("CFG_APP_LED_BLINK_MS"));
 pub const APP_SELFTEST_STACK: usize = parse_u32(env!("CFG_APP_SELFTEST_STACK")) as usize;
 pub const APP_SELFTEST_PRIORITY: u8 = parse_u8(env!("CFG_APP_SELFTEST_PRIORITY"));
+/// 是否启用内核自检 (CFG_APP_SELFTEST_ENABLE = true/false)
+/// 启用后通过 shell 命令 `selftest` 手动启动, 不再开机自动运行
+pub const APP_SELFTEST_ENABLE: bool = if eq_str(env!("CFG_APP_SELFTEST_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_APP_SELFTEST_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_APP_SELFTEST_ENABLE 非法 (可用 true/false)")
+};
 pub const APP_SHELL_STACK: usize = parse_u32(env!("CFG_APP_SHELL_STACK")) as usize;
 pub const APP_SHELL_PRIORITY: u8 = parse_u8(env!("CFG_APP_SHELL_PRIORITY"));
 pub const APP_SHELL_TIMESLICE: u32 = parse_u32(env!("CFG_APP_SHELL_TIMESLICE"));
