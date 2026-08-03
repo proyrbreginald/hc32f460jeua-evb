@@ -12,6 +12,7 @@ mod heap; // 全局堆分配器 (边界标记 + 首次适配)
 mod icg; // ICG 硬件配置段
 mod intc; // 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 mod efm; // 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
+mod sram; // 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
 mod panic;
 mod startup; // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
 mod vector_table; // 复位/异常/144 外设中断向量表 // panic 与硬件 fault 诊断

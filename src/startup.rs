@@ -26,6 +26,8 @@ pub unsafe extern "C" fn reset_handler() -> ! {
     // (0x20020000~0x20026FFF, 本工程的栈区) 是慢速块, 需要 1 个读/写等待周期,
     // 否则访问数据会损坏。复位后 WTCR=0 (0 等待), 必须显式配置。
     //
+    // 逻辑见 `sram` 模块 (set_wait_cycles/表 8-1); 此处**必须内联**:
+    // 栈尚未建立 (栈指针在 RAM 顶, 本函数第一条指令即使用), 不能调用函数。
     // SRAMC 基址 0x4005_0800, 寄存器: WTCR(+0x0) WTPR(+0x4) CKCR(+0x8) CKPR(+0xC) CKSR(+0x10)
     // WTPR/CKPR 写保护键值: 0x77 解锁, 0x76 锁定 (SRAM_REG_UNLOCK_KEY/LOCK_KEY)
     unsafe {

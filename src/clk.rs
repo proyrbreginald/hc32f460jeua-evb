@@ -336,7 +336,7 @@ pub fn switch_to_pll() {
     let target = pll_hz();
 
     crate::efm::set_wait_cycle(target);
-    set_sram_wait_cycle(target);
+    crate::sram::set_wait_cycles(target);
     // 126~200MHz 输入采样需 3 个读等待周期 (对齐 BSP_CLK_Init)
     set_gpio_read_wait(GPIO_RD_WAIT_200MHZ);
     // 高性能电源模式 (200MHz 必需)
@@ -535,7 +535,7 @@ pub fn xtal_cmd(enable: bool) -> Result<(), ClkError> {
 /// 顺序不可颠倒 (高时钟下取指/栈操作必须先满足时序)。
 pub fn switch_to_hrc() {
     crate::efm::set_wait_cycle(hrc_hz());
-    set_sram_wait_cycle(hrc_hz());
+    crate::sram::set_wait_cycles(hrc_hz());
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_HRC);
     delay_short();
@@ -548,7 +548,7 @@ pub fn switch_to_hrc() {
 /// 高时钟下若等待周期不足, 切换瞬间取指/栈操作即出错, 顺序不可颠倒。
 pub fn switch_to_xtal() {
     crate::efm::set_wait_cycle(XTAL_HZ);
-    set_sram_wait_cycle(XTAL_HZ);
+    crate::sram::set_wait_cycles(XTAL_HZ);
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_XTAL);
     // 等待时钟源切换稳定 (对齐 DDL CLK_SYSCLK_SW_STB)
@@ -671,52 +671,6 @@ pub fn mco1_cmd(enable: bool) {
     }
     write8(CMU_BASE + CMU_MCO1CFGR, v);
     cmu_lock();
-}
-
-/// 表 8-1: SRAM 读写访问等待周期设定与 CPU 时钟频率的关系
-///
-/// - SRAMH (高速): 恒 0 等待, 0~200MHz 全支持;
-/// - SRAM1/2/Ret: HCLK ≤ 100MHz → 0 等待; HCLK > 100MHz → 1 等待;
-/// - SRAM3: **恒 1 等待** —— 表 8-1 脚注: "在使用 SRAM3 作为堆栈空间时,
-///   须将 SRAM3 的等待时间设置为 1wait (2 个 CPU 周期以上访问)"。
-///   本工程的栈顶位于 SRAM3 末尾 (0x2002_7000), 故 SRAM3 必须保持 1 等待。
-///
-/// 结果与 DDL 启动配置 (SRAM3=1) 及 BSP_CLK_Init (200MHz 时 SRAM12/3/R=1)
-/// 完全一致。
-pub const fn sram_wtcr_value(hclk_hz: u32) -> u32 {
-    let w12r = if hclk_hz > 100_000_000 { 1u32 } else { 0 }; // SRAM1/2/Ret
-    // WTCR 位: SRAM12_RWT[2:0] SRAM12_WWT[6:4] SRAM3_RWT[10:8] SRAM3_WWT[14:12]
-    //          SRAMH_RWT[18:16] SRAMH_WWT[22:20] SRAMR_RWT[26:24] SRAMR_WWT[30:28]
-    w12r
-        | (w12r << 4)
-        | (1 << 8)
-        | (1 << 12) // SRAM3 恒 1 等待 (栈空间, 脚注要求)
-        | (w12r << 24)
-        | (w12r << 28)
-}
-
-/// 配置 SRAM 读写等待周期 (表 8-1 + 脚注), 时钟源切换前调用
-///
-/// SRAMC 基址 0x4005_0800: WTCR(+0x0) WTPR(+0x4) CKCR(+0x8) CKPR(+0xC)
-/// WTPR/CKPR 写保护键值: 0x77 解锁, 0x76 锁定。
-///
-/// 注意: 复位处理函数开头的 SRAMC 内联配置 (SRAM3=1 等待) 保持不动 ——
-/// 栈顶位于 SRAM3 末尾, 配置完成前禁止任何函数调用; 本接口供时钟切换
-/// 等**后续**场景使用, 结果与复位配置一致 (SRAM3 恒 1 等待)。
-pub fn set_sram_wait_cycle(hclk_hz: u32) {
-    const SRAMC: usize = 0x4005_0800;
-    let wtcr = sram_wtcr_value(hclk_hz);
-
-    unsafe {
-        // 解锁 SRAMC 寄存器写保护
-        core::ptr::write_volatile((SRAMC + 0x04) as *mut u32, 0x77);
-        core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x77);
-        // 写入等待周期
-        core::ptr::write_volatile(SRAMC as *mut u32, wtcr);
-        // 恢复写保护
-        core::ptr::write_volatile((SRAMC + 0x04) as *mut u32, 0x76);
-        core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x76);
-    }
 }
 
 /// 解锁 CMU 寄存器写保护 (PWC.FPRC)

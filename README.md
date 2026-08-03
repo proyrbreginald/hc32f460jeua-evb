@@ -59,6 +59,7 @@ src/
 ├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
 ├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
 ├── efm.rs             # 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
+├── sram.rs            # 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
 ├── intc.rs            # 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 ├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
 ├── gpio.rs            # GPIO: 寄存器→端口→引脚→接口四层, const 泛型校验
@@ -148,6 +149,24 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
   `clk` 切换时钟时调用 (从原 clk 模块迁入);
 - 自检 (`selftest` 命令) 含 Flash 实测: 末扇区擦除/64B 混合数据编程/
   逐字节回读校验, 完成后还原擦除态。
+
+## 片内 SRAM (sram)
+
+对齐 DDL v3.3.0 `hc32_ll_sram.c/h` 与参考手册表 8-1:
+
+- 布局: SRAMH 32K (0x1FFF8000) / SRAM1·2 各 64K / SRAM3 28K (栈区,
+  0x20020000~0x20026FFF) / Ret 4K; SRAMH/1/2/Ret 偶校验 (恒使能),
+  **SRAM3 用 ECC** (CKCR.ECCMOD 配 MD1~3);
+- **等待周期**: `set_wait_cycles(hclk)` 按表 8-1 自动配置 (SRAMH 恒 0,
+  SRAM1/2/Ret >100MHz→1, **SRAM3 恒 1** —— 栈顶在 SRAM3 末尾的脚注
+  要求), 由 `clk` 切换时钟时调用 (从原 clk 模块迁入); `wait_cycles_now`
+  读取当前配置;
+- **错误检测**: 奇偶/ECC 错误经 NMI 上报 (CKCR.PYOAD/ECCOAD 可改复位),
+  `error()` 查询 / `clear_status()` 清除 / `set_fault_action()` 配置动作 /
+  `set_ecc_mode()` 配置 SRAM3 ECC 模式;
+- 启动阶段 (`startup.rs`) 的 SRAM3 配置保持**内联** (栈未建立不能调用
+  函数), 与 DDL `SetSRAM3Wait` 逐字节一致;
+- 寄存器写保护: WTPR/CKPR 键值 0x77 解锁 / 0x76 锁定。
 
 ## 启动流程
 
