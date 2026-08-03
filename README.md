@@ -58,6 +58,7 @@ src/
 ├── critical_section.rs# PRIMASK 临界区 (嵌套安全, 中断安全的基础)
 ├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
 ├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
+├── efm.rs             # 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
 ├── intc.rs            # 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 ├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
 ├── gpio.rs            # GPIO: 寄存器→端口→引脚→接口四层, const 泛型校验
@@ -128,6 +129,25 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
   `hc32f460_ll_interrupts_share.c` 模式), 本模块暂不支持 (注册限制
   INT000~127, 配置层已校验);
 - ISR 约束: 中断上下文只能使用非阻塞操作 (与 `print!`/`log!` 同约束)。
+
+## 片内 Flash (efm)
+
+对齐 DDL v3.3.0 `hc32_ll_efm.c/h` (FWMC 模式 + 写 Flash 地址触发模型):
+
+- 主 Flash 512KB / 64 个 **8KB 扇区** (最小擦除单位, 无页擦除);
+- **擦除**: `sector_erase(addr)` (字对齐, 擦除所在整个扇区, ~ms 级);
+- **编程**: `program(addr, &data)` (任意长度, 4 字节对齐, 尾部 0xFF 补齐)
+  / `program_word(addr, word)`; 单字编程逐字等待结束;
+- 流程对齐 DDL: FAPRT 解锁 → FWMC.PEMODE → 设 PEMOD 模式 → 写地址触发
+  → 等 FSR.RDY+OPTEND → 恢复只读锁定; 操作结束检查 FSR 错误位
+  (PEWERR/PEPRTERR/PGSZERR/PGMISMTCH/COLERR) 返回 `EfmError`;
+- **bus hold**: 擦写期间总线被占用, CPU stall 至完成 (从 Flash 运行安全);
+  全片擦除/序列编程需 RAM 运行, 模块不提供;
+- 读: `read_byte`/`read_word` (Flash 内存映射) / `uid()` (96 位唯一 ID);
+- **读等待周期**归属本模块: `set_wait_cycle`/`wait_cycle` (表 7-1),
+  `clk` 切换时钟时调用 (从原 clk 模块迁入);
+- 自检 (`selftest` 命令) 含 Flash 实测: 末扇区擦除/64B 混合数据编程/
+  逐字节回读校验, 完成后还原擦除态。
 
 ## 启动流程
 
@@ -295,7 +315,8 @@ continue
   插队) / 消息队列 (含二进制) / 线程延时 / 线程删除 (delete) / 线程自然
   退出 (defunct 回收);
 - 逐项结果 (`[PASS]`/`[FAIL]`/进度) 走**应用日志** (info/debug 级, 可经
-  `log` 命令控制); **汇总始终打印** (不受日志开关影响):
+  `log` 命令控制); `log level trace` 可输出**每项执行细节** (实际返回值/
+  耗时/参数, 用于故障定位); **汇总始终打印** (不受日志开关影响):
   `[selftest] 完成: N 通过, 0 失败`。
 
 ### UART 驱动 (USART1~4)

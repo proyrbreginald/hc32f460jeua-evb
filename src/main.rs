@@ -11,6 +11,7 @@ mod critical_section; // PRIMASK 临界区 (中断安全的基础)
 mod heap; // 全局堆分配器 (边界标记 + 首次适配)
 mod icg; // ICG 硬件配置段
 mod intc; // 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
+mod efm; // 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
 mod panic;
 mod startup; // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
 mod vector_table; // 复位/异常/144 外设中断向量表 // panic 与硬件 fault 诊断
@@ -170,13 +171,16 @@ pub(crate) fn start_selftest() {
 /// rtos 自检线程: 依次验证信号量/互斥量/事件/邮箱/消息队列/
 /// 延时/线程删除/线程退出。
 ///
-/// 逐项结果走**应用日志** (info 级, 可经 `log` 命令控制/关闭);
+/// 日志分级: **trace** 级输出每项执行细节 (实际返回值/耗时等,
+/// `log level trace` 打开), **info** 级输出 PASS/FAIL 结果;
 /// 汇总一行始终打印 (命令的执行结果, 不受日志开关影响)。
 extern "C" fn selftest_thread(_param: usize) {
     log_info!("[selftest] 开始 (rtos 内核功能自检)");
     let mut pass = 0u32;
     let mut fail = 0u32;
-    let mut check = |ok: bool, name: &str| {
+    let mut check = |ok: bool, name: &str, detail: core::fmt::Arguments<'_>| {
+        // trace 级: 执行细节 (实际返回值/参数), 用于故障定位
+        log_trace!("[selftest] {} → {}", name, detail);
         if ok {
             pass += 1;
             log_info!("[PASS] {}", name);
@@ -188,92 +192,127 @@ extern "C" fn selftest_thread(_param: usize) {
 
     // 信号量: 计数获取 / 立即超时 / release 唤醒
     static SEM: rtos::Semaphore = rtos::Semaphore::new(1, 1);
+    let r = SEM.take(Timeout::Ticks(0));
     check(
-        SEM.take(Timeout::Ticks(0)).is_ok(),
+        r.is_ok(),
         "信号量: 初始计数可获取",
+        format_args!("take(0) = {:?}", r),
     );
+    let r = SEM.take(Timeout::Ticks(0));
     check(
-        SEM.take(Timeout::Ticks(0)).is_err(),
+        r.is_err(),
         "信号量: 计数 0 立即超时",
+        format_args!("take(0) = {:?}", r),
     );
     SEM.release();
+    let r = SEM.take(Timeout::Ticks(0));
     check(
-        SEM.take(Timeout::Ticks(0)).is_ok(),
+        r.is_ok(),
         "信号量: release 后可获取",
+        format_args!("release() 后 take(0) = {:?}", r),
     );
 
     // 互斥量: 获取 / 递归持有 / 释放
     static MTX: rtos::Mutex = rtos::Mutex::new();
-    check(MTX.lock(Timeout::Ticks(0)).is_ok(), "互斥量: 可获取");
-    check(MTX.lock(Timeout::Ticks(0)).is_ok(), "互斥量: 递归持有合法");
-    MTX.unlock();
-    MTX.unlock();
+    let r = MTX.lock(Timeout::Ticks(0));
+    check(r.is_ok(), "互斥量: 可获取", format_args!("lock(0) = {:?}", r));
+    let r = MTX.lock(Timeout::Ticks(0));
     check(
-        MTX.lock(Timeout::Ticks(0)).is_ok(),
+        r.is_ok(),
+        "互斥量: 递归持有合法",
+        format_args!("递归 lock(0) = {:?}", r),
+    );
+    MTX.unlock();
+    MTX.unlock();
+    let r = MTX.lock(Timeout::Ticks(0));
+    check(
+        r.is_ok(),
         "互斥量: 释放后可重新获取",
+        format_args!("unlock×2 后 lock(0) = {:?}", r),
     );
     MTX.unlock();
 
     // 事件: AND / OR / 立即超时
     static EVT: rtos::Event = rtos::Event::new();
     EVT.send(0x05);
+    let r = EVT.recv(0x05, EventOpt::And, Timeout::Ticks(0));
     check(
-        EVT.recv(0x05, EventOpt::And, Timeout::Ticks(0)) == Ok(0x05),
+        r == Ok(0x05),
         "事件: AND 匹配返回等待全集",
+        format_args!("send(0x05) recv(0x05, And) = {:?}", r),
     );
+    let r = EVT.recv(0x02, EventOpt::And, Timeout::Ticks(0));
     check(
-        EVT.recv(0x02, EventOpt::And, Timeout::Ticks(0)).is_err(),
+        r.is_err(),
         "事件: 不满足立即超时",
+        format_args!("recv(0x02, And) = {:?}", r),
     );
     EVT.send(0x08);
+    let r = EVT.recv(0x08, EventOpt::Or, Timeout::Ticks(0));
     check(
-        EVT.recv(0x08, EventOpt::Or, Timeout::Ticks(0)) == Ok(0x08),
+        r == Ok(0x08),
         "事件: OR 匹配返回实际位",
+        format_args!("send(0x08) recv(0x08, Or) = {:?}", r),
     );
+    let r = EVT.recv(0x10, EventOpt::OrClear, Timeout::Ticks(0));
     check(
-        EVT.recv(0x10, EventOpt::OrClear, Timeout::Ticks(0))
-            .is_err(),
+        r.is_err(),
         "事件: 无匹配位立即超时",
+        format_args!("recv(0x10, OrClear) = {:?}", r),
     );
 
     // 邮箱: 收发 / 紧急插队 / 满返回 Full / 空返回 TimedOut
     static MB: rtos::Mailbox = rtos::Mailbox::new(4);
-    check(MB.send(100, Timeout::Ticks(0)).is_ok(), "邮箱: 发送");
-    check(MB.recv(Timeout::Ticks(0)) == Ok(100), "邮箱: 接收一致");
-    check(MB.recv(Timeout::Ticks(0)).is_err(), "邮箱: 空立即超时");
+    let r = MB.send(100, Timeout::Ticks(0));
+    check(r.is_ok(), "邮箱: 发送", format_args!("send(100) = {:?}", r));
+    let r = MB.recv(Timeout::Ticks(0));
+    check(r == Ok(100), "邮箱: 接收一致", format_args!("recv() = {:?}", r));
+    let r = MB.recv(Timeout::Ticks(0));
+    check(r.is_err(), "邮箱: 空立即超时", format_args!("recv() = {:?}", r));
     for i in 0..4 {
         MB.send(1000 + i, Timeout::Ticks(0)).ok();
     }
+    let r = MB.send(9999, Timeout::Ticks(0));
     check(
-        MB.send(9999, Timeout::Ticks(0)).is_err(),
+        r.is_err(),
         "邮箱: 满返回 Full",
+        format_args!("满 4 条后 send(9999) = {:?}", r),
     );
     // 取出一条腾出空间后再紧急发送 (urgent 在满时同样返回 Full)
     MB.recv(Timeout::Ticks(0)).ok();
-    check(MB.urgent(42, Timeout::Ticks(0)).is_ok(), "邮箱: 紧急发送");
+    let r = MB.urgent(42, Timeout::Ticks(0));
+    check(r.is_ok(), "邮箱: 紧急发送", format_args!("urgent(42) = {:?}", r));
+    let r = MB.recv(Timeout::Ticks(0));
     check(
-        MB.recv(Timeout::Ticks(0)) == Ok(42),
+        r == Ok(42),
         "邮箱: 紧急消息插到队首",
+        format_args!("recv() = {:?}", r),
     );
 
     // 消息队列: 收发一致 (含二进制)
     static MQ: rtos::MessageQueue = rtos::MessageQueue::new(16, 4);
     let hello: &[u8] = &[0x52, 0x00, 0xFF, b'!'];
-    check(MQ.send(hello, Timeout::Ticks(0)).is_ok(), "消息队列: 发送");
+    let r = MQ.send(hello, Timeout::Ticks(0));
+    check(r.is_ok(), "消息队列: 发送", format_args!("send({:02X?}) = {:?}", hello, r));
     let mut buf = [0u8; 16];
+    let n = MQ.recv(&mut buf, Timeout::Ticks(0));
     check(
-        MQ.recv(&mut buf, Timeout::Ticks(0)) == Ok(4) && buf[..4] == *hello,
+        n == Ok(4) && buf[..4] == *hello,
         "消息队列: 接收内容一致",
+        format_args!("recv() = {:?}, data = {:02X?}", n, &buf[..4]),
     );
-    check(
-        MQ.recv(&mut buf, Timeout::Ticks(0)).is_err(),
-        "消息队列: 空立即超时",
-    );
+    let r = MQ.recv(&mut buf, Timeout::Ticks(0));
+    check(r.is_err(), "消息队列: 空立即超时", format_args!("recv() = {:?}", r));
 
     // 延时: uptime 前进
     let t0 = rtos::uptime_ms();
     rtos::thread_delay_ms(20);
-    check(rtos::uptime_ms() >= t0 + 20, "线程延时: uptime 前进 ≥ 20ms");
+    let t1 = rtos::uptime_ms();
+    check(
+        t1 >= t0 + 20,
+        "线程延时: uptime 前进 ≥ 20ms",
+        format_args!("延时 20ms, 实际 {}ms", t1 - t0),
+    );
 
     // 线程删除 (delete API) 与自然退出 (defunct 回收)
     log_debug!("[selftest] 创建 victim 线程");
@@ -284,11 +323,47 @@ extern "C" fn selftest_thread(_param: usize) {
     victim.delete();
     log_debug!("[selftest] delete() 已返回, 延时 50ms");
     rtos::thread_delay_ms(50);
-    check(true, "线程删除: delete() 完成且系统正常");
+    check(true, "线程删除: delete() 完成且系统正常", format_args!("victim 已删除, 系统无异常"));
     log_debug!("[selftest] 创建 exit-me 线程");
     rtos::thread_create("exit-me", 1024, 25, 0, exit_thread, 0);
     rtos::thread_delay_ms(100);
-    check(true, "线程退出: 入口返回后经 defunct 回收");
+    check(true, "线程退出: 入口返回后经 defunct 回收", format_args!("exit-me 已退出并被回收"));
+
+    // Flash (EFM): 扇区擦除 + 多字编程 + 回读校验 (末扇区, 远离固件/swap 标记)
+    {
+        const FLASH_TEST_ADDR: u32 = 0x0007_C000; // 扇区 62 (0x7C000)
+        let data: [u8; 64] = [
+            0x52, b'F', b'L', b'A', b'S', b'H', 0x00, 0xFF, // 二进制 + ASCII 混合
+            b'-', b't', b'e', b's', b't', b' ', b'o', b'k',
+            0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78,
+            b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h',
+            b'i', b'j', b'k', b'l', b'm', b'n', b'o', b'p',
+            b'q', b'r', b's', b't', b'u', b'v', b'w', b'x',
+            b'y', b'z', 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7',
+        ];
+        let mut ok = efm::sector_erase(FLASH_TEST_ADDR).is_ok();
+        if ok && efm::program(FLASH_TEST_ADDR, &data).is_err() {
+            ok = false;
+        }
+        if ok {
+            for (i, &b) in data.iter().enumerate() {
+                if efm::read_byte(FLASH_TEST_ADDR + i as u32) != b {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // 还原为擦除态 (0xFF), 保持扇区干净
+        if efm::sector_erase(FLASH_TEST_ADDR).is_err() {
+            ok = false;
+        }
+        check(
+            ok,
+            "Flash: 扇区擦除/编程/回读",
+            format_args!("addr=0x{:08X} len={}B", FLASH_TEST_ADDR, data.len()),
+        );
+    }
 
     // 汇总始终打印 (内核打印, 不受日志开关影响)
     println!("[selftest] 完成: {} 通过, {} 失败", pass, fail);

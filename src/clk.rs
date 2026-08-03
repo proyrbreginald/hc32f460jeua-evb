@@ -335,7 +335,7 @@ pub fn switch_to_pll() {
     // 目标频率 = 已配置 PLLCFGR 的实际输出 (运行时计算)
     let target = pll_hz();
 
-    set_flash_wait_cycle(target);
+    crate::efm::set_wait_cycle(target);
     set_sram_wait_cycle(target);
     // 126~200MHz 输入采样需 3 个读等待周期 (对齐 BSP_CLK_Init)
     set_gpio_read_wait(GPIO_RD_WAIT_200MHZ);
@@ -534,7 +534,7 @@ pub fn xtal_cmd(enable: bool) -> Result<(), ClkError> {
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1),
 /// 顺序不可颠倒 (高时钟下取指/栈操作必须先满足时序)。
 pub fn switch_to_hrc() {
-    set_flash_wait_cycle(hrc_hz());
+    crate::efm::set_wait_cycle(hrc_hz());
     set_sram_wait_cycle(hrc_hz());
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_HRC);
@@ -547,7 +547,7 @@ pub fn switch_to_hrc() {
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1):
 /// 高时钟下若等待周期不足, 切换瞬间取指/栈操作即出错, 顺序不可颠倒。
 pub fn switch_to_xtal() {
-    set_flash_wait_cycle(XTAL_HZ);
+    crate::efm::set_wait_cycle(XTAL_HZ);
     set_sram_wait_cycle(XTAL_HZ);
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_XTAL);
@@ -716,53 +716,6 @@ pub fn set_sram_wait_cycle(hclk_hz: u32) {
         // 恢复写保护
         core::ptr::write_volatile((SRAMC + 0x04) as *mut u32, 0x76);
         core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x76);
-    }
-}
-
-/// 表 7-1: CPU 时钟频率 → FLASH 读等待周期 (普通读模式)
-pub const fn flash_wait_cycle(hclk_hz: u32) -> u32 {
-    if hclk_hz <= 33_000_000 {
-        0
-    } else if hclk_hz <= 66_000_000 {
-        1
-    } else if hclk_hz <= 99_000_000 {
-        2
-    } else if hclk_hz <= 132_000_000 {
-        3
-    } else if hclk_hz <= 168_000_000 {
-        4
-    } else {
-        5
-    }
-}
-
-/// 配置 FLASH 读等待周期 (对齐 DDL EFM_SetWaitCycle)
-///
-/// EFM 基址 0x4001_0400: FAPRT(+0x0, 写保护) FRMC(+0x8, FLWT[7:4])
-/// 解锁键值 0x0123/0x3210, 锁定 0x0000。
-pub fn set_flash_wait_cycle(hclk_hz: u32) {
-    const EFM_BASE: usize = 0x4001_0400;
-    const FRMC_FLWT_MASK: u32 = 0x0000_00F0;
-    let cycles = flash_wait_cycle(hclk_hz);
-
-    unsafe {
-        // 解锁 EFM 寄存器写保护
-        core::ptr::write_volatile(EFM_BASE as *mut u32, 0x0123);
-        core::ptr::write_volatile(EFM_BASE as *mut u32, 0x3210);
-        // FRMC: 读-改-写 FLWT
-        let frmc = core::ptr::read_volatile((EFM_BASE + 0x08) as *const u32);
-        core::ptr::write_volatile(
-            (EFM_BASE + 0x08) as *mut u32,
-            (frmc & !FRMC_FLWT_MASK) | (cycles << 4),
-        );
-        // 回读确认配置生效
-        while core::ptr::read_volatile((EFM_BASE + 0x08) as *const u32) & FRMC_FLWT_MASK
-            != cycles << 4
-        {
-            // 等待
-        }
-        // 恢复写保护
-        core::ptr::write_volatile(EFM_BASE as *mut u32, 0x0000);
     }
 }
 
