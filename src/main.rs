@@ -26,20 +26,21 @@ mod rtos;
 // -- 应用 --
 mod banner; // 启动横幅 (应用层, 依赖 clk/heap/rtos 公共状态)
 mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
+mod config; // 编译期配置 (.cargo/config.toml [env] → env!)
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use gpio::{Config, Drive, Gpio, Level, Mode, Pin, PortA, PortC};
-use uart::{Uart1, UartConfig};
+use gpio::{Config, Drive, Gpio, Mode, Pin, PortA, PortC};
+use uart::UartConfig;
 
 /// 全局堆分配器 (边界标记 + 首次适配, 见 heap 模块)
 #[global_allocator]
 static ALLOCATOR: heap::HeapAllocator = heap::HeapAllocator;
 
-/// SysTick 中断频率 (Hz), 同时是 RTOS 的节拍频率
-const SYSTICK_FREQ_HZ: u32 = 1000;
+/// SysTick 中断频率 (Hz), 同时是 RTOS 的节拍频率 (.cargo/config.toml)
+const SYSTICK_FREQ_HZ: u32 = config::SYSTICK_FREQ_HZ;
 
-/// PC13 LED, const 构造 (引脚号在编译期校验)
-const LED: Pin<PortC, 13> = Pin::new();
+/// 板载 LED (PC13): 端口由类型系统固定, 引脚号来自配置, 存在性编译期校验
+const LED: Pin<PortC, { config::LED_PIN }> = Pin::new();
 
 /// 周期定时器触发计数
 static TIMER_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -65,17 +66,43 @@ pub(crate) fn main() -> ! {
     // RTOS 初始化: 中断优先级 + 空闲线程
     rtos::init();
 
-    // 创建演示线程
-    rtos::thread_create("led", 4096, 2, 10, led_thread, 0);
-    rtos::thread_create("selftest", 4096, 15, 0, selftest_thread, 0);
-    rtos::thread_create("shell", 4096, 18, 10, shell::shell_entry, 0);
+    // 创建演示线程 (栈/优先级/时间片来自 .cargo/config.toml)
+    rtos::thread_create(
+        "led",
+        config::APP_LED_STACK,
+        config::APP_LED_PRIORITY,
+        config::APP_LED_TIMESLICE,
+        led_thread,
+        0,
+    );
+    rtos::thread_create(
+        "selftest",
+        config::APP_SELFTEST_STACK,
+        config::APP_SELFTEST_PRIORITY,
+        0,
+        selftest_thread,
+        0,
+    );
+    rtos::thread_create(
+        "shell",
+        config::APP_SHELL_STACK,
+        config::APP_SHELL_PRIORITY,
+        config::APP_SHELL_TIMESLICE,
+        shell::shell_entry,
+        0,
+    );
 
     // 周期定时器 (回调在中断上下文执行)
     static TIMER: rtos::Timer = rtos::Timer::new();
-    TIMER.start(2000, 2000, timer_cb, 0);
+    TIMER.start(
+        config::APP_TIMER_PERIOD_MS,
+        config::APP_TIMER_PERIOD_MS,
+        timer_cb,
+        0,
+    );
 
-    // 使能 UART1 接收中断 (INTC 通道 INT001, NVIC 优先级 8)
-    uart.enable_rx_interrupt(1, 8);
+    // 使能控制台 UART 接收中断 (INTC 通道/NVIC 优先级来自 .cargo/config.toml)
+    uart.enable_rx_interrupt(config::UART_RX_IRQ_CHANNEL, config::UART_RX_IRQ_PRIORITY);
 
     // 内核启动横幅 (创建线程后、启动前, 就绪统计包含所有线程)
     banner::show();
@@ -86,11 +113,11 @@ pub(crate) fn main() -> ! {
 
 // ---- 演示线程 ----
 
-/// LED 线程: 每 500ms 翻转一次 (由线程调度而非中断分频)
+/// LED 线程: 每 500ms 翻转一次 (周期来自配置, 由线程调度而非中断分频)
 extern "C" fn led_thread(_param: usize) {
     loop {
         LED.toggle();
-        rtos::thread_delay_ms(500);
+        rtos::thread_delay_ms(config::APP_LED_BLINK_MS);
     }
 }
 
@@ -236,28 +263,38 @@ extern "C" fn timer_cb(_param: usize) {
     TIMER_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// 硬件初始化: 时钟 → GPIO (LED + UART 引脚) → SysTick → USART1
-fn hardware_init() -> Uart1 {
-    // 时钟初始化: 外部晶振 + MPLL → 200MHz (失败自动回退 MRC)
-    let _ = clk::init(clk::ClockSource::Pll200);
+/// 硬件初始化: 时钟 → GPIO (LED + UART 引脚) → SysTick → 控制台 USART
+///
+/// 各参数 (时钟源/引脚/波特率/节拍频率等) 均来自 .cargo/config.toml。
+fn hardware_init() -> config::ConsoleUart {
+    // 时钟初始化 (时钟源来自配置, 失败自动回退)
+    let _ = clk::init(config::CLOCK_SOURCE);
 
     // GPIO
     let gpio = Gpio::take();
-    gpio.pin::<PortC, 13>().configure(Config {
-        mode: Mode::Output,
-        pull_up: false,
-        drive: Drive::Low,
-        initial_level: Level::High,
-    });
-    // UART 引脚复用: PA9=USART1_TX (FSEL 32), PA10=USART1_RX (FSEL 33)
-    gpio.pin::<PortA, 9>().set_func(32);
-    gpio.pin::<PortA, 10>().set_func(33);
+    gpio.pin::<PortC, { config::LED_PIN }>()
+        .configure(Config {
+            mode: Mode::Output,
+            pull_up: false,
+            drive: Drive::Low,
+            initial_level: config::LED_INITIAL_LEVEL,
+        });
+    // UART 引脚复用 (PA9=TX / PA10=RX; 引脚号/功能号来自配置)
+    gpio.pin::<PortA, { config::UART_TX_PIN }>()
+        .set_func(config::UART_TX_FSEL);
+    gpio.pin::<PortA, { config::UART_RX_PIN }>()
+        .set_func(config::UART_RX_FSEL);
 
     // SysTick (RTOS 节拍源)
     systick::init(SYSTICK_FREQ_HZ).expect("SysTick 配置失败!");
 
-    // USART1 (console 绑定目标): 115200, 8N1
-    let uart = Uart1::take();
-    uart.init(UartConfig::default()).expect("UART 初始化失败!");
+    // 控制台 USART (波特率/过采样/分频来自配置)
+    let uart = config::ConsoleUart::take();
+    uart.init(UartConfig {
+        baudrate: config::UART_BAUDRATE,
+        oversample: config::UART_OVERSAMPLE,
+        clock_div: config::UART_CLOCK_DIV,
+    })
+    .expect("UART 初始化失败!");
     uart
 }

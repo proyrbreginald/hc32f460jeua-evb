@@ -2,9 +2,9 @@
 //!
 //! # 登录
 //!
-//! 启动后先显示 `login:` 提示, 输入用户名 (仅 [`SHELL_USERNAME`], 默认
-//! root) 与密码 (不显示回显) 后进入命令提示符; 密码来自编译期注入的
-//! 配置文件 `shell.conf` (见 [`build.rs`])。
+//! 启动后先显示 `login:` 提示, 输入用户名 (默认 root) 与密码 (不显示
+//! 回显) 后进入命令提示符; 用户名/密码/失败次数来自 `.cargo/config.toml`
+//! 的 `[env]` 段 (编译期读取, 见 [`crate::config`])。
 //!
 //! # 命令提示符
 //!
@@ -27,25 +27,25 @@
 //! # 输入处理
 //!
 //! 回车提交命令, 退格 (BS/DEL) 删除字符, Ctrl+C 清空当前行;
-//! 输入缓冲区 128 字节, 超长截断。
+//! 输入缓冲区大小来自配置 (`CFG_SHELL_LINE_BUF`), 超长截断。
 
+use crate::config;
 use crate::gpio::{Gpio, PortC};
 use crate::heap;
 use crate::print; // #[macro_export] 宏需显式引入
 use crate::println;
-use crate::uart::Uart1;
 
-/// 登录用户名 (编译期注入, 默认 root)
-const SHELL_USERNAME: &str = env!("SHELL_USERNAME");
-/// 登录密码 (编译期注入, 见 shell.conf)
-const SHELL_PASSWORD: &str = env!("SHELL_PASSWORD");
-/// 登录失败允许次数 (配置文件注入的字符串, 运行时解析)
-const SHELL_LOGIN_TRIES: &str = env!("SHELL_LOGIN_TRIES");
-/// 主机名 (仿 Ubuntu PS1 用, 取编译期芯片型号小写)
-const HOSTNAME: &str = env!("RTOS_CHIP_MODEL");
+/// 登录用户名 (.cargo/config.toml `CFG_SHELL_USERNAME`)
+const SHELL_USERNAME: &str = config::SHELL_USERNAME;
+/// 登录密码 (.cargo/config.toml `CFG_SHELL_PASSWORD`)
+const SHELL_PASSWORD: &str = config::SHELL_PASSWORD;
+/// 登录失败允许次数 (.cargo/config.toml `CFG_SHELL_LOGIN_TRIES`)
+const SHELL_LOGIN_TRIES: u32 = config::SHELL_LOGIN_TRIES;
+/// 主机名 (仿 Ubuntu PS1 用, 取编译期芯片型号)
+const HOSTNAME: &str = config::CHIP_MODEL;
 
-/// 输入行缓冲区大小
-const LINE_BUF: usize = 128;
+/// 输入行缓冲区大小 (.cargo/config.toml `CFG_SHELL_LINE_BUF`)
+const LINE_BUF: usize = config::SHELL_LINE_BUF_SIZE;
 
 /// shell 线程入口: 登录 → 命令循环 (永不返回)
 pub extern "C" fn shell_entry(_param: usize) {
@@ -76,14 +76,14 @@ fn login() {
                     "Welcome to RT-RUST {} ({} kernel, {}).",
                     env!("CARGO_PKG_VERSION"),
                     "RT-Thread 架构的 Rust RTOS",
-                    env!("RTOS_CORE")
+                    config::CORE
                 );
                 return;
             }
             tries += 1;
             println!("Login incorrect");
         }
-        if tries >= SHELL_LOGIN_TRIES.parse().unwrap_or(3) {
+        if tries >= SHELL_LOGIN_TRIES {
             println!();
             println!("Too many login failures; try again later.");
             crate::rtos::thread_delay_ms(1000);
@@ -156,8 +156,8 @@ fn cmd_sysinfo() {
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
-    println!("芯片型号   : {}", env!("RTOS_CHIP_MODEL"));
-    println!("内核       : {}", env!("RTOS_CORE"));
+    println!("芯片型号   : {}", config::CHIP_MODEL);
+    println!("内核       : {}", config::CORE);
     println!(
         "CPU 频率   : {} MHz",
         crate::clk::system_clock_hz() / 1_000_000
@@ -268,7 +268,7 @@ fn cmd_reboot() {
 /// `masked` 为 true 时输入不回显 (密码模式)。
 /// 中断驱动: 挂起在数据到达信号量上, 由 RX ISR 唤醒, 无轮询。
 fn read_line(masked: bool, max: usize) -> alloc::string::String {
-    let uart = Uart1::take();
+    let uart = config::ConsoleUart::take();
     let mut line = alloc::string::String::new();
     loop {
         let b = uart.read_rx_blocking();

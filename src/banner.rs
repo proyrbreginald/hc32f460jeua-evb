@@ -14,9 +14,9 @@ use crate::rtos::{IDLE_PRIORITY, PRIORITY_MAX, TICKS_PER_SEC, sched};
 
 /// 内核版本 (与 Cargo.toml 包版本一致)
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// 芯片型号 / 内核名 (板级信息, 由 Cargo.toml `[env]` 注入, 不在代码中写死)
-const CHIP_MODEL: &str = env!("RTOS_CHIP_MODEL");
-const CORE: &str = env!("RTOS_CORE");
+/// 芯片型号 / 内核名 (板级信息, 来自 .cargo/config.toml `[env]`)
+const CHIP_MODEL: &str = crate::config::CHIP_MODEL;
+const CORE: &str = crate::config::CORE;
 
 /// 块字符大标题 "RT-RUST" (5 行, 5x5 字模, 每字符 5 列 + 2 列间距)
 const TITLE: [&str; 7] = [

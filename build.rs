@@ -1,8 +1,7 @@
-//! 构建脚本: 为启动横幅 (banner) 生成构建日期与 rustc 版本等元数据
+//! 构建脚本: 仅注入启动横幅所需的构建日期与 rustc 版本。
 //!
-//! 通过 `cargo:rustc-env` 注入编译期环境变量, crate 内以
-//! `env!("RTOS_BUILD_DATE")` / `env!("RTOS_RUSTC")` 读取。
-//! 无第三方依赖。
+//! 工程配置不在本脚本中 — 全部集中在 `.cargo/config.toml` 的 `[env]`
+//! 段, 由 `src/config.rs` 编译期读取。
 
 fn main() {
     // 构建日期 (UTC, 公历)
@@ -21,42 +20,6 @@ fn main() {
     {
         println!("cargo:rustc-env=RTOS_RUSTC={}", s.trim());
     }
-
-    // shell 配置: 读取源码目录下的 shell.conf (KEY=VALUE 行, # 为注释)
-    inject_shell_conf();
-}
-
-/// 读取 `shell.conf` 并注入编译期环境变量 (缺失时用内置默认值)
-fn inject_shell_conf() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shell.conf");
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut values: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            values.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    // 密码等敏感字段不随编译命令输出
-    let username = values
-        .get("USERNAME")
-        .cloned()
-        .unwrap_or_else(|| "root".into());
-    let password = values
-        .get("PASSWORD")
-        .cloned()
-        .unwrap_or_else(|| "root123".into());
-    let tries = values
-        .get("LOGIN_TRIES")
-        .cloned()
-        .unwrap_or_else(|| "3".into());
-    println!("cargo:rustc-env=SHELL_USERNAME={}", username);
-    println!("cargo:rustc-env=SHELL_PASSWORD={}", password);
-    println!("cargo:rustc-env=SHELL_LOGIN_TRIES={}", tries);
-    println!("cargo:rerun-if-changed=shell.conf");
 }
 
 /// Unix 秒 → (年, 月, 日) (Howard Hinnant 公历算法, 无依赖)

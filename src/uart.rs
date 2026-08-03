@@ -368,8 +368,8 @@ impl<const U: u8> Uart<U> {
     }
 }
 
-/// 接收环形缓冲大小 (字节)
-pub const RX_BUF_SIZE: usize = 512;
+/// 接收环形缓冲大小 (字节) (.cargo/config.toml `CFG_UART_RX_BUF_SIZE`)
+pub const RX_BUF_SIZE: usize = crate::config::UART_RX_BUF_SIZE;
 
 /// 接收环形缓冲: ISR (单生产者) 写 head, 应用 (单消费者) 读 tail
 struct RxRing {

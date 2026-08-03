@@ -34,9 +34,9 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::gpio::{Config, Drive, Level, Mode, Pin, PortH};
 
-/// 外部高速晶振频率 (Hz)。合法范围 4~25MHz (参考手册)。
-/// **按实际电路板晶振修改此常量!**
-pub const XTAL_HZ: u32 = 8_000_000;
+/// 外部高速晶振频率 (Hz), 合法范围 4~25MHz (参考手册)。
+/// **来自 .cargo/config.toml `CFG_XTAL_HZ`, 按实际电路板晶振修改!**
+pub const XTAL_HZ: u32 = crate::config::XTAL_HZ;
 const _: () = assert!(
     XTAL_HZ >= 4_000_000 && XTAL_HZ <= 25_000_000,
     "XTAL 频率必须在 4~25MHz"
@@ -108,9 +108,18 @@ const SCFGR_EXCKS_POS: u32 = 20; // [22:20] EXCLK 分频
 const SCFGR_HCLKS_POS: u32 = 24; // [26:24] HCLK 分频
 
 /// 总线分频编码 (SCFGR): 0=÷1, 1=÷2, 2=÷4, 3=÷8, 4=÷16
-const CLK_DIV1: u32 = 0;
-const CLK_DIV2: u32 = 1;
-const CLK_DIV4: u32 = 2;
+///
+/// 分频系数 → 寄存器编码 (1/2/4/8/16; 合法性已在 config.rs 编译期校验)
+fn div_code(div: u32) -> u32 {
+    match div {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        16 => 4,
+        _ => unreachable!("总线分频已在编译期校验"),
+    }
+}
 
 /// 稳定时间: 约 2ms (对齐 DDL CLK_XTAL_STB_2MS)
 const XTAL_STABLE_TIME: u32 = 0x05;
@@ -148,7 +157,7 @@ pub fn init(src: ClockSource) -> Result<(), ClkError> {
         ClockSource::Pll200 => {
             xtal_init()?;
             set_bus_clock_div();
-            if pll_init(pll_200mhz_config()).is_ok() {
+            if pll_init(pll_config()).is_ok() {
                 switch_to_pll();
             } else {
                 // PLL 锁定失败: 降级为晶振直通 (总线分频在低频下无害)
@@ -214,18 +223,19 @@ pub struct PllConfig {
     pub r: u32,
 }
 
-/// 默认 200MHz 配置: XTAL 8MHz ÷1 ×50 ÷2 = 200MHz
+/// MPLL 配置: 来自 .cargo/config.toml 的 `CFG_PLL_*` 项
 ///
+/// 默认 (200MHz 方案): XTAL 8MHz ÷1 ×50 ÷2 = 200MHz
 /// VCO = 8M×50 = 400MHz ∈ [240, 480]MHz, 倍频 50 ∈ [20, 480],
 /// 分频 2 ∈ [2, 16] —— 全部合法 (参考手册), 对齐 DDL BSP_CLK_Init。
-pub const fn pll_200mhz_config() -> PllConfig {
+fn pll_config() -> PllConfig {
     PllConfig {
-        src: 0, // XTAL
-        m: 0,
-        n: 49,
-        p: 1,
-        q: 1,
-        r: 1,
+        src: crate::config::PLL_SRC,
+        m: crate::config::PLL_M,
+        n: crate::config::PLL_N,
+        p: crate::config::PLL_P,
+        q: crate::config::PLL_Q,
+        r: crate::config::PLL_R,
     }
 }
 
@@ -292,7 +302,7 @@ pub fn switch_to_pll() {
     XTAL_STATUS.store(STATUS_ACTIVE, Ordering::Relaxed);
 }
 
-/// 总线时钟分频配置 (SCFGR), 对齐 BSP_CLK_Init 的 200MHz 方案:
+/// 总线时钟分频配置 (SCFGR), 分频系数来自 .cargo/config.toml `CFG_DIV_*`:
 ///
 /// | 总线 | 分频 | 频率 |
 /// |---|---|---|
@@ -310,13 +320,13 @@ pub fn switch_to_pll() {
 /// 调用时机: PLL 启动后、CKSWR 切换前 (此时非 PLL 时钟源, 无需 FCG
 /// 备份, 对齐 DDL SetSysClockDiv 的 PLL 分支条件)。
 pub fn set_bus_clock_div() {
-    let scfgr = (CLK_DIV1 << SCFGR_PCLK0S_POS) // PCLK0 ÷1
-        | (CLK_DIV2 << SCFGR_PCLK1S_POS) // PCLK1 ÷2
-        | (CLK_DIV4 << SCFGR_PCLK2S_POS) // PCLK2 ÷4
-        | (CLK_DIV4 << SCFGR_PCLK3S_POS) // PCLK3 ÷4
-        | (CLK_DIV2 << SCFGR_PCLK4S_POS) // PCLK4 ÷2
-        | (CLK_DIV2 << SCFGR_EXCKS_POS) // EXCLK ÷2
-        | (CLK_DIV1 << SCFGR_HCLKS_POS); // HCLK ÷1
+    let scfgr = (div_code(crate::config::DIV_PCLK0) << SCFGR_PCLK0S_POS) // PCLK0
+        | (div_code(crate::config::DIV_PCLK1) << SCFGR_PCLK1S_POS) // PCLK1
+        | (div_code(crate::config::DIV_PCLK2) << SCFGR_PCLK2S_POS) // PCLK2
+        | (div_code(crate::config::DIV_PCLK3) << SCFGR_PCLK3S_POS) // PCLK3
+        | (div_code(crate::config::DIV_PCLK4) << SCFGR_PCLK4S_POS) // PCLK4
+        | (div_code(crate::config::DIV_EXCLK) << SCFGR_EXCKS_POS) // EXCLK
+        | (div_code(crate::config::DIV_HCLK) << SCFGR_HCLKS_POS); // HCLK
 
     cmu_unlock();
     write32(CMU_BASE + CMU_SCFGR, scfgr);

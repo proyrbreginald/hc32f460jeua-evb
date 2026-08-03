@@ -15,11 +15,39 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
   不会无界等待低优先级线程;
 - 完整的 panic/fault 诊断 (CFSR/HFSR 解码 + 栈回溯)。
 
+## 工程配置 (.cargo/config.toml)
+
+所有可调参数集中在 `.cargo/config.toml` 的 `[env]` 段统一管理, 经 `env!`
+在**编译期**读取 (`src/config.rs`), 非法值直接编译报错。修改后重新编译
+即生效, 无需改动代码 (cargo 自动追踪该文件变化并触发重编译):
+
+| 前缀 | 内容 |
+|---|---|
+| `CFG_CHIP_MODEL` / `CFG_CORE` | 芯片型号 / 内核名 (横幅与 shell 提示符显示) |
+| `CFG_XTAL_HZ` / `CFG_CLK_SOURCE` | 晶振频率 / 时钟源 (mrc/xtal/pll) |
+| `CFG_PLL_*` | MPLL 倍频分频 |
+| `CFG_DIV_*` | 总线分频 (1/2/4/8/16) |
+| `CFG_SYSTICK_HZ` / `CFG_TICKS_PER_SEC` | 节拍频率 (两者必须一致, 编译期校验) |
+| `CFG_PRIORITY_MAX` / `CFG_IDLE_*` | RTOS 优先级与空闲线程 |
+| `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 过采样 / 缓冲 / 中断参数 |
+| `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
+| `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 (原 `shell.conf` 并入) |
+| `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / LED 翻转周期 / 定时器周期 |
+
+约束:
+- 数值均为字符串, 编译期解析 (支持 `_` 分隔), 溢出/非法字符/非法枚举
+  (如 `CFG_UART_OVERSAMPLE` 非 8/16) 在编译期报错;
+- UART/LED 的**端口类型** (PortA/PortC) 由 Rust 类型系统编码, 固定在
+  `main.rs` 中, 引脚号/功能号等数值参数可在此配置; 引脚存在性仍由
+  `Pin::new()` 编译期校验 (JEUA 封装引脚表);
+- `build.rs` 仅负责构建日期与 rustc 版本 (启动横幅显示用)。
+
 ## 目录结构
 
 ```
 src/
 ├── main.rs            # 应用入口: 硬件初始化 + 演示线程 (led/selftest/rx) + 定时器
+├── config.rs          # 编译期配置入口 (.cargo/config.toml [env] → 类型化常量)
 ├── banner.rs          # 启动横幅 (应用层): 块字符大标题 + 内核信息面板
 ├── startup.rs         # 复位入口: SRAM 等待周期/FPU/.data/.bss → main
 ├── vector_table.rs    # 复位/异常/144 外设中断向量表 + INT000~007 中断分发
@@ -162,9 +190,9 @@ continue
 
 ### 终端 (仿 Ubuntu shell)
 
-- 启动后先登录: 用户名 + 密码 (密码不显示), 配置见 `shell.conf`
-  (编译期经 build.rs 注入, 改密码无需改代码);
-- 密码错误 3 次 (可配置) 提示 "Too many login failures";
+- 启动后先登录: 用户名 + 密码 (密码不显示), 配置见 `.cargo/config.toml`
+  的 `CFG_SHELL_*` (编译期读取, 改密码无需改代码);
+- 密码错误次数可配置 (默认 3 次), 超限提示 "Too many login failures";
 - 命令提示符 `root@HC32F460JEUA:~$` (用户名@芯片型号);
 - 命令: `help` / `sysinfo` / `uptime` / `ps` / `free` / `echo` /
   `led on|off` / `clear` / `whoami` / `reboot` / `logout|exit`;
