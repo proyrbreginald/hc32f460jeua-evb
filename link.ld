@@ -37,11 +37,16 @@ SECTIONS
         KEEP(*(.icgs));
     } > FLASH
 
+    .const :
+    {
+        . = ALIGN(4);
+        *(.rodata*);
+    }
+
     .text :
     {
         . = ALIGN(4);
         *(.text*);
-        *(.rodata*);
         /* panic 处理器: 固定保留, 便于 gdb 定位 */
         KEEP(*(.text.panic_handler));
     } > FLASH
