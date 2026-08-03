@@ -17,6 +17,17 @@
 
 use core::ptr;
 
+/// 节点指针 → 包含该节点的内核对象指针 (RT-Thread `rt_list_entry` 移植)
+///
+/// 各模块的 `*_from_node` 转换统一走此宏, 避免 offset_of 计算分散。
+macro_rules! container_of {
+    ($node:expr, $ty:ty, $field:ident) => {{
+        let node = $node as *mut u8;
+        node.sub(core::mem::offset_of!($ty, $field)) as *mut $ty
+    }};
+}
+pub(crate) use container_of;
+
 /// 双向链表节点
 #[derive(Clone, Copy)]
 pub(crate) struct ListHead {
@@ -47,6 +58,16 @@ impl<T> KCell<T> {
     #[inline]
     pub unsafe fn get(&self) -> *mut T {
         self.0.get()
+    }
+
+    /// 临界区内: 获取可变引用
+    ///
+    /// 写操作请优先使用本方法: 通过共享引用派生裸指针再写入可能被
+    /// 编译器视为死存储而消除 (静态对象无可变借用, 写入无别名依据)。
+    #[inline]
+    #[allow(clippy::mut_from_ref)] // 内核对象经 UnsafeCell 由临界区保护
+    pub unsafe fn get_mut(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
     }
 }
 

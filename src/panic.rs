@@ -59,8 +59,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
 
     match info.location() {
-        Some(loc) => write_fmt(format_args!("panicked at {}: {}\r\n", loc, info.message())),
-        None => write_fmt(format_args!("panicked: {}\r\n", info.message())),
+        Some(loc) => write_fmt(format_args!("程序异常于 {}: {}\r\n", loc, info.message())),
+        None => write_fmt(format_args!("程序异常: {}\r\n", info.message())),
     }
     report_context();
     report_backtrace(fp);
@@ -92,7 +92,7 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn fault_diagnose(ipsr: u32, msp: u32, _sp: u32, fp: u32) -> ! {
     write_fmt(format_args!(
-        "=== FAULT ===\r\n  exception: {} ({})\r\n",
+        "=== 硬件故障 ===\r\n  异常号: {} ({})\r\n",
         ipsr,
         exception_name(ipsr)
     ));
@@ -110,7 +110,7 @@ fn report_exception_frame(msp: u32) {
             let f = msp as *const u32;
             let rd = |i: usize| core::ptr::read_volatile(f.add(i));
             write_fmt(format_args!(
-                "  exception frame @0x{:08x}:\r\n    r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x}\r\n",
+                "  异常帧 @0x{:08x}:\r\n    r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x}\r\n",
                 msp,
                 rd(0),
                 rd(1),
@@ -165,7 +165,7 @@ fn stack_backtrace(mut fp: usize, frames: &mut [usize]) -> usize {
 fn report_backtrace(fp: usize) {
     let mut frames = [0usize; MAX_BACKTRACE_FRAMES];
     let n = stack_backtrace(fp, &mut frames);
-    write_fmt(format_args!("  backtrace ({} frames):\r\n", n));
+    write_fmt(format_args!("  栈回溯 ({} 帧):\r\n", n));
     for (i, pc) in frames[..n].iter().enumerate() {
         write_fmt(format_args!("    #{} 0x{:08x}\r\n", i, pc));
     }
@@ -186,7 +186,7 @@ fn report_context() {
     let sp = mrs_msp();
     let stack_used = STACK_TOP.wrapping_sub(sp as usize);
     write_fmt(format_args!(
-        "  context: {} (ipsr={}), sp=0x{:08x}, stack used=0x{:x} B\r\n",
+        "  上下文: {} (ipsr={}), sp=0x{:08x}, 栈使用=0x{:x} B\r\n",
         exception_name(ipsr),
         ipsr,
         sp,
@@ -277,7 +277,7 @@ const HFSR_BITS: [(u32, &str); 3] = [
 /// 异常号 → 名称 (IPSR 值)
 fn exception_name(n: u32) -> &'static str {
     match n {
-        0 => "thread mode",
+        0 => "线程模式",
         2 => "NMI",
         3 => "HardFault",
         4 => "MemManage",
@@ -287,8 +287,8 @@ fn exception_name(n: u32) -> &'static str {
         12 => "DebugMonitor",
         14 => "PendSV",
         15 => "SysTick",
-        16..=159 => "external IRQ",
-        _ => "unknown",
+        16..=159 => "外部中断",
+        _ => "未知",
     }
 }
 

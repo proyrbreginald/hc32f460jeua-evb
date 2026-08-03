@@ -1,109 +1,267 @@
 # hc32f460jeua-evb
 
-## 开发环境容器
+HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第三方依赖,
+全部外设驱动为手写寄存器访问,并内置一个**从 RT-Thread v5.2.2 移植的 RTOS 内核**
+(接口按 Rust 风格重新设计)。
 
-本项目的 `Containerfile` 定义了一个包含 **Python** 和 **Rust** 开发环境的 Ubuntu 容器镜像。
+## 特性
 
-### 前置条件
+- 零依赖裸机 Rust (edition 2024, `thumbv7em-none-eabihf`),无 PAC/HAL crate;
+- 寄存器级外设驱动:时钟 (XTAL+MPLL→200MHz,失败自动回退)、GPIO、SysTick、USART;
+- 全局堆分配器 (边界标记 + 首次适配,中断安全),支持 `Vec`/`Box`/`String`;
+- **RTOS 内核**:32 级位图调度 + 时间片轮转、优先级继承互斥量、硬定时器、
+  信号量/事件/邮箱/消息队列、线程生命周期与僵尸回收;
+- **原子打印**:打印锁 (优先级继承) 保证输出整行不交错,高优先级线程
+  不会无界等待低优先级线程;
+- 完整的 panic/fault 诊断 (CFSR/HFSR 解码 + 栈回溯)。
 
-确保已安装 Podman：
+## 目录结构
 
-```bash
-sudo apt install podman -y
+```
+src/
+├── main.rs            # 应用入口: 硬件初始化 + 演示线程 (led/selftest/rx) + 定时器
+├── banner.rs          # 启动横幅 (应用层): 块字符大标题 + 内核信息面板
+├── startup.rs         # 复位入口: SRAM 等待周期/FPU/.data/.bss → main
+├── vector_table.rs    # 复位/异常/144 外设中断向量表 + INT000~007 中断分发
+├── panic.rs           # panic 与硬件 fault 诊断 (CFSR/HFSR 解码, 栈回溯)
+├── critical_section.rs# PRIMASK 临界区 (嵌套安全, 中断安全的基础)
+├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
+├── icg.rs             # ICG 硬件配置段 (flash 0x400, 全 0xFF)
+├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
+├── gpio.rs            # GPIO: 寄存器→端口→引脚→接口四层, const 泛型校验
+├── systick.rs         # SysTick 1kHz 节拍 (RTOS 时钟源)
+├── uart.rs            # USART1~4 驱动 (波特率/过采样) + 中断接收环形缓冲
+├── console.rs         # 控制台: 打印锁 (优先级继承) + 原子整行输出
+├── build.rs           # 构建元数据 (日期/rustc 版本, 供启动横幅使用)
+└── rtos/              # RTOS 内核 (RT-Thread 架构移植, 不依赖应用模块)
+    ├── mod.rs         # 公共 API: init/start/tick/thread_create 等
+    ├── klist.rs       # 侵入式链表 + container_of 宏 (rt_list 移植)
+    ├── sched.rs       # 位图就绪表 (32 级) + 时间片轮转 + 栈溢出检测
+    ├── thread.rs      # TCB/创建/删除/挂起/延时 + 公共唤醒/调度判定辅助
+    ├── timer.rs       # 有序链表硬定时器 (tick 回绕安全)
+    ├── ipc.rs         # 信号量/互斥量(优先级继承)/事件/邮箱/消息队列
+    ├── idle.rs        # 空闲线程 (wfi) + 僵尸线程回收
+    └── context.rs     # Cortex-M4 PendSV 上下文切换汇编 (含 FPU)
 ```
 
-### 一、构建镜像
+## 启动流程
 
-```bash
-podman build --no-cache -t <镜像名:版本号> -f <镜像构建脚本> .
+```
+reset_handler (startup.rs)
+ ├─ SRAMC 等待周期 / FLASH 等待周期 / FPU 使能
+ ├─ .data 拷贝 / .bss 清零
+ └─ main
+     ├─ clk::init(Pll200)          # 200MHz, 失败回退 MRC/XTAL
+     ├─ GPIO (LED/串口引脚) / SysTick 1kHz / USART1 115200
+     ├─ rtos::init()               # PendSV/SysTick 优先级 + 空闲线程
+     ├─ rtos::thread_create(...)   # 创建演示线程
+     └─ rtos::start()              # 首次切换, 永不返回
 ```
 
-### 二、创建容器
+## RTOS 内核
 
-```bash
-podman create -it -v "$PWD":/workspace --name <容器名称> <镜像名称>
+架构移植自 RT-Thread v5.2.2 (`CRust/src/libs/rtos/`):
+
+| RT-Thread 源文件 | 本模块 | 内容 |
+|---|---|---|
+| `scheduler_up.c` | `sched` | 位图就绪表 + 时间片轮转 |
+| `thread.c` | `thread` | 线程创建/退出/延时/挂起 |
+| `idle.c`/`defunct.c` | `idle` | 空闲线程 + 僵尸回收 |
+| `timer.c` | `timer` | 有序链表硬定时器 |
+| `ipc.c` | `ipc` | 信号量/互斥量/事件/邮箱/消息队列 |
+| `context_gcc.S` | `context` | PendSV 上下文切换 (PSP + FPU) |
+
+### 使用流程
+
+```rust
+pub extern "C" fn sys_tick_handler() {
+    rtos::tick_increase();          // 1. SysTick ISR 驱动节拍
+}
+rtos::init();                       // 2. 初始化内核
+rtos::thread_create("led", 2048, 2, 10, led_thread, 0); // 3. 创建线程
+rtos::start();                      // 4. 启动调度器 (永不返回)
+
+extern "C" fn led_thread(_p: usize) {
+    loop { LED.toggle(); rtos::thread_delay_ms(500); }
+}
 ```
 
-### 三、运行容器
+- 优先级:0(最高)~ 31(最低,空闲线程);时间片单位 = 节拍 (1ms);
+- 线程栈由堆分配,打印线程建议 ≥2KB (debug 构建下格式化打印栈消耗较大),
+  调度器在每次切换时检测栈溢出;
+- 阻塞 API:线程上下文使用;中断上下文仅可用非阻塞调用
+  (`Timeout::Ticks(0)` 探测、`release`/`send`/`unlock`、`Timer::start/stop`);
+- 内核对象 (`Semaphore`/`Mutex`/`Event`/`Mailbox`/`MessageQueue`/`Timer`)
+  可作 `static` 常量构造,启动后不可移动。
 
-```bash
-podman start <容器名称>
-podman exec -it <容器名称> bash
+### IPC 速查
+
+```rust
+static SEM: Semaphore = Semaphore::new(0, 1);
+static MUT: Mutex = Mutex::new();                 // 优先级继承
+static EVT: Event = Event::new();
+static MB: Mailbox = Mailbox::new(4);             // 机器字消息
+static MQ: MessageQueue = MessageQueue::new(32, 4);
+
+SEM.take(Timeout::Forever);    SEM.release();
+MUT.lock(Timeout::Forever);    MUT.unlock();
+EVT.send(0x01);
+EVT.recv(0x01, EventOpt::OrClear, Timeout::Ticks(3000));
+MB.send(42usize, Timeout::Forever);  MB.recv(Timeout::Forever);
+MQ.send(b"hi", Timeout::Forever);    MQ.recv(&mut buf, Timeout::Forever);
 ```
 
-### 四、停止容器
+### 打印系统 (console)
+
+- `println!` 整行原子输出:内容 + CRLF 在同一次加锁内完成 (优先级继承互斥量),
+  多线程输出不交错;等待打印锁的高优先级线程会把持有者提升到自己的优先级,
+  **不会出现高优先级线程无界等待低优先级线程**;
+- 中断上下文 / panic 诊断走无锁通道 `write_fmt_raw` (仅诊断, 可能交错);
+- 调度器启动前 (boot 阶段) 自动退化为无锁输出;
+- 注意:UART 为 115200 无流控,输出速率接近 PC 读取能力时 CH340 缓冲可能
+  溢出丢字节 (表现为行尾截断, 与打印交错无关)。
+
+## 构建 / 烧录 / 调试
+
+目标: `thumbv7em-none-eabihf`,自定义链接脚本 `link.ld`
+(FLASH 512K + RAM 188K,8K 主栈,`.heap` 段)。
 
 ```bash
-podman stop <容器名称>
+cargo build                          # debug 构建
+cargo build --release                # release 构建
+cargo run                            # 构建 + 烧录 (pyocd, 见 scripts/flash.sh)
 ```
 
-### 五、删除容器与镜像
+### 烧录 (pyocd)
 
 ```bash
-podman rm <容器名称>
-podman rmi <镜像名称>
+pyocd list                           # 列出可用调试器
+pyocd flash -u <调试器ID> --target hc32f460xe target/thumbv7em-none-eabihf/release/hc32f460.elf
 ```
 
-## Python 虚拟环境与 pyOCD
+可选参数: `--base-address 0x00000000`、`--erase auto`。
 
-### 一、创建 Python 虚拟环境
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 二、安装 pyOCD
-
-在虚拟环境中安装 `pyocd`:
+### GDB 调试
 
 ```bash
-pip install pyocd
-```
-
-### 三、连接调试器与检测目标
-
-将调试器（如 DAPLink、ST-Link、J-Link）通过 SWD 接口连接到目标板，然后检测芯片：
-
-```bash
-pyocd list # 列出可用调试器
-```
-
-### 四、烧录固件
-
-```bash
-pyocd flash -u <调试器ID> --target hc32f460xe target/thumbv7em-none-eabihf/debug/hc32f460.elf
-```
-
-参数说明：
-- `--target hc32f460xe`  指定目标芯片型号
-- `--base-address 0x00000000`  可选，指定烧录起始地址
-- `--erase auto`  可选，自动选择擦除策略（sector / chip）
-
-### 五、调试
-
-#### 启动 GDB 服务器
-
-```bash
-pyocd gdbserver --target hc32f460xe
-```
-
-默认监听端口 `3333`，可用 `--port` 指定其他端口。
-
-#### 连接 GDB
-
-在另一个终端中启动 GDB 并连接：
-
-```bash
+pyocd gdbserver --target hc32f460xe  # 默认端口 3333
 arm-none-eabi-gdb -q target/thumbv7em-none-eabihf/debug/hc32f460.elf
 target extended-remote localhost:3333
-monitor reset halt   # 复位并暂停
-load                 # 烧录当前 ELF
-continue             # 运行
+monitor reset halt
+load
+continue
 ```
 
-### 六、退出虚拟环境
+### 串口控制台
+
+- 板载 USB 串口 (CH340, 如 `/dev/ttyUSB0`),115200 8N1;
+- 终端: `minicom -D /dev/ttyUSB0 -b 115200` 或 `screen /dev/ttyUSB0 115200`
+  (建议使用交互式终端; `cat` 读取不及时会丢字节);
+- 启动横幅 (`banner::show()`): 块字符大标题 + 内核信息面板
+  (CPU 频率/节拍/堆大小/构建日期/rustc 版本/就绪线程数)。
+
+### 终端 (仿 Ubuntu shell)
+
+- 启动后先登录: 用户名 + 密码 (密码不显示), 配置见 `shell.conf`
+  (编译期经 build.rs 注入, 改密码无需改代码);
+- 密码错误 3 次 (可配置) 提示 "Too many login failures";
+- 命令提示符 `root@HC32F460JEUA:~$` (用户名@芯片型号);
+- 命令: `help` / `sysinfo` / `uptime` / `ps` / `free` / `echo` /
+  `led on|off` / `clear` / `whoami` / `reboot` / `logout|exit`;
+- 输入: 回车提交, 退格删除, Ctrl+C 清行;
+- 输入采用中断驱动 (RX ISR 释放信号量, 线程阻塞等待, 无轮询)。
+
+### 内核自检 (selftest)
+
+- `selftest_thread` 在启动后自动运行, 依次验证信号量 / 互斥量 (递归) /
+  事件 (AND/OR/清除) / 邮箱 (含紧急插队) / 消息队列 (含二进制) /
+  线程延时 / 线程删除 (delete) / 线程自然退出 (defunct 回收);
+- 全部通过输出 `[selftest] 完成: N 通过, 0 失败` (失败项逐条标 `[FAIL]`)。
+
+### UART 中断接收 (USART1)
+
+- `uart.enable_rx_interrupt(irq_n, priority)`: INTC 事件源映射 +
+  NVIC 使能 + `CR1.RIE` (对齐 DDL `INTC_IrqSignIn` / `USART_FuncCmd`);
+- 接收中断把字节写入 512 字节环形缓冲 (溢出丢弃新字节), 应用侧
+  `rx_count()` / `read_rx()` / `drain_rx()` 非阻塞读取;
+- 错误处理对齐 `USART_ClearStatus`: 读 RDR 清 RXNE, 写 CR1 的
+  CPE/CFE/CORE 清 PE/FE/ORE;
+- 外设中断通过 `vector_table::register_irq` 分发 (INT000~007 槽位,
+  向量表在 FLASH, 槽位预置分发入口, 回调运行时注册);
+- 真机验证 (115200, PC→板): ASCII/二进制/混合/连续数据均完整接收,
+  500B 单包零丢失。
+
+```
+ooooooooo.   ooooooooooooo         ooooooooo.                            .   
+`888   `Y88. 8'   888   `8         `888   `Y88.                        .o8   
+ 888   .d88'      888               888   .d88' oooo  oooo   .oooo.o .o888oo 
+ 888ooo88P'       888               888ooo88P'  `888  `888  d88(  "8   888   
+ 888`88b.         888      8888888  888`88b.     888   888  `"Y88b.    888   
+ 888  `88b.       888               888  `88b.   888   888  o.  )88b   888 . 
+o888o  o888o     o888o             o888o  o888o  `V88V"V8P' 8""888P'   "888" 
+
+hc32f460jeua-evb v0.1.0  —  RT-Thread 架构的 Rust RTOS (HC32F460JEUA)
+── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+处理器 : Cortex-M4F @ 200 MHz
+节拍 : 1 ms (1000 Hz)
+优先级 : 32 级 (空闲 = 31)
+堆 : 179 KB
+── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+构建 : 2026-08-02 [debug] rustc 1.97.1 (8bab26f4f 2026-07-14)
+就绪 : 2 个线程 (位图 0x80000004)
+```
+
+> 提示: 横幅的块字符与中文均为 UTF-8 字节流, 终端需设置为 UTF-8 编码
+> (现代终端默认支持), 否则会显示为乱码。
+
+## 开发环境容器
+
+`Containerfile` 定义包含 Python + Rust 的容器镜像:
 
 ```bash
-deactivate
+podman build --no-cache -t <镜像名:版本号> -f Containerfile .
+podman create -it -v "$PWD":/workspace --name <容器名称> <镜像名称>
+podman start <容器名称> && podman exec -it <容器名称> bash
 ```
+
+容器内需额外安装 Rust 目标与工具:
+
+```bash
+rustup target add thumbv7em-none-eabihf
+python3 -m venv .venv && .venv/bin/pip install pyocd
+```
+
+## 验证记录
+
+- debug 与 release 构建均已在真机烧录验证:0 panic,稳定运行 60s+;
+- 内核自检 (selftest) 连续 5 次复位全部 22 项通过;
+- RX 中断接收:ASCII/二进制/混合数据完整回显, 90 秒后系统仍正常响应;
+- 大包高速输入 (超 512B 缓冲) 按设计丢弃新字节, 不崩溃;
+- 已知现象:115200 无流控下 PC 端读取不及时 (如 `cat`) 会丢字节
+  (表现为行尾截断, 非打印设计缺陷), 建议使用交互式终端查看;
+  启动横幅经 `screen` 捕获验证零丢失。
+
+## 代码整理与设计优化记录
+
+- banner 移出 `rtos` 内核 (应用层 `src/banner.rs`), 内核不再依赖
+  `clk`/`heap` 等应用模块;
+- `klist.rs` 新增 `container_of!` 宏与 `KCell::get_mut`, 统一 5 处
+  "链表节点 → 内核对象" 转换 (thread/timer/ipc/idle);
+- `thread.rs` 提取公共辅助: `wakeup_thread` (唤醒统一路径) /
+  `resched_needed` (优先级抢占判定) / `blocked_wait` (阻塞恢复判定),
+  消除 `ipc.rs` 6 处重复的"调度 + 超时检查"模式与 3 处唤醒序列;
+- `timer::check` 的"摘除 + 回调"改为临界区原子 (消除线程删除与
+  定时器回调之间的 use-after-free 竞态);
+- `context.rs` 统一寄存器写入辅助; 全项目修复历史 clippy 警告,
+  当前 0 警告 0 错误。
+
+## 终端 (shell) 调试中修复的问题
+
+- **浮点格式化崩溃**: `core` 的浮点格式化 (flt2dec/dragon) 在
+  no_std 裸机环境下导致内存破坏 (表现为系统崩溃/输出垃圾字节)。
+  `free` 命令改用整数百分比计算, 完全规避浮点格式化;
+- **静态链表写入被消除**: 静态对象的 `KCell` 链表写入 (thread_create
+  的线程登记) 曾因"写后无读"被编译器判定为死存储而消除 (ps 列表为空),
+  通过 `get_mut` + volatile 读屏障强制保留;
+- **RX 输入中断驱动化**: read_line 从 5ms 轮询改为信号量阻塞等待
+  (RX ISR 释放), 消除高频定时器操作对调度的扰动。

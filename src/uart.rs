@@ -73,20 +73,51 @@ const USART_BASES: [usize; 4] = [0x4001_D000, 0x4001_D400, 0x4002_1000, 0x4002_1
 /// PWC 外设基址 (FCG 时钟门控)
 const PWC_BASE: usize = 0x4004_8000;
 
+// ---- 中断路径 (INTC 事件源映射 + NVIC, 参考 DDL hc32_ll_interrupts.c) ----
+
+/// INTC 基址 (CM_INTC_TypeDef, 见 hc32f460.h):
+/// NMICR@0x00, NMIENR@0x04, NMIFR@0x08, NMICFR@0x0C,
+/// EIRQCR0~15@0x10..0x4C, WUPEN@0x50, EIFR@0x54, EIFCR@0x58,
+/// **SEL0@0x5C** 起 (每通道 4 字节, 复位值 0x1FF = 未映射)。
+const INTC_BASE: usize = 0x4005_1000;
+const INTC_SEL_OFF: usize = 0x5C;
+/// NVIC ISER0 基址 (Cortex-M4 内核外设)
+const NVIC_ISER_BASE: usize = 0xE000_E100;
+/// NVIC IPR0 基址 (优先级字节, 每中断 1 字节)
+const NVIC_IPR_BASE: usize = 0xE000_E400;
+
+/// USART1 中断事件源编号 (DDL hc32f460.h en_int_src_t)
+pub const INT_SRC_USART1_RI: u32 = 279; // 接收数据寄存器非空/接收错误
+#[allow(unused)]
+pub const INT_SRC_USART1_EI: u32 = 278; // 接收错误
+#[allow(unused)]
+pub const INT_SRC_USART1_TI: u32 = 280; // 发送数据寄存器空
+#[allow(unused)]
+pub const INT_SRC_USART1_TCI: u32 = 281; // 发送完成
+
 /// FCG1.USARTn 时钟门控位 (清位 = 使能): USART1=bit24 ... USART4=bit27
 const fn fcg1_usart_bit(unit: u8) -> u32 {
     1 << (23 + unit)
 }
 
 /// SR 标志位
-const SR_TXE: u32 = 1 << 7; // 发送数据寄存器空
+const SR_PE: u32 = 1 << 0; // 奇偶校验错误
+const SR_FE: u32 = 1 << 1; // 帧错误
+const SR_ORE: u32 = 1 << 3; // 过载错误
 const SR_RXNE: u32 = 1 << 5; // 接收数据寄存器非空
+const SR_TXE: u32 = 1 << 7; // 发送数据寄存器空
 
 /// CR1 位
 const CR1_RE: u32 = 1 << 2; // 接收使能
 const CR1_TE: u32 = 1 << 3; // 发送使能
+const CR1_RIE: u32 = 1 << 5; // 接收中断使能 (RXNE + 接收错误)
 const CR1_OVER8: u32 = 1 << 15; // 8 位过采样
 const CR1_FBME: u32 = 1 << 29; // 小数波特率使能
+
+/// CR1 错误标志清除位 (写 1 清除, 对应 SR 的 PE/FE/ORE)
+const CR1_CPE: u32 = 1 << 16; // 清除奇偶校验错误
+const CR1_CFE: u32 = 1 << 17; // 清除帧错误
+const CR1_CORE: u32 = 1 << 19; // 清除过载错误
 
 /// BRR 字段
 const BRR_DIV_FRACTION_MASK: u32 = 0x7F; // [6:0]
@@ -181,7 +212,7 @@ impl<const U: u8> Uart<U> {
     /// 获取 UART 句柄。`U` 越界 (非 1~4) 时:
     /// 以 `const` 方式使用会在编译期报错。
     pub const fn take() -> Self {
-        assert!(U >= 1 && U <= 4, "USART unit must be 1..=4");
+        assert!(U >= 1 && U <= 4, "USART 单元必须为 1..=4");
         Self { _private: () }
     }
 
@@ -302,6 +333,185 @@ impl<const U: u8> Uart<U> {
             None
         }
     }
+
+    /// 使能接收中断 (对齐 DDL 示例: 注册 INTC 事件源 + NVIC + CR1.RIE)
+    ///
+    /// 中断 ISR ([`rx_irq_handler`], 各单元共用同一 ISR 按单元分发)
+    /// 把收到的字节写入环形缓冲 [`RX_RINGS`], 应用侧用
+    /// [`Uart::rx_count`] / [`Uart::read_rx`] / [`Uart::drain_rx`] 读取。
+    ///
+    /// - `irq_n`: INTC 通道号 (INT000~INT007, 对应向量表分发槽位);
+    /// - `priority`: NVIC 抢占优先级 (0~15, 4 位, 值越小优先级越高)。
+    pub fn enable_rx_interrupt(&self, irq_n: usize, priority: u8) {
+        assert!(
+            irq_n < 8,
+            "enable_rx_interrupt: INTC 通道仅支持 INT000~INT007"
+        );
+        crate::vector_table::register_irq(irq_n, rx_irq_handler::<U>);
+        unsafe {
+            // 1. INTC 事件源映射: SEL[irq_n] = USART1_RI (对齐 INTC_IrqSignIn)
+            let sel = INTC_BASE + INTC_SEL_OFF + 4 * irq_n;
+            core::ptr::write_volatile(sel as *mut u32, INT_SRC_USART1_RI);
+
+            // 2. NVIC: 清挂起 → 设优先级 → 使能 (对齐 INTC_IrqInstalHandler)。
+            //    ISER 为写 1 置位 (W1S) 寄存器, 直接写入只影响本中断位;
+            //    IPR 是字节寄存器, 用字节指针写 (u32 指针会因未对齐触发 UB 检查)。
+            core::ptr::write_volatile(
+                (NVIC_ISER_BASE + 4 * (irq_n / 32)) as *mut u32,
+                1 << (irq_n % 32),
+            );
+            core::ptr::write_volatile((NVIC_IPR_BASE + irq_n) as *mut u8, (priority & 0x0F) << 4);
+
+            // 3. CR1.RIE: 接收满 + 接收错误中断使能 (对齐 USART_FuncCmd(USART_INT_RX))
+            self.cr1().modify(|v| v | CR1_RIE);
+        }
+    }
+}
+
+/// 接收环形缓冲大小 (字节)
+pub const RX_BUF_SIZE: usize = 512;
+
+/// 接收环形缓冲: ISR (单生产者) 写 head, 应用 (单消费者) 读 tail
+struct RxRing {
+    buf: [u8; RX_BUF_SIZE],
+    head: usize,
+    tail: usize,
+}
+
+impl RxRing {
+    const fn new() -> Self {
+        Self {
+            buf: [0; RX_BUF_SIZE],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        let next = (self.head + 1) % RX_BUF_SIZE;
+        if next == self.tail {
+            return; // 缓冲满: 丢弃新字节
+        }
+        self.buf[self.head] = byte;
+        self.head = next;
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.head == self.tail {
+            return None;
+        }
+        let b = self.buf[self.tail];
+        self.tail = (self.tail + 1) % RX_BUF_SIZE;
+        Some(b)
+    }
+
+    fn count(&self) -> usize {
+        (self.head + RX_BUF_SIZE - self.tail) % RX_BUF_SIZE
+    }
+}
+
+/// 各 USART 单元的接收环形缓冲容器
+struct RxRingCell(core::cell::UnsafeCell<RxRing>);
+
+// 访问路径: ISR (rx_irq_handler) 与 critical_section 保护的读侧,
+// 无共享引用越权访问, Send/Sync 安全。
+unsafe impl Sync for RxRingCell {}
+
+static RX_RINGS: [RxRingCell; 4] = [
+    RxRingCell(core::cell::UnsafeCell::new(RxRing::new())),
+    RxRingCell(core::cell::UnsafeCell::new(RxRing::new())),
+    RxRingCell(core::cell::UnsafeCell::new(RxRing::new())),
+    RxRingCell(core::cell::UnsafeCell::new(RxRing::new())),
+];
+
+/// 各 USART 单元的"数据到达"信号量 (ISR 释放, 应用侧等待)
+///
+/// 避免轮询 RX 缓冲: 应用线程在信号量上阻塞, ISR 每收到一个字节
+/// 释放一次 (计数截断, 缓冲满时语义退化为"有数据"提示)。
+static RX_SEMS: [crate::rtos::Semaphore; 4] = [
+    crate::rtos::Semaphore::new(0, 255),
+    crate::rtos::Semaphore::new(0, 255),
+    crate::rtos::Semaphore::new(0, 255),
+    crate::rtos::Semaphore::new(0, 255),
+];
+
+/// 接收中断 ISR (对齐 DDL 示例 USART_RxFull_IrqCallback + USART_RxError_IrqCallback)
+///
+/// - RXNE: 读 RDR 取数据入环形缓冲 (读 RDR 自动清 RXNE);
+/// - 错误 (ORE/FE/PE): 读 RDR 丢弃出错字节, 写 CR1 清除位 (对齐
+///   `USART_ClearStatus(USART_FLAG_PARITY_ERR|FRAME_ERR|OVERRUN)`)。
+///
+/// 仅做缓冲写入, 不调用任何 RTOS/打印 API (中断上下文安全)。
+unsafe extern "C" fn rx_irq_handler<const U: u8>() {
+    unsafe {
+        let base = USART_BASES[U as usize - 1];
+        let sr = core::ptr::read_volatile(base as *const u32);
+        if sr & (SR_RXNE | SR_PE | SR_FE | SR_ORE) != 0 {
+            // 读 RDR: 清 RXNE/ORE, 同时取出数据 (对齐示例先读再判错)
+            let byte = core::ptr::read_volatile((base + 0x06) as *const u16) as u8;
+            let ring = &mut *RX_RINGS[U as usize - 1].0.get();
+            if sr & SR_RXNE != 0 {
+                ring.push(byte);
+                // 通知等待线程 (信号量计数截断: 缓冲满时退化为"有数据"提示)
+                RX_SEMS[U as usize - 1].release();
+            }
+            if sr & (SR_PE | SR_FE | SR_ORE) != 0 {
+                // 读-改-写 CR1 清除错误标志 (CPE/CFE/CORE, 对齐 USART_ClearStatus)
+                let cr1 = core::ptr::read_volatile((base + 0x0C) as *const u32);
+                core::ptr::write_volatile(
+                    (base + 0x0C) as *mut u32,
+                    cr1 | CR1_CPE | CR1_CFE | CR1_CORE,
+                );
+            }
+        }
+    }
+}
+
+impl<const U: u8> Uart<U> {
+    /// 阻塞等待一个接收字节 (中断驱动, 无需轮询)
+    ///
+    /// 挂起在数据到达信号量上, 由 RX ISR 唤醒; 收到字节即返回。
+    /// 仅可在线程上下文调用。
+    pub fn read_rx_blocking(&self) -> u8 {
+        loop {
+            if let Some(b) = self.read_rx() {
+                return b;
+            }
+            let _ = RX_SEMS[U as usize - 1].take(crate::rtos::Timeout::Forever);
+        }
+    }
+}
+
+impl<const U: u8> Uart<U> {
+    /// 环形缓冲中待读取的字节数
+    pub fn rx_count(&self) -> usize {
+        crate::critical_section::with(|| unsafe { (*RX_RINGS[U as usize - 1].0.get()).count() })
+    }
+
+    /// 从环形缓冲非阻塞读取一个字节 (中断接收模式下使用)
+    pub fn read_rx(&self) -> Option<u8> {
+        crate::critical_section::with(|| unsafe { (*RX_RINGS[U as usize - 1].0.get()).pop() })
+    }
+
+    /// 从环形缓冲读取多个字节到 `buf`, 返回读取数量 (非阻塞)
+    pub fn drain_rx(&self, buf: &mut [u8]) -> usize {
+        let mut n = 0;
+        while n < buf.len() {
+            match self.read_rx() {
+                Some(b) => {
+                    buf[n] = b;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        n
+    }
+
+    /// 读取 SR 状态寄存器 (诊断用)
+    pub fn sr_value(&self) -> u32 {
+        self.sr().read()
+    }
 }
 
 /// 实现 `core::fmt::Write`, 使任意 UART 可作为格式化输出目标
@@ -346,7 +556,7 @@ fn calc_brr(
         return Err(UartError::BaudrateUnsupported); // DIV_INT 溢出
     }
 
-    if usart_clk % d == 0 {
+    if usart_clk.is_multiple_of(d) {
         // 精确波特率, 无需小数
         return Ok((div_int, 0, false));
     }

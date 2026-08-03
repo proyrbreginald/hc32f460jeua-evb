@@ -37,7 +37,7 @@ pub unsafe extern "C" fn reset_handler() -> ! {
         core::ptr::write_volatile((SRAMC + 0x04) as *mut u32, 0x77);
         core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x77);
         // SRAM3 读等待 1 周期 + 写等待 1 周期 (WTCR = 0x1100)
-        core::ptr::write_volatile((SRAMC + 0x00) as *mut u32, 0x1100);
+        core::ptr::write_volatile(SRAMC as *mut u32, 0x1100);
         // 恢复 SRAMC 寄存器写保护
         core::ptr::write_volatile((SRAMC + 0x04) as *mut u32, 0x76);
         core::ptr::write_volatile((SRAMC + 0x0C) as *mut u32, 0x76);

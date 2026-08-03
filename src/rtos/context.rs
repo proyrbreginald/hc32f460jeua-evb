@@ -157,31 +157,25 @@ pub(crate) unsafe fn init_stack(
 
     // 硬件异常帧 (异常返回时由硬件自动弹出)
     let mut p = top - 32;
-    unsafe {
-        write_u32(p, param as u32); // r0
-        write_u32(p + 4, 0); // r1
-        write_u32(p + 8, 0); // r2
-        write_u32(p + 12, 0); // r3
-        write_u32(p + 16, 0); // r12
-        write_u32(p + 20, exit as u32); // lr → 线程退出
-        write_u32(p + 24, entry as u32); // pc → 线程入口
-        write_u32(p + 28, 0x0100_0000); // xpsr: Thumb 模式
-    }
+    write_u32(p, param as u32); // r0
+    write_u32(p + 4, 0); // r1
+    write_u32(p + 8, 0); // r2
+    write_u32(p + 12, 0); // r3
+    write_u32(p + 16, 0); // r12
+    write_u32(p + 20, exit as u32); // lr → 线程退出
+    write_u32(p + 24, entry as u32); // pc → 线程入口
+    write_u32(p + 28, 0x0100_0000); // xpsr: Thumb 模式
 
     // FPU 寄存器区 (d8-d15)
     p -= 64;
-    unsafe {
-        for i in 0..16 {
-            write_u32(p + i * 4, 0);
-        }
+    for i in 0..16 {
+        write_u32(p + i * 4, 0);
     }
 
     // 通用寄存器区 (r4-r11)
     p -= 32;
-    unsafe {
-        for i in 0..8 {
-            write_u32(p + i * 4, 0);
-        }
+    for i in 0..8 {
+        write_u32(p + i * 4, 0);
     }
 
     p // 初始 PSP

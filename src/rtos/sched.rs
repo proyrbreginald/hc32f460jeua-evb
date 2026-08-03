@@ -25,10 +25,10 @@
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use crate::critical_section;
+use crate::rtos::PRIORITY_MAX;
 use crate::rtos::context;
 use crate::rtos::klist::{KCell, ListHead};
-use crate::rtos::thread::{thread_from_ready, Thread, STACK_PATTERN};
-use crate::rtos::PRIORITY_MAX;
+use crate::rtos::thread::{STACK_PATTERN, Thread, thread_from_ready};
 
 /// 就绪表: 每个优先级一个就绪队列 (队尾插入)
 static READY_TABLE: KCell<[ListHead; PRIORITY_MAX as usize]> =
@@ -42,7 +42,30 @@ static CURRENT: AtomicPtr<Thread> = AtomicPtr::new(core::ptr::null_mut());
 #[inline]
 pub(crate) fn current() -> *mut Thread {
     CURRENT.load(Ordering::Relaxed)
-}/// 设置当前线程 (调度器启动时)
+}
+
+/// 就绪优先级位图 (诊断/横幅用)
+pub(crate) fn ready_group_value() -> u32 {
+    READY_GROUP.load(Ordering::Relaxed)
+}
+
+/// 就绪线程总数 (遍历全部优先级队列, 诊断/横幅用)
+pub(crate) fn ready_thread_count() -> usize {
+    critical_section::with(|| unsafe {
+        let mut n = 0;
+        for q in (*READY_TABLE.get()).iter() {
+            let head = q as *const ListHead as *mut ListHead;
+            let mut node = q.next_node();
+            while !node.is_null() && node != head {
+                n += 1;
+                node = (*node).next_node();
+            }
+        }
+        n
+    })
+}
+
+/// 设置当前线程 (调度器启动时)
 #[inline]
 pub(crate) fn set_current(t: *mut Thread) {
     CURRENT.store(t, Ordering::Relaxed);
@@ -101,7 +124,9 @@ pub(crate) fn schedule() {
         if cur.is_null() {
             return;
         }
-        let Some(to) = highest_ready_thread() else { return };
+        let Some(to) = highest_ready_thread() else {
+            return;
+        };
         if to == cur {
             // 当前线程仍是最高就绪: 让出标志在无竞争者时失效
             (*to).yielded = false;
@@ -124,12 +149,17 @@ unsafe fn stack_guard_check(t: *mut Thread) {
     let end = base + (*t).stack_size;
     let sp = (*t).sp;
     if sp < base || sp >= end {
-        panic!("thread '{}' stack overflow (sp={:#x}, stack=[{:#x},{:#x}))",
-            (*t).name, sp, base, end);
+        panic!(
+            "线程 '{}' 栈溢出 (sp={:#x}, 栈=[{:#x},{:#x}))",
+            (*t).name,
+            sp,
+            base,
+            end
+        );
     }
     for i in 0..4 {
         if unsafe { (base as *const u32).add(i).read_volatile() } != STACK_PATTERN {
-            panic!("thread '{}' stack overflow (stack bottom overwritten)", (*t).name);
+            panic!("线程 '{}' 栈溢出 (栈底已被覆盖)", (*t).name);
         }
     }
 }

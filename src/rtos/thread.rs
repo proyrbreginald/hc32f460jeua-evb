@@ -10,13 +10,13 @@
 
 use core::ptr;
 
-use alloc::alloc::{alloc, dealloc, Layout};
+use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::boxed::Box;
 
 use crate::critical_section;
 use crate::rtos::context;
 use crate::rtos::idle::defunct_push;
-use crate::rtos::ipc::{mutex_release_all_held, Error, EventOpt, MutexInner};
+use crate::rtos::ipc::{Error, EventOpt, MutexInner, mutex_release_all_held};
 use crate::rtos::klist::{KCell, ListHead};
 use crate::rtos::sched;
 use crate::rtos::timer::Timer;
@@ -34,6 +34,9 @@ pub(crate) const STACK_PATTERN: u32 = 0xA5A5_A5A5;
 
 /// 睡眠队列 (线程延时挂起; 与 IPC 挂起队列共用 suspend_node)
 static SLEEP_LIST: KCell<ListHead> = KCell::new(ListHead::const_new());
+
+/// 全部已创建线程链表 (供 `ps` 等诊断遍历)
+static ALL_THREADS: KCell<ListHead> = KCell::new(ListHead::const_new());
 
 /// 线程控制块 (TCB) — RT-Thread `struct rt_thread` 的 Rust 移植
 ///
@@ -68,6 +71,8 @@ pub struct Thread {
     pub(crate) suspend_node: ListHead,
     /// 僵尸队列节点
     pub(crate) defunct_node: ListHead,
+    /// 全局线程链表节点 (供诊断遍历)
+    pub(crate) list_node: ListHead,
     /// 线程内建定时器 (超时回调 = [`thread_timer_cb`])
     pub(crate) thread_timer: Timer,
     /// 已持有互斥量链表头
@@ -143,10 +148,8 @@ impl Thread {
                 return false;
             }
             (*t).suspend_node.remove();
-            (*t).thread_timer.stop_internal();
-            (*t).state = TS_READY;
-            sched::ready_insert(t);
-            need = (*t).current_priority < (*sched::current()).current_priority;
+            wakeup_thread(t);
+            need = resched_needed(t);
             true
         });
         if !ok {
@@ -171,13 +174,13 @@ pub fn thread_create(
     entry: extern "C" fn(usize),
     param: usize,
 ) -> &'static Thread {
-    assert!(priority < PRIORITY_MAX, "thread_create: priority out of range");
-    assert!(stack_size >= 256, "thread_create: stack too small");
+    assert!(priority < PRIORITY_MAX, "thread_create: 优先级超出范围");
+    assert!(stack_size >= 256, "thread_create: 栈过小");
 
     // 分配线程栈 (8 字节对齐), 填充溢出检测魔数
-    let layout = Layout::from_size_align(stack_size, 8).expect("bad stack layout");
+    let layout = Layout::from_size_align(stack_size, 8).expect("栈布局无效");
     let stack = unsafe { alloc(layout) };
-    assert!(!stack.is_null(), "thread_create: stack allocation failed");
+    assert!(!stack.is_null(), "thread_create: 栈分配失败");
     unsafe {
         let words = stack as *mut u32;
         for i in 0..stack_size / 4 {
@@ -202,6 +205,7 @@ pub fn thread_create(
         ready_node: ListHead::const_new(),
         suspend_node: ListHead::const_new(),
         defunct_node: ListHead::const_new(),
+        list_node: ListHead::const_new(),
         thread_timer: Timer::new(),
         taken_list: ListHead::const_new(),
         pending_mutex: ptr::null_mut(),
@@ -221,13 +225,60 @@ pub fn thread_create(
         );
     }
 
-    // 启动: 加入就绪队列
+    // 启动: 加入就绪队列 + 全局线程链表
     critical_section::with(|| unsafe {
         (*t).state = TS_READY;
         sched::ready_insert(t);
+        // volatile 读屏障: 防止"写后无读"将链表写入判定为死存储而消除
+        let head = ALL_THREADS.get();
+        let _ = core::ptr::read_volatile(head);
+        (*ALL_THREADS.get_mut()).push_back(&mut (*t).list_node);
+        let _ = core::ptr::read_volatile(head);
     });
 
     unsafe { &mut *t }
+}
+
+/// 线程状态 → 名称 (诊断显示)
+pub fn thread_state_name(state: u8) -> &'static str {
+    match state {
+        TS_INIT => "init",
+        TS_READY => "ready",
+        TS_RUNNING => "running",
+        TS_SUSPEND => "suspend",
+        TS_CLOSE => "close",
+        _ => "?",
+    }
+}
+
+/// 线程快照 (供 `ps` 等诊断命令使用)
+#[derive(Clone, Copy)]
+pub struct ThreadInfo {
+    /// 线程名
+    pub name: &'static str,
+    /// 当前优先级 (0 最高)
+    pub priority: u8,
+    /// 线程状态 (见 [`thread_state_name`])
+    pub state: u8,
+}
+
+/// 全部已创建线程的快照列表 (按创建顺序, 供诊断命令使用)
+pub fn thread_info_list() -> alloc::vec::Vec<ThreadInfo> {
+    let mut list = alloc::vec::Vec::new();
+    critical_section::with(|| unsafe {
+        let head = ALL_THREADS.get();
+        let mut node = (*head).next_node();
+        while !node.is_null() && node != head {
+            let t = crate::rtos::klist::container_of!(node, Thread, list_node);
+            list.push(ThreadInfo {
+                name: (*t).name,
+                priority: (*t).current_priority,
+                state: (*t).state,
+            });
+            node = (*node).next_node();
+        }
+    });
+    list
 }
 
 /// 线程入口返回后由硬件跳入 (初始帧 lr), 执行退出清理并切换, 永不返回
@@ -285,8 +336,10 @@ pub fn yield_now() {
 unsafe fn delay_suspend(cur: *mut Thread, ticks: u32) {
     (*cur).error = 0;
     (*cur).suspend_node.remove();
-    (*cur).thread_timer.start_internal(ticks, 0, thread_timer_cb, cur as usize);
-    (*SLEEP_LIST.get()).push_back(&mut (*cur).suspend_node);
+    (*cur)
+        .thread_timer
+        .start_internal(ticks, 0, thread_timer_cb, cur as usize);
+    (*SLEEP_LIST.get_mut()).push_back(&mut (*cur).suspend_node);
     (*cur).state = TS_SUSPEND;
     sched::ready_remove(cur);
 }
@@ -303,10 +356,8 @@ pub(crate) extern "C" fn thread_timer_cb(param: usize) {
         }
         (*t).error = -1; // -RT_ETIMEDOUT
         (*t).suspend_node.remove();
-        (*t).state = TS_READY;
-        sched::ready_insert(t);
-        let cur = sched::current();
-        need = !cur.is_null() && (*t).current_priority < (*cur).current_priority;
+        wakeup_thread(t);
+        need = resched_needed(t);
     });
     if need {
         sched::schedule();
@@ -315,17 +366,43 @@ pub(crate) extern "C" fn thread_timer_cb(param: usize) {
 
 /// 挂起节点 → 线程
 pub(crate) unsafe fn thread_from_suspend(node: *mut ListHead) -> *mut Thread {
-    (node as *mut u8).sub(core::mem::offset_of!(Thread, suspend_node)) as *mut Thread
+    crate::rtos::klist::container_of!(node, Thread, suspend_node)
 }
 
 /// 就绪节点 → 线程
 pub(crate) unsafe fn thread_from_ready(node: *mut ListHead) -> *mut Thread {
-    (node as *mut u8).sub(core::mem::offset_of!(Thread, ready_node)) as *mut Thread
+    crate::rtos::klist::container_of!(node, Thread, ready_node)
+}
+
+/// 临界区内: 唤醒挂起线程 (对齐 RT-Thread `rt_thread_resume` 的核心步骤)
+///
+/// 停止线程定时器 → 状态就绪 → 入就绪队列。调用方须保证线程处于
+/// 挂起态 (状态检查由各调用路径完成, 超时回调与显式唤醒互斥)。
+pub(crate) unsafe fn wakeup_thread(t: *mut Thread) {
+    (*t).thread_timer.stop_internal();
+    (*t).state = TS_READY;
+    sched::ready_insert(t);
+}
+
+/// 被唤醒线程是否比当前线程更紧急 (需要重新调度)
+pub(crate) fn resched_needed(w: *mut Thread) -> bool {
+    let cur = sched::current();
+    !cur.is_null() && unsafe { (*w).current_priority < (*cur).current_priority }
+}
+
+/// 阻塞等待后返回: 是否已超时
+///
+/// 挂起后的统一路径: 触发重新调度; 恢复后线程错误码非零即超时唤醒
+/// (由 [`thread_timer_cb`] 写入 `-1`)。
+pub(crate) fn blocked_wait() -> bool {
+    sched::schedule();
+    (unsafe { (*sched::current()).error }) != 0
 }
 
 /// 释放线程栈与 TCB (由空闲线程的僵尸回收调用)
 pub(crate) unsafe fn free_thread(t: *mut Thread) {
-    let layout = Layout::from_size_align((*t).stack_size, 8).expect("bad layout");
+    (*t).list_node.remove();
+    let layout = Layout::from_size_align((*t).stack_size, 8).expect("内存布局无效");
     unsafe { dealloc((*t).stack_addr as *mut u8, layout) };
     drop(Box::from_raw(t));
 }

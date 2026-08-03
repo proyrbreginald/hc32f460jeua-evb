@@ -26,6 +26,7 @@
 //! - 临界区 = 关中断 (PRIMASK), 调度锁由临界区覆盖;
 //! - 时间片为 0 表示不参与轮转 (RT-Thread 的 `tick` 字段);
 //! - 定时器仅硬定时器 (回调在中断上下文)。
+#![allow(dead_code)]
 
 pub(crate) mod context;
 pub(crate) mod idle;
@@ -52,7 +53,7 @@ pub fn tick() -> u32 {
     TICK.load(Ordering::Relaxed)
 }
 
-/// 调度器是否已启动 (`[`start`] 之后)
+/// 调度器是否已启动 (`start` 之后)
 ///
 /// 启动前系统为单执行流 (main), 无并发; 中断上下文返回当前被打断
 /// 的线程 (非空), 因此该判定只对"启动前"为真。
@@ -75,7 +76,7 @@ pub fn init() {
 
 /// 启动调度器: 切换到最高优先级线程, **永不返回**。
 pub fn start() -> ! {
-    let first = unsafe { sched::highest_ready_thread() }.expect("rtos::start: no thread to run");
+    let first = unsafe { sched::highest_ready_thread() }.expect("rtos::start: 没有可运行的线程");
     unsafe {
         sched::set_current(first);
         context::switch_to_first(&mut (*first).sp as *mut usize as usize);
@@ -101,6 +102,9 @@ pub fn tick_increase() {
 #[allow(unused_imports)]
 pub use ipc::{Error, Event, EventOpt, Mailbox, MessageQueue, Mutex, Semaphore, Timeout};
 #[allow(unused_imports)]
-pub use thread::{thread_create, thread_delay, thread_delay_ms, yield_now, Thread};
+pub use thread::{
+    Thread, ThreadInfo, thread_create, thread_delay, thread_delay_ms, thread_info_list,
+    thread_state_name, yield_now,
+};
 #[allow(unused_imports)]
 pub use timer::Timer;

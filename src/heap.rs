@@ -83,6 +83,31 @@ fn heap_bounds() -> (usize, usize) {
     (start, end)
 }
 
+/// 堆容量 (字节, 诊断/启动横幅用)
+pub fn capacity() -> usize {
+    let (start, end) = heap_bounds();
+    end.saturating_sub(start)
+}
+
+/// 已用堆内存 (字节, 诊断/终端 `free` 用)
+///
+/// 遍历空闲链表累加空闲字节, 容量减空闲即为已用 (含元数据开销)。
+pub fn used() -> usize {
+    crate::critical_section::with(|| {
+        let (start, end) = heap_bounds();
+        if !INITIALIZED.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let mut free = 0;
+        let mut cur = FREE_HEAD.load(Ordering::Relaxed);
+        while cur != NULL_BLOCK {
+            free += block_size(cur);
+            cur = next_ptr(cur);
+        }
+        (end - start).saturating_sub(free)
+    })
+}
+
 /// payload 指针 → 块头地址
 #[inline]
 fn block_of(payload: *mut u8) -> usize {
