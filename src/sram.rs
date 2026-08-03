@@ -241,7 +241,11 @@ pub fn set_fault_action(target: CheckTarget, action: FaultAction) {
         let v = core::ptr::read_volatile((SRAMC + CKCR) as *const u32);
         core::ptr::write_volatile(
             (SRAMC + CKCR) as *mut u32,
-            if action == FaultAction::Reset { v | bit } else { v & !bit },
+            if action == FaultAction::Reset {
+                v | bit
+            } else {
+                v & !bit
+            },
         );
     }
     lock();

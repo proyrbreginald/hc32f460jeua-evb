@@ -7,13 +7,14 @@
 extern crate alloc;
 
 // -- 启动与内核基础设施 --
+mod crc; // CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
 mod critical_section; // PRIMASK 临界区 (中断安全的基础)
+mod efm; // 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
 mod heap; // 全局堆分配器 (边界标记 + 首次适配)
 mod icg; // ICG 硬件配置段
 mod intc; // 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
-mod efm; // 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
-mod sram; // 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
 mod panic;
+mod sram; // 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
 mod startup; // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
 mod vector_table; // 复位/异常/144 外设中断向量表 // panic 与硬件 fault 诊断
 
@@ -221,7 +222,11 @@ pub(crate) fn selftest_run() {
     // 互斥量: 获取 / 递归持有 / 释放
     let mtx = rtos::Mutex::new();
     let r = mtx.lock(Timeout::Ticks(0));
-    check(r.is_ok(), "互斥量: 可获取", format_args!("lock(0) = {:?}", r));
+    check(
+        r.is_ok(),
+        "互斥量: 可获取",
+        format_args!("lock(0) = {:?}", r),
+    );
     let r = mtx.lock(Timeout::Ticks(0));
     check(
         r.is_ok(),
@@ -272,9 +277,17 @@ pub(crate) fn selftest_run() {
     let r = mb.send(100, Timeout::Ticks(0));
     check(r.is_ok(), "邮箱: 发送", format_args!("send(100) = {:?}", r));
     let r = mb.recv(Timeout::Ticks(0));
-    check(r == Ok(100), "邮箱: 接收一致", format_args!("recv() = {:?}", r));
+    check(
+        r == Ok(100),
+        "邮箱: 接收一致",
+        format_args!("recv() = {:?}", r),
+    );
     let r = mb.recv(Timeout::Ticks(0));
-    check(r.is_err(), "邮箱: 空立即超时", format_args!("recv() = {:?}", r));
+    check(
+        r.is_err(),
+        "邮箱: 空立即超时",
+        format_args!("recv() = {:?}", r),
+    );
     for i in 0..4 {
         mb.send(1000 + i, Timeout::Ticks(0)).ok();
     }
@@ -287,7 +300,11 @@ pub(crate) fn selftest_run() {
     // 取出一条腾出空间后再紧急发送 (urgent 在满时同样返回 Full)
     mb.recv(Timeout::Ticks(0)).ok();
     let r = mb.urgent(42, Timeout::Ticks(0));
-    check(r.is_ok(), "邮箱: 紧急发送", format_args!("urgent(42) = {:?}", r));
+    check(
+        r.is_ok(),
+        "邮箱: 紧急发送",
+        format_args!("urgent(42) = {:?}", r),
+    );
     let r = mb.recv(Timeout::Ticks(0));
     check(
         r == Ok(42),
@@ -299,7 +316,11 @@ pub(crate) fn selftest_run() {
     let mq = rtos::MessageQueue::new(16, 4);
     let hello: &[u8] = &[0x52, 0x00, 0xFF, b'!'];
     let r = mq.send(hello, Timeout::Ticks(0));
-    check(r.is_ok(), "消息队列: 发送", format_args!("send({:02X?}) = {:?}", hello, r));
+    check(
+        r.is_ok(),
+        "消息队列: 发送",
+        format_args!("send({:02X?}) = {:?}", hello, r),
+    );
     let mut buf = [0u8; 16];
     let n = mq.recv(&mut buf, Timeout::Ticks(0));
     check(
@@ -308,7 +329,11 @@ pub(crate) fn selftest_run() {
         format_args!("recv() = {:?}, data = {:02X?}", n, &buf[..4]),
     );
     let r = mq.recv(&mut buf, Timeout::Ticks(0));
-    check(r.is_err(), "消息队列: 空立即超时", format_args!("recv() = {:?}", r));
+    check(
+        r.is_err(),
+        "消息队列: 空立即超时",
+        format_args!("recv() = {:?}", r),
+    );
 
     // 延时: uptime 前进
     let t0 = rtos::uptime_ms();
@@ -330,11 +355,19 @@ pub(crate) fn selftest_run() {
         victim.delete();
         log_debug!("[selftest] delete() 已返回, 延时 50ms");
         rtos::thread_delay_ms(50);
-        check(true, "线程删除: delete() 完成且系统正常", format_args!("victim 已删除, 系统无异常"));
+        check(
+            true,
+            "线程删除: delete() 完成且系统正常",
+            format_args!("victim 已删除, 系统无异常"),
+        );
         log_debug!("[selftest] 创建 exit-me 线程");
         rtos::thread_create("exit-me", 1024, 25, 0, exit_thread, 0);
         rtos::thread_delay_ms(100);
-        check(true, "线程退出: 入口返回后经 defunct 回收", format_args!("exit-me 已退出并被回收"));
+        check(
+            true,
+            "线程退出: 入口返回后经 defunct 回收",
+            format_args!("exit-me 已退出并被回收"),
+        );
     }
 
     // Flash (EFM): 扇区擦除 + 多字编程 + 回读校验 (末扇区, 远离固件/swap 标记)
@@ -342,13 +375,10 @@ pub(crate) fn selftest_run() {
         const FLASH_TEST_ADDR: u32 = 0x0007_C000; // 扇区 62 (0x7C000)
         let data: [u8; 64] = [
             0x52, b'F', b'L', b'A', b'S', b'H', 0x00, 0xFF, // 二进制 + ASCII 混合
-            b'-', b't', b'e', b's', b't', b' ', b'o', b'k',
-            0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78,
-            b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h',
-            b'i', b'j', b'k', b'l', b'm', b'n', b'o', b'p',
-            b'q', b'r', b's', b't', b'u', b'v', b'w', b'x',
-            b'y', b'z', 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-            b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7',
+            b'-', b't', b'e', b's', b't', b' ', b'o', b'k', 0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34,
+            0x56, 0x78, b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h', b'i', b'j', b'k', b'l',
+            b'm', b'n', b'o', b'p', b'q', b'r', b's', b't', b'u', b'v', b'w', b'x', b'y', b'z',
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7',
         ];
         let mut ok = efm::sector_erase(FLASH_TEST_ADDR).is_ok();
         if ok && efm::program(FLASH_TEST_ADDR, &data).is_err() {
@@ -370,6 +400,23 @@ pub(crate) fn selftest_run() {
             ok,
             "Flash: 扇区擦除/编程/回读",
             format_args!("addr=0x{:08X} len={}B", FLASH_TEST_ADDR, data.len()),
+        );
+    }
+
+    // CRC 硬件加速器: 标准测试向量 "123456789" (四个标准配置)
+    if !aborted.get() {
+        let data: &[u8] = b"123456789";
+        let x25 = crc::calculate(data, crc::DataWidth::Byte, crc::Config::x25());
+        let ccitt = crc::calculate(data, crc::DataWidth::Byte, crc::Config::ccitt_false());
+        let ieee = crc::calculate(data, crc::DataWidth::Byte, crc::Config::crc32());
+        let mpeg2 = crc::calculate(data, crc::DataWidth::Byte, crc::Config::crc32_mpeg2());
+        check(
+            x25 == 0x906E && ccitt == 0x29B1 && ieee == 0xCBF4_3926 && mpeg2 == 0x0376_E6E7,
+            "CRC: 标准向量 X25/CCITT/CRC32/MPEG2",
+            format_args!(
+                "X25={:#06X} CCITT-F={:#06X} CRC32={:#010X} MPEG2={:#010X}",
+                x25, ccitt, ieee, mpeg2
+            ),
         );
     }
 

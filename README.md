@@ -59,6 +59,7 @@ src/
 ├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
 ├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
 ├── efm.rs             # 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
+├── crc.rs             # CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
 ├── sram.rs            # 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
 ├── intc.rs            # 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 ├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
@@ -167,6 +168,23 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
 - 启动阶段 (`startup.rs`) 的 SRAM3 配置保持**内联** (栈未建立不能调用
   函数), 与 DDL `SetSRAM3Wait` 逐字节一致;
 - 寄存器写保护: WTPR/CKPR 键值 0x77 解锁 / 0x76 锁定。
+
+## CRC 硬件加速器 (crc)
+
+对齐 DDL v3.3.0 `hc32_ll_crc.c/h`:
+
+- 多项式硬件固定: CRC16 = 0x1021 (X25/CCITT 系), CRC32 = 0x04C11DB7 (IEEE 802.3);
+- `Config` 预设标准组合: `x25()` / `ccitt_false()` / `crc32()` /
+  `crc32_mpeg2()` (初值 + REFIN/REFOUT/XOROUT 开关);
+- 输入宽度: 8/16/32 位 (`DataWidth`), 写 DAT0 即触发 (硬件流水);
+- 一次性计算 `calculate(data, width, cfg)`; 分帧累加
+  `init` + `accumulate`×N + `result()` (可 `set_init_value` 中途重置);
+  `check()` 与期望值比较;
+- 结果格式: REFIN+REFOUT+XOROUT 全使能时即标准 CRC (与软件按位建模
+  逐位一致, 标准向量已验: "123456789" → X25=0x906E / CRC32=0xCBF43926);
+- 时钟门控 FCG0.bit23 (FCG0PC 键 0xA5A50001 解锁), 模块初始化时自动使能;
+- 自检 (`selftest` 命令) 含 CRC 实测: 四个标准配置计算 "123456789"
+  并与标准向量比对。
 
 ## 启动流程
 
