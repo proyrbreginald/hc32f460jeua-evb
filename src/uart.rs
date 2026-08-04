@@ -650,12 +650,12 @@ impl<const U: u8> Uart<U> {
 impl<const U: u8> Uart<U> {
     /// 环形缓冲中待读取的字节数
     pub fn rx_count(&self) -> usize {
-        crate::critical_section::with(|| unsafe { (*RX_RINGS[U as usize - 1].0.get()).count() })
+        crate::critical_section::with(|_| unsafe { (*RX_RINGS[U as usize - 1].0.get()).count() })
     }
 
     /// 从环形缓冲非阻塞读取一个字节 (中断接收模式下使用)
     pub fn read_rx(&self) -> Option<u8> {
-        crate::critical_section::with(|| unsafe { (*RX_RINGS[U as usize - 1].0.get()).pop() })
+        crate::critical_section::with(|_| unsafe { (*RX_RINGS[U as usize - 1].0.get()).pop() })
     }
 
     /// 从环形缓冲读取多个字节到 `buf`, 返回读取数量 (非阻塞)

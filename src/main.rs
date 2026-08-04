@@ -150,8 +150,9 @@ extern "C" fn victim_thread(_param: usize) {
 extern "C" fn exit_thread(_param: usize) {}
 
 /// 阻塞发送线程: 向容量 2 的邮箱连发 3 条 (第 3 条在满时阻塞,
-/// 由接收者取走消息后唤醒) —— 回归"唤醒不重试丢消息"缺陷
-static BLK_MB: rtos::Mailbox = rtos::Mailbox::new(2);
+/// 由接收者取走消息后唤醒) —— 回归"唤醒不重试丢消息"缺陷。
+/// 消息类型 `usize` 编码在类型中, 收发类型不一致在编译期报错。
+static BLK_MB: rtos::Mailbox<usize> = rtos::Mailbox::new(2);
 
 extern "C" fn blk_sender(_param: usize) {
     for i in 0..3 {
@@ -231,29 +232,42 @@ pub(crate) fn selftest_run() {
         format_args!("release() 后 take(0) = {:?}", r),
     );
 
-    // 互斥量: 获取 / 递归持有 / 释放
-    let mtx = rtos::Mutex::new();
-    let r = mtx.lock(Timeout::Ticks(0));
+    // 互斥量 Mutex<T>: 数据保护 (守卫提供 &mut T) + 非递归语义
+    let mtx = rtos::Mutex::new(0u32);
+    let mut g1 = mtx.lock(Timeout::Ticks(0));
     check(
-        r.is_ok(),
+        g1.is_ok(),
         "互斥量: 可获取",
-        format_args!("lock(0) = {:?}", r),
+        format_args!("lock(0) = {:?}", g1),
     );
-    let r = mtx.lock(Timeout::Ticks(0));
+    // 守卫内 &mut 访问保护数据
+    let mut wrote = false;
+    if let Ok(g) = &mut g1 {
+        **g = 0x5A5A_5A5A;
+        wrote = **g == 0x5A5A_5A5A;
+    }
     check(
-        r.is_ok(),
-        "互斥量: 递归持有合法",
-        format_args!("递归 lock(0) = {:?}", r),
+        wrote,
+        "互斥量: 守卫内 &mut 独占访问数据",
+        format_args!("经守卫写入并读回 0x5A5A5A5A"),
     );
-    mtx.unlock();
-    mtx.unlock();
-    let r = mtx.lock(Timeout::Ticks(0));
+    // 非递归: 持有守卫时重复获取返回 Invalid (而非死锁)
+    let g2 = mtx.lock(Timeout::Ticks(0));
     check(
-        r.is_ok(),
-        "互斥量: 释放后可重新获取",
-        format_args!("unlock×2 后 lock(0) = {:?}", r),
+        g2.is_err(),
+        "互斥量: 非递归, 持有中重复获取返回 Invalid",
+        format_args!("持有中 lock(0) = {:?}", g2),
     );
-    mtx.unlock();
+    drop(g1);
+    // 释放后可重新获取, 且数据保留
+    let g3 = mtx.lock(Timeout::Ticks(0));
+    let val = g3.as_ref().map(|g| **g);
+    check(
+        g3.is_ok() && val == Ok(0x5A5A_5A5A),
+        "互斥量: 释放后可重新获取且数据保留",
+        format_args!("释放后 lock(0) = {:?}, data = {:#010X}", g3, val.unwrap_or(0)),
+    );
+    drop(g3);
 
     // 事件: AND / OR / 立即超时
     let evt = rtos::Event::new();
@@ -285,7 +299,7 @@ pub(crate) fn selftest_run() {
     );
 
     // 邮箱: 收发 / 紧急插队 / 满返回 Full / 空返回 TimedOut
-    let mb = rtos::Mailbox::new(4);
+    let mb = rtos::Mailbox::<usize>::new(4);
     let r = mb.send(100, Timeout::Ticks(0));
     check(r.is_ok(), "邮箱: 发送", format_args!("send(100) = {:?}", r));
     let r = mb.recv(Timeout::Ticks(0));

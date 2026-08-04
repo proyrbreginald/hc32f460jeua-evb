@@ -63,12 +63,12 @@ unsafe impl GlobalAlloc for HeapAllocator {
         if layout.align() > ALIGN {
             return core::ptr::null_mut();
         }
-        crate::critical_section::with(|| unsafe { alloc_inner(layout.size()) })
+        crate::critical_section::with(|_| unsafe { alloc_inner(layout.size()) })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         if !ptr.is_null() {
-            crate::critical_section::with(|| unsafe { dealloc_inner(ptr) });
+            crate::critical_section::with(|_| unsafe { dealloc_inner(ptr) });
         }
     }
 }
@@ -93,7 +93,7 @@ pub fn capacity() -> usize {
 ///
 /// 遍历空闲链表累加空闲字节, 容量减空闲即为已用 (含元数据开销)。
 pub fn used() -> usize {
-    crate::critical_section::with(|| {
+    crate::critical_section::with(|_| {
         let (start, end) = heap_bounds();
         if !INITIALIZED.load(Ordering::Relaxed) {
             return 0;

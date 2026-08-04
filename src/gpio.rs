@@ -191,7 +191,7 @@ fn pwpr() -> Reg<u16> {
 ///   被中断的加锁"提前锁死"而静默丢弃, 因此窗口内禁止中断;
 /// - 临界区嵌套安全: 外层已处于临界区时, 内层不会重新开中断。
 fn with_unlocked<T>(f: impl FnOnce() -> T) -> T {
-    crate::critical_section::with(|| {
+    crate::critical_section::with(|_| {
         pwpr().write(PWPR_UNLOCK);
         let result = f();
         pwpr().write(PWPR_LOCK);

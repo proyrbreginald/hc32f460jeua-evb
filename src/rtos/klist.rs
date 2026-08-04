@@ -17,6 +17,8 @@
 
 use core::ptr;
 
+use crate::critical_section::CriticalSection;
+
 /// 节点指针 → 包含该节点的内核对象指针 (RT-Thread `rt_list_entry` 移植)
 ///
 /// 各模块的 `*_from_node` 转换统一走此宏, 避免 offset_of 计算分散。
@@ -42,11 +44,13 @@ unsafe impl Sync for ListHead {}
 
 /// 内核全局单元 — 为 `static` 提供 Sync 的 `UnsafeCell`
 ///
-/// 内核全局状态 (就绪表/定时链表/僵尸队列等) 均经此类声明,
-/// 访问须在临界区 (关中断) 内通过 [`KCell::get`] 进行。
+/// 内核全局状态 (就绪表/定时链表/僵尸队列等) 均经此类声明。
+/// 访问必须出示 [`CriticalSection`] 令牌 (见 [`KCell::get`]),
+/// 返回的可变引用生命周期绑定临界区作用域 —— 无法逃逸出
+/// 关中断区间, 编译器强制"须在临界区内访问"的契约。
 pub(crate) struct KCell<T>(core::cell::UnsafeCell<T>);
 
-// 内核保证所有访问均在临界区内进行
+// 内核保证所有访问均经临界区令牌, 令牌生命周期内中断已关闭
 unsafe impl<T> Sync for KCell<T> {}
 
 impl<T> KCell<T> {
@@ -54,19 +58,15 @@ impl<T> KCell<T> {
         Self(core::cell::UnsafeCell::new(value))
     }
 
-    /// 临界区内: 获取可变指针
-    #[inline]
-    pub unsafe fn get(&self) -> *mut T {
-        self.0.get()
-    }
-
-    /// 临界区内: 获取可变引用
+    /// 临界区内: 获取可变引用 (生命周期绑定临界区, 不可逃逸)
     ///
-    /// 写操作请优先使用本方法: 通过共享引用派生裸指针再写入可能被
-    /// 编译器视为死存储而消除 (静态对象无可变借用, 写入无别名依据)。
+    /// 令牌 `cs` 证明调用方运行在关中断上下文, 返回的 `&mut T`
+    /// 与临界区作用域同生命周期 —— 临界区结束后引用即失效,
+    /// 无法存储后越界使用。注意: 同一临界区内对同一 `KCell`
+    /// 仅可调用一次 (返回 `&mut`, 重复调用会被借用检查拒绝)。
     #[inline]
-    #[allow(clippy::mut_from_ref)] // 内核对象经 UnsafeCell 由临界区保护
-    pub unsafe fn get_mut(&self) -> &mut T {
+    #[allow(clippy::mut_from_ref)] // 访问经临界区令牌 (CriticalSection) 授权
+    pub unsafe fn get<'cs>(&self, _cs: CriticalSection<'cs>) -> &'cs mut T {
         unsafe { &mut *self.0.get() }
     }
 }

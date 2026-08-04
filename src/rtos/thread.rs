@@ -11,9 +11,10 @@
 use core::ptr;
 
 use alloc::alloc::{Layout, alloc, dealloc};
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use crate::critical_section;
+use crate::critical_section::CriticalSection;
 use crate::rtos::context;
 use crate::rtos::idle::defunct_push;
 use crate::rtos::ipc::{Error, EventOpt, MutexInner, mutex_release_all_held};
@@ -40,9 +41,21 @@ static ALL_THREADS: KCell<ListHead> = KCell::new(ListHead::const_new());
 
 /// 线程控制块 (TCB) — RT-Thread `struct rt_thread` 的 Rust 移植
 ///
-/// 由内核分配并持有 (僵尸回收), 应用持有 `&'static Thread` 句柄。
+/// 由内核以 `Arc` 管理: [`thread_create`] 返回 [`Arc<Thread>`] 句柄,
+/// **句柄在 TCB 被回收后仍可使用 (不悬垂)** —— TCB 的存活由
+/// 用户句柄与内核侧强引用 ([`Thread::kernel_self`]) 共同维持:
+///
+/// - 线程退出/删除后, 空闲线程回收**栈**并释放内核侧强引用;
+///   只要仍有用户句柄, TCB 本身保持存活;
+/// - 全部用户句柄释放后, TCB 才被释放。
+///
 /// 除 [`Thread::name`] 外, 字段仅在临界区 (关中断) 内访问。
 pub struct Thread {
+    /// 内核侧强引用 (与用户句柄构成 TCB 的存活集合)
+    ///
+    /// 线程创建时写入; 回收 (空闲线程) 时取出并释放 —— 若用户仍持有
+    /// [`Arc<Thread>`] 句柄, TCB 由句柄维持, 杜绝 use-after-free。
+    pub(crate) kernel_self: Option<Arc<Thread>>,
     /// 保存的线程栈指针 (PSP, 由 PendSV 汇编读写)
     pub(crate) sp: usize,
     /// 栈基址 / 大小
@@ -97,7 +110,7 @@ impl Thread {
 
     /// 当前优先级
     pub fn priority(&self) -> u8 {
-        critical_section::with(|| self.current_priority)
+        critical_section::with(|_| self.current_priority)
     }
 
     /// 删除线程: 进入僵尸队列, 由空闲线程回收资源
@@ -108,7 +121,7 @@ impl Thread {
         if t == sched::current() {
             unsafe { exit_and_schedule(t) };
         }
-        critical_section::with(|| unsafe { delete_bookkeeping(t) });
+        critical_section::with(|cs| unsafe { delete_bookkeeping(t, cs) });
         sched::schedule();
     }
 
@@ -122,9 +135,9 @@ impl Thread {
         }
         let mut ok = false;
         let mut need = false;
-        critical_section::with(|| unsafe {
+        critical_section::with(|cs| unsafe {
             if (*t).state == TS_READY || (*t).state == TS_RUNNING {
-                sched::ready_remove(t);
+                sched::ready_remove(t, cs);
                 (*t).state = TS_SUSPEND;
                 ok = true;
                 need = (*t).current_priority < (*sched::current()).current_priority;
@@ -147,12 +160,12 @@ impl Thread {
     pub fn resume(&self) -> Result<(), Error> {
         let t = self as *const Thread as *mut Thread;
         let mut need = false;
-        let ok = critical_section::with(|| unsafe {
+        let ok = critical_section::with(|cs| unsafe {
             if (*t).state != TS_SUSPEND {
                 return false;
             }
             (*t).suspend_node.remove();
-            wakeup_thread(t);
+            wakeup_thread(t, cs);
             need = resched_needed(t);
             true
         });
@@ -170,6 +183,10 @@ impl Thread {
 ///
 /// 参数: 名称 / 栈大小 (字节) / 优先级 (0 最高, 31 为最低/空闲) /
 /// 时间片 (tick, 0 = 不参与轮转) / 入口函数 (`extern "C" fn(usize)`) / 参数。
+///
+/// 返回 [`Arc<Thread>`] 用户句柄: 线程退出/删除后 TCB 由句柄维持存活
+/// (栈已被空闲线程回收), 句柄不会悬垂; 丢弃句柄不影响线程运行
+/// (内核侧强引用维持 TCB)。
 pub fn thread_create(
     name: &'static str,
     stack_size: usize,
@@ -177,7 +194,7 @@ pub fn thread_create(
     timeslice: u32,
     entry: extern "C" fn(usize),
     param: usize,
-) -> &'static Thread {
+) -> Arc<Thread> {
     assert!(priority < PRIORITY_MAX, "thread_create: 优先级超出范围");
     assert!(stack_size >= 256, "thread_create: 栈过小");
 
@@ -192,8 +209,10 @@ pub fn thread_create(
         }
     }
 
-    // 分配 TCB
-    let t = Box::into_raw(Box::new(Thread {
+    // TCB 以 Arc 管理: 用户句柄 + 内核侧强引用 (kernel_self) 各持一份
+    // 引用计数, TCB 在两者全部释放前保持存活 (见 Thread::kernel_self)。
+    let arc: Arc<Thread> = Arc::new(Thread {
+        kernel_self: None,
         sp: 0,
         stack_addr: stack as usize,
         stack_size,
@@ -216,7 +235,12 @@ pub fn thread_create(
         event_wanted: 0,
         event_opt: EventOpt::Or,
         event_recv_bits: 0,
-    }));
+    });
+    // 计数: new=1 → clone(kernel_arc)=2 → into_raw 后由 from_raw
+    // 重建用户句柄 (消费同一计数), kernel_arc 与 user_arc 各持 1
+    let kernel_arc = Arc::clone(&arc);
+    let t = Arc::into_raw(arc) as *mut Thread;
+    let user_arc = unsafe { Arc::from_raw(t) };
 
     // 构造初始栈帧: 入口返回后硬件跳入 thread_exit
     unsafe {
@@ -227,20 +251,22 @@ pub fn thread_create(
             param,
             thread_exit as *const () as usize,
         );
+        // 登记内核侧强引用: 之后 TCB 由 kernel_self 与 user_arc 共同维持
+        (*t).kernel_self = Some(kernel_arc);
     }
 
     // 启动: 加入就绪队列 + 全局线程链表
-    critical_section::with(|| unsafe {
+    critical_section::with(|cs| unsafe {
         (*t).state = TS_READY;
-        sched::ready_insert(t);
+        sched::ready_insert(t, cs);
         // volatile 读屏障: 防止"写后无读"将链表写入判定为死存储而消除
-        let head = ALL_THREADS.get();
+        let head = ALL_THREADS.get(cs) as *mut ListHead;
         let _ = core::ptr::read_volatile(head);
-        (*ALL_THREADS.get_mut()).push_back(&mut (*t).list_node);
+        (*ALL_THREADS.get(cs)).push_back(&mut (*t).list_node);
         let _ = core::ptr::read_volatile(head);
     });
 
-    unsafe { &mut *t }
+    user_arc
 }
 
 /// 线程状态 → 名称 (诊断显示)
@@ -269,8 +295,8 @@ pub struct ThreadInfo {
 /// 全部已创建线程的快照列表 (按创建顺序, 供诊断命令使用)
 pub fn thread_info_list() -> alloc::vec::Vec<ThreadInfo> {
     let mut list = alloc::vec::Vec::new();
-    critical_section::with(|| unsafe {
-        let head = ALL_THREADS.get();
+    critical_section::with(|cs| unsafe {
+        let head = ALL_THREADS.get(cs) as *const ListHead as *mut ListHead;
         let mut node = (*head).next_node();
         while !node.is_null() && node != head {
             let t = crate::rtos::klist::container_of!(node, Thread, list_node);
@@ -292,7 +318,7 @@ unsafe extern "C" fn thread_exit() -> ! {
 
 /// 退出清理 + 触发切换 (当前线程调用, 永不返回)
 unsafe fn exit_and_schedule(t: *mut Thread) -> ! {
-    critical_section::with(|| unsafe { delete_bookkeeping(t) });
+    critical_section::with(|cs| unsafe { delete_bookkeeping(t, cs) });
     sched::schedule();
     // PendSV 即将切换走, 此循环仅在切换前短暂执行
     loop {
@@ -300,24 +326,24 @@ unsafe fn exit_and_schedule(t: *mut Thread) -> ! {
     }
 }
 
-/// 临界区内: 线程删除/退出公共清理
-unsafe fn delete_bookkeeping(t: *mut Thread) {
+/// 临界区内: 线程删除/退出公共清理 (须持有临界区令牌)
+unsafe fn delete_bookkeeping(t: *mut Thread, cs: CriticalSection<'_>) {
     // 已回收 (TS_CLOSE, 僵尸队列中): 拒绝重复删除, 防二次释放
     if (*t).state == TS_CLOSE {
         return;
     }
     // 释放持有的互斥量 (所有权转移给等待者)
-    mutex_release_all_held(t);
+    mutex_release_all_held(t, cs);
     // 停止线程定时器 (防止超时回调唤醒已删除线程)
     (*t).thread_timer.stop_internal();
     // 从就绪/挂起队列移除
     if (*t).ready_node.is_linked() {
-        sched::ready_remove(t);
+        sched::ready_remove(t, cs);
     }
     (*t).suspend_node.remove();
     // 置关闭状态, 进入僵尸队列 (由空闲线程回收)
     (*t).state = TS_CLOSE;
-    defunct_push(t);
+    defunct_push(t, cs);
 }
 
 /// 线程延时 (tick); 0 时等价于让出 CPU
@@ -326,7 +352,7 @@ pub fn thread_delay(ticks: u32) {
         unsafe { sched::yield_thread() };
         return;
     }
-    critical_section::with(|| unsafe { delay_suspend(sched::current(), ticks) });
+    critical_section::with(|cs| unsafe { delay_suspend(sched::current(), ticks, cs) });
     sched::schedule();
 }
 
@@ -341,15 +367,15 @@ pub fn yield_now() {
 }
 
 /// 临界区内: 当前线程挂起 `ticks` tick (进入睡眠队列)
-unsafe fn delay_suspend(cur: *mut Thread, ticks: u32) {
+unsafe fn delay_suspend(cur: *mut Thread, ticks: u32, cs: CriticalSection<'_>) {
     (*cur).error = 0;
     (*cur).suspend_node.remove();
     (*cur)
         .thread_timer
-        .start_internal(ticks, 0, thread_timer_cb, cur as usize);
-    (*SLEEP_LIST.get_mut()).push_back(&mut (*cur).suspend_node);
+        .start_internal(ticks, 0, thread_timer_cb, cur as usize, cs);
+    (*SLEEP_LIST.get(cs)).push_back(&mut (*cur).suspend_node);
     (*cur).state = TS_SUSPEND;
-    sched::ready_remove(cur);
+    sched::ready_remove(cur, cs);
 }
 
 /// 线程定时器超时回调: 唤醒挂起的线程 (延时超时 / IPC 超时)
@@ -358,14 +384,14 @@ unsafe fn delay_suspend(cur: *mut Thread, ticks: u32) {
 pub(crate) extern "C" fn thread_timer_cb(param: usize) {
     let t = param as *mut Thread;
     let mut need = false;
-    critical_section::with(|| unsafe {
+    critical_section::with(|cs| unsafe {
         if (*t).state != TS_SUSPEND {
             return;
         }
         (*t).error = -1; // -RT_ETIMEDOUT
         (*t).pending_mutex = core::ptr::null_mut(); // 超时: 清理继承链残留
         (*t).suspend_node.remove();
-        wakeup_thread(t);
+        wakeup_thread(t, cs);
         need = resched_needed(t);
     });
     if need {
@@ -387,10 +413,10 @@ pub(crate) unsafe fn thread_from_ready(node: *mut ListHead) -> *mut Thread {
 ///
 /// 停止线程定时器 → 状态就绪 → 入就绪队列。调用方须保证线程处于
 /// 挂起态 (状态检查由各调用路径完成, 超时回调与显式唤醒互斥)。
-pub(crate) unsafe fn wakeup_thread(t: *mut Thread) {
+pub(crate) unsafe fn wakeup_thread(t: *mut Thread, cs: CriticalSection<'_>) {
     (*t).thread_timer.stop_internal();
     (*t).state = TS_READY;
-    sched::ready_insert(t);
+    sched::ready_insert(t, cs);
 }
 
 /// 被唤醒线程是否比当前线程更紧急 (需要重新调度)
@@ -408,10 +434,16 @@ pub(crate) fn blocked_wait() -> bool {
     (unsafe { (*sched::current()).error }) != 0
 }
 
-/// 释放线程栈与 TCB (由空闲线程的僵尸回收调用)
+/// 释放线程栈与内核侧强引用 (由空闲线程的僵尸回收调用)
+///
+/// 线程已退出/被删除且已切换离开, 栈不再被使用, 立即释放;
+/// TCB 由内核侧强引用维持 (本函数取出并释放), 若用户仍持有
+/// [`Arc<Thread>`] 句柄, TCB 继续存活 —— 句柄不会悬垂。
 pub(crate) unsafe fn free_thread(t: *mut Thread) {
     (*t).list_node.remove();
     let layout = Layout::from_size_align((*t).stack_size, 8).expect("内存布局无效");
     unsafe { dealloc((*t).stack_addr as *mut u8, layout) };
-    drop(Box::from_raw(t));
+    // 释放内核侧强引用; 若用户句柄仍存活, 此处仅递减引用计数,
+    // TCB 在最后一个句柄释放时才被回收
+    unsafe { (*t).kernel_self.take() };
 }

@@ -9,6 +9,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::critical_section;
+use crate::critical_section::CriticalSection;
 use crate::rtos::klist::{KCell, ListHead};
 use crate::rtos::sched;
 use crate::rtos::thread::{Thread, free_thread, thread_create};
@@ -16,9 +17,9 @@ use crate::rtos::thread::{Thread, free_thread, thread_create};
 /// 僵尸队列: 已退出/被删除的线程等待空闲线程回收
 static DEFUNCT: KCell<ListHead> = KCell::new(ListHead::const_new());
 
-/// 临界区内: 线程进入僵尸队列
-pub(crate) unsafe fn defunct_push(t: *mut Thread) {
-    unsafe { (*DEFUNCT.get_mut()).push_back(&mut (*t).defunct_node) };
+/// 临界区内: 线程进入僵尸队列 (须持有临界区令牌)
+pub(crate) unsafe fn defunct_push(t: *mut Thread, cs: CriticalSection<'_>) {
+    unsafe { (*DEFUNCT.get(cs)).push_back(&mut (*t).defunct_node) };
 }
 
 /// 创建空闲线程 (由 [`crate::rtos::init`] 调用)
@@ -46,8 +47,8 @@ extern "C" fn idle_entry(_param: usize) {
 /// 回收僵尸队列中的线程 (释放栈与 TCB)
 fn defunct_execute() {
     loop {
-        let t = critical_section::with(|| unsafe {
-            let node = (*DEFUNCT.get_mut()).pop_first()?;
+        let t = critical_section::with(|cs| unsafe {
+            let node = (*DEFUNCT.get(cs)).pop_first()?;
             Some(thread_from_defunct(node))
         });
         let Some(t) = t else { break };

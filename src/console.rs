@@ -19,6 +19,8 @@
 //! 一次打印调用是**原子输出**的: 线程上下文的打印 (`write_fmt`, 即
 //! `print!`/`println!`) 由带**优先级继承**的互斥量 ([`rtos::Mutex`])
 //! 串行化, 任意时刻至多一个线程占用串口, 输出不会交错。
+//! 锁以 RAII 守卫形式持有 ([`rtos::MutexGuard`]), 作用域结束自动
+//! 释放, 不存在忘解锁/重复解锁路径。
 //!
 //! 优先级继承保证**不会出现高优先级线程无界等待低优先级线程**:
 //! 低优先级线程持有打印锁时, 等待的高优先级线程会将其提升到自己的
@@ -44,7 +46,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub type ConsoleUart = crate::config::ConsoleUart;
 
 /// 打印互斥量 (优先级继承): 串行化线程上下文的打印输出
-static PRINT_MUTEX: Mutex = Mutex::new();
+///
+/// 保护数据为 `()`: 本模块仅需锁语义 (输出串行化), 经
+/// [`MutexGuard`](crate::rtos::MutexGuard) 独占持有即可。
+static PRINT_MUTEX: Mutex<()> = Mutex::new(());
 
 /// 控制台是否就绪: UART 初始化前 (`mark_ready` 前) 的打印**静默丢弃**,
 /// 防止在 UART 时钟未使能时访问 USART (TXE 读回 0 导致等待死循环)。
@@ -68,9 +73,10 @@ pub fn write_fmt(args: core::fmt::Arguments<'_>) {
         return; // UART 未就绪: 静默丢弃, 防止 TXE 等待死循环
     }
     if crate::rtos::scheduler_started() {
-        PRINT_MUTEX.lock(Timeout::Forever).ok();
+        // RAII 守卫: 离开本函数作用域时自动释放打印锁,
+        // 忘解锁/重复解锁在类型层面被排除 (见 rtos::ipc::MutexGuard)
+        let _guard = PRINT_MUTEX.lock(Timeout::Forever).ok();
         write_fmt_raw(args);
-        PRINT_MUTEX.unlock();
     } else {
         write_fmt_raw(args);
     }
@@ -85,14 +91,18 @@ pub fn write_fmt_line(args: core::fmt::Arguments<'_>) {
         return; // UART 未就绪: 静默丢弃, 防止 TXE 等待死循环
     }
     if crate::rtos::scheduler_started() {
-        PRINT_MUTEX.lock(Timeout::Forever).ok();
-        // 自检: 打印期间锁必须仍归当前线程持有 (定位锁丢失)
-        let me = crate::rtos::sched::current();
+        // 内容与换行在同一守卫内完成 (RAII), 行与行之间不会交错;
+        // 守卫析构前校验锁仍由当前线程持有 (正常情况下必然成立,
+        // 作为打印路径回归的哨兵检查)
+        let guard = PRINT_MUTEX.lock(Timeout::Forever).ok();
         write_fmt_raw(args);
-        debug_assert_eq!(PRINT_MUTEX.owner(), me, "print lock lost during output");
+        debug_assert_eq!(
+            PRINT_MUTEX.owner(),
+            crate::rtos::sched::current(),
+            "print lock lost during output"
+        );
         write_fmt_raw(core::format_args!("\r\n"));
-        debug_assert_eq!(PRINT_MUTEX.owner(), me, "print lock lost during CRLF");
-        PRINT_MUTEX.unlock();
+        drop(guard); // 显式释放: CRLF 输出完成后立即解锁
     } else {
         write_fmt_raw(args);
         write_fmt_raw(core::format_args!("\r\n"));

@@ -22,6 +22,7 @@
 use core::cell::UnsafeCell;
 
 use crate::critical_section;
+use crate::critical_section::CriticalSection;
 use crate::rtos::klist::{KCell, ListHead};
 use crate::rtos::tick;
 
@@ -77,21 +78,21 @@ impl Timer {
         callback: extern "C" fn(usize),
         param: usize,
     ) {
-        critical_section::with(|| unsafe {
-            self.start_internal(delay_ticks, period_ticks, callback, param);
+        critical_section::with(|cs| unsafe {
+            self.start_internal(delay_ticks, period_ticks, callback, param, cs);
         });
     }
 
     /// 停止定时器 (回调将不再触发)
     pub fn stop(&self) {
-        critical_section::with(|| unsafe {
+        critical_section::with(|_| unsafe {
             self.stop_internal();
         });
     }
 
     /// 定时器是否处于启动状态
     pub fn is_active(&self) -> bool {
-        critical_section::with(|| unsafe { (*self.ptr()).started })
+        critical_section::with(|_| unsafe { (*self.ptr()).started })
     }
 
     #[inline]
@@ -106,6 +107,7 @@ impl Timer {
         period_ticks: u32,
         callback: extern "C" fn(usize),
         param: usize,
+        cs: CriticalSection<'_>,
     ) {
         let t = unsafe { &mut *self.ptr() };
         t.callback = callback;
@@ -116,7 +118,7 @@ impl Timer {
         }
         t.timeout_tick = tick().wrapping_add(delay_ticks);
         t.started = true;
-        insert_sorted(t);
+        insert_sorted(t, cs);
     }
 
     /// 临界区内: 停止
@@ -138,8 +140,8 @@ unsafe fn timer_from_node(node: *mut ListHead) -> *mut TimerInner {
 ///
 /// 相同时刻的定时器后到者排后 (先注册先回调)。
 /// tick 回绕安全: 差值 < 2^31 视为"晚于"。
-unsafe fn insert_sorted(t: &mut TimerInner) {
-    let head = TIMER_LIST.get();
+unsafe fn insert_sorted(t: &mut TimerInner, cs: CriticalSection<'_>) {
+    let head = TIMER_LIST.get(cs) as *mut ListHead;
     let mut cur = unsafe { (*head).next_node() };
     while !cur.is_null() && cur != head {
         let e = timer_from_node(cur);
@@ -163,9 +165,11 @@ unsafe fn insert_sorted(t: &mut TimerInner) {
 /// 且不得在回调内阻塞 (临界区内不可挂起)。
 pub(crate) fn check() {
     loop {
-        let done = critical_section::with(|| unsafe {
-            let list = &mut *TIMER_LIST.get();
-            let Some(node) = list.first() else {
+        let done = critical_section::with(|cs| unsafe {
+            // 立即转裸指针: 之后 insert_sorted 需再次借用 TIMER_LIST,
+            // &mut 引用不可重叠存活
+            let head = TIMER_LIST.get(cs) as *mut ListHead;
+            let Some(node) = (*head).first() else {
                 return false;
             };
             let t = timer_from_node(node);
@@ -182,7 +186,7 @@ pub(crate) fn check() {
                 if t.period_ticks != 0 && !t.node.is_linked() {
                     if t.started {
                         t.timeout_tick = tick().wrapping_add(t.period_ticks);
-                        insert_sorted(t);
+                        insert_sorted(t, cs);
                     }
                 } else {
                     // 一次性定时器: 触发后清除 started (is_active 不再误报)
