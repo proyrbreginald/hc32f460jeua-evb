@@ -88,6 +88,6 @@ SECTIONS
     } > RAM
 }
 
-/* 堆上界 = RAM 顶 - 栈预留 (绝对符号) */
-_heap_end = ORIGIN(RAM) + LENGTH(RAM) - STACK_SIZE;
+/* 堆上界 = RAM 顶 - 栈预留 - 主栈 canary 4B (空闲线程巡检, 见 thread.rs) */
+_heap_end = ORIGIN(RAM) + LENGTH(RAM) - STACK_SIZE - 4;
 ASSERT(_heap_end >= _heap_start, "RAM 空间不足以容纳堆和栈预留");

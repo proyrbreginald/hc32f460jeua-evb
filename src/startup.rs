@@ -15,6 +15,8 @@ unsafe extern "C" {
     unsafe static mut _data_ram_end: u32;
     unsafe static mut _bss_ram_start: u32;
     unsafe static mut _bss_ram_end: u32;
+    /// 堆上界 (link.ld: RAM 顶 - 栈预留 - 主栈 canary)
+    static _heap_end: u8;
 }
 
 /// 设置为复位处理函数
@@ -81,6 +83,15 @@ pub unsafe extern "C" fn reset_handler() -> ! {
             core::ptr::write_volatile(dest, 0);
             dest = dest.add(1);
         }
+    }
+
+    // 主栈 (MSP: 启动/中断栈) canary: 位于堆/主栈边界 (link.ld 预留),
+    // 由空闲线程巡检 —— 主栈向下溢出首先破坏该字 (见 rtos/thread.rs)
+    unsafe {
+        core::ptr::write_volatile(
+            core::ptr::addr_of!(_heap_end) as *mut u32,
+            crate::rtos::thread::STACK_PATTERN,
+        );
     }
 
     // 进入应用入口

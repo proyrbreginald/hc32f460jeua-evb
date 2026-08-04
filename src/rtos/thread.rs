@@ -512,6 +512,24 @@ pub(crate) fn check_stack_canaries() -> Option<&'static str> {
     })
 }
 
+/// 主栈 (MSP: 启动/中断栈) canary 地址: 堆上界 `_heap_end`
+/// (link.ld 预留 4 字节, 见 startup.rs 初始化)
+fn main_stack_canary_addr() -> usize {
+    unsafe extern "C" {
+        static _heap_end: u8;
+    }
+    core::ptr::addr_of!(_heap_end) as usize
+}
+
+/// 检查主栈 (MSP) canary 是否被破坏 (主栈向下溢出首先写坏该字)
+///
+/// 由空闲线程巡检 (线程模式运行, MSP 空闲可安全读取); 与线程栈
+/// canary 互补 —— 线程栈有 MPU 守卫 + canary, 主栈是启动/中断
+/// 专用栈, 此为唯一的溢出检测点。
+pub(crate) fn check_main_stack_canary() -> bool {
+    unsafe { core::ptr::read_volatile(main_stack_canary_addr() as *const u32) == STACK_PATTERN }
+}
+
 /// 线程栈已使用字节数 (高水位, 从栈底向上扫描未破坏的填充区)
 ///
 /// 填充魔数区 = 从未被触及的栈区; 首个非魔数字以下为使用区。

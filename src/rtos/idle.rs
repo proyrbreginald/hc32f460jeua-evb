@@ -42,6 +42,10 @@ extern "C" fn idle_entry(_param: usize) {
         if let Some(name) = crate::rtos::thread::check_stack_canaries() {
             panic!("线程栈溢出: {}", name);
         }
+        // 主栈 (MSP: 启动/中断栈) canary 巡检 (堆/主栈边界字)
+        if !crate::rtos::thread::check_main_stack_canary() {
+            panic!("主栈 (MSP) 溢出: 中断/启动栈 canary 被破坏");
+        }
         // 看门狗喂狗 (CFG_WDT_ENABLE 编译期开关, false 时整段消除)
         if crate::config::WDT_ENABLE {
             crate::wdt::feed();

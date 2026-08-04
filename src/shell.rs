@@ -528,7 +528,7 @@ fn cmd_led(rest: &str) -> CmdResult {
 /// (受 CFG_APP_SELFTEST_ENABLE 控制)
 fn cmd_selftest(_rest: &str) -> CmdResult {
     if config::APP_SELFTEST_ENABLE {
-        crate::selftest_run();
+        crate::selftest::run();
     } else {
         println!("selftest 未启用 (CFG_APP_SELFTEST_ENABLE=false)");
     }
