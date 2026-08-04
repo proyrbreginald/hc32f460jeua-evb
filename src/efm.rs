@@ -277,6 +277,64 @@ fn check_addr(addr: u32) -> Result<(), EfmError> {
     Ok(())
 }
 
+// ============================== 引导交换 (Boot Swap) ==============================
+//
+// 参考手册 Rev1.71 章节 7.8 (引导交换), 仅 512KB 产品支持 (JEUA 为 512KB)。
+//
+// # 机制
+//
+// 扇区 0 (0x0000_0000~0x1FFF) 与扇区 1 (0x0000_2000~0x3FFF) 是 8KB 引导扇区:
+// 对 0x0007_FFDC (扇区 63 末字) 编程 0xFFFF_4321 后复位, 硬件把两个扇区的
+// **地址映射互换** (EFM_FSWP.FSWP=0), CPU 从物理扇区 1 (地址 0x0) 启动;
+// 该状态在每次复位时按 0x7FFDC 内容锁定, 擦除扇区 63 后恢复 (FSWP=1)。
+//
+// # 用途: 引导程序 (bootloader) 的自升级
+//
+// 标准流程 (对齐 RM 图 7-3/7-4, 每步都不可"砖"):
+//   1. 运行中的引导程序把新引导镜像写入扇区 1 (自身所在扇区 0 不动);
+//   2. [`swap_enable`] 编程 0x7FFDC = 0xFFFF_4321 (单字编程, 原子);
+//   3. 系统复位 → 新引导从物理扇区 1 启动 (旧引导仍完整保留);
+//   4. 新引导自检通过后, 擦除扇区 0 (此刻映射在 0x2000) 并把自身复制过去;
+//   5. [`swap_disable`] 擦除扇区 63 (清除交换标志) → 复位 → 回到正常启动。
+// 任一步掉电/复位都能从另一个扇区的旧镜像继续, 不会整片失效。
+//
+// # 注意事项
+//
+// - ICG 配置字 (0x400~0x41F) 在复位时按**地址**读取: 交换生效后读到的是
+//   物理扇区 1 的 0x400 —— 新引导镜像必须携带与扇区 0 相同的 ICG 字
+//   (本工程 `.icg` 段 8×32bit, 见 icg.rs);
+// - 交换标志只能写 1→0: 再次升级前必须先擦除扇区 63 (即 swap_disable);
+// - 应用代码应避开扇区 63 末字 0x7FFDC (可整段避开扇区 63)。
+
+/// 交换标志地址 (扇区 63 末字)
+pub const SWAP_FLAG_ADDR: u32 = 0x0007_FFDC;
+/// 交换标志值 (对齐 DDL EFM_SWAP_DATA)
+pub const SWAP_FLAG_DATA: u32 = 0xFFFF_4321;
+
+/// 当前是否处于引导交换状态 (EFM_FSWP.FSWP: 0=已交换, 1=未交换;
+/// 对齐 DDL `EFM_GetSwapStatus`)
+pub fn swap_status() -> bool {
+    unsafe { core::ptr::read_volatile((EFM_BASE + FSWP) as *const u32) & 1 == 0 }
+}
+
+/// 使能引导交换: 编程 0x7FFDC = 0xFFFF_4321, 复位后从扇区 1 启动
+/// (对齐 DDL `EFM_SwapCmd(ENABLE)`: PGM_SINGLE + 写标志字)
+///
+/// 由 [`program_word`] 组合实现 (含缓存保存/恢复、解锁/锁定、bus hold),
+/// 单字编程原子完成, 掉电也不会损坏现有引导。
+pub fn swap_enable() -> Result<(), EfmError> {
+    program_word(SWAP_FLAG_ADDR, SWAP_FLAG_DATA)
+}
+
+/// 失能引导交换: 擦除扇区 63 清除标志 (对齐 DDL `EFM_SwapCmd(DISABLE)`:
+/// ERASE_SECTOR + 触发写), 复位后恢复从扇区 0 启动
+///
+/// 由 [`sector_erase`] 组合实现; 注意会**擦除整个扇区 63** (8KB),
+/// 该扇区不应存放应用数据。
+pub fn swap_disable() -> Result<(), EfmError> {
+    sector_erase(SWAP_FLAG_ADDR)
+}
+
 // ============================== 读 ==============================
 
 /// 读取 Flash 字节 (Flash 内存映射, 任意字节地址)

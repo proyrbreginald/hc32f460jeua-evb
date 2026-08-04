@@ -110,6 +110,8 @@ rustflags = [
   "-C",
   "link-arg=-Tlink.ld",                                    # 使用自定义链接脚本
   "-C",
+  "link-arg=--gc-sections",                                # 垃圾回收未引用段 (本工程实测体积无变化: LLVM 已先行 DCE)
+  "-C",
   "link-arg=-Map=target/thumbv7em-none-eabihf/output.map", # 生成链接映射文件
   "-C",
   "force-frame-pointers=true",                             # 全量帧指针, 供 panic/fault 栈回溯
