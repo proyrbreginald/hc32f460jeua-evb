@@ -73,6 +73,12 @@ pub fn write_fmt(args: core::fmt::Arguments<'_>) {
         return; // UART 未就绪: 静默丢弃, 防止 TXE 等待死循环
     }
     if crate::rtos::scheduler_started() {
+        // 中断上下文禁止加锁打印: 会挂起被打断的线程 (打印互斥量死锁)。
+        // 诊断输出请用 write_fmt_raw (无锁)。
+        debug_assert!(
+            !crate::critical_section::in_isr(),
+            "中断上下文不可加锁打印, 请使用 console::write_fmt_raw"
+        );
         // RAII 守卫: 离开本函数作用域时自动释放打印锁,
         // 忘解锁/重复解锁在类型层面被排除 (见 rtos::ipc::MutexGuard)
         let _guard = PRINT_MUTEX.lock(Timeout::Forever).ok();
@@ -91,6 +97,11 @@ pub fn write_fmt_line(args: core::fmt::Arguments<'_>) {
         return; // UART 未就绪: 静默丢弃, 防止 TXE 等待死循环
     }
     if crate::rtos::scheduler_started() {
+        // 同 write_fmt: 中断上下文不可加锁打印 (打印互斥量死锁)
+        debug_assert!(
+            !crate::critical_section::in_isr(),
+            "中断上下文不可加锁打印, 请使用 console::write_fmt_raw"
+        );
         // 内容与换行在同一守卫内完成 (RAII), 行与行之间不会交错;
         // 守卫析构前校验锁仍由当前线程持有 (正常情况下必然成立,
         // 作为打印路径回归的哨兵检查)

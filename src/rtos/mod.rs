@@ -92,6 +92,10 @@ pub fn start() -> ! {
             .expect("rtos::start: 没有可运行的线程");
     unsafe {
         sched::set_current(first);
+        // MPU 线程栈守卫: 首个线程的守卫区 (与 schedule() 一致)
+        if crate::config::MPU_ENABLE {
+            crate::mpu::set_thread_guard((*first).guard_addr);
+        }
         context::switch_to_first(&mut (*first).sp as *mut usize as usize);
     }
     // PendSV 即将执行首个切换; 此处永不返回

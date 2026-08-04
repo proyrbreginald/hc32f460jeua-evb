@@ -377,11 +377,12 @@ pub fn sector_erase(addr: u32) -> Result<(), EfmError> {
     set_op_mode(OpMode::SectorErase);
 
     // 触发: 向目标地址写 0 (擦除 = 全 1, 任意值均可, DDL 用 0)
-    let result = unsafe {
+    // MPU: FLASH 只读区域临时放开 (触发写是"写 Flash 地址")
+    let result = crate::mpu::with_flash_writable(|| unsafe {
         core::ptr::write_volatile(addr as *mut u32, 0);
         // 扇区擦除 ~ms 级, 超时按 HCLK 折算 ~20ms (对齐 DDL EFM_ERASE_TIMEOUT)
         wait_end(crate::clk::hclk_hz() / 50)
-    };
+    });
 
     set_op_mode(OpMode::ReadOnly);
     restore_cache(cache);
@@ -421,11 +422,12 @@ pub fn program(addr: u32, data: &[u8]) -> Result<(), EfmError> {
             word &= !(0xFFu32 << (8 * j));
             word |= (b as u32) << (8 * j);
         }
-        unsafe {
+        // 触发写 (MPU: FLASH 只读区域临时放开, 见 mpu::with_flash_writable)
+        result = crate::mpu::with_flash_writable(|| unsafe {
             core::ptr::write_volatile((addr + 4 * i as u32) as *mut u32, word);
-        }
-        // 单字编程 ~µs 级, 超时按 HCLK 折算 ~53µs (对齐 DDL EFM_PGM_TIMEOUT)
-        result = wait_end(crate::clk::hclk_hz() / 20_000);
+            // 单字编程 ~µs 级, 超时按 HCLK 折算 ~53µs (对齐 DDL EFM_PGM_TIMEOUT)
+            wait_end(crate::clk::hclk_hz() / 20_000)
+        });
         if result.is_err() {
             break;
         }

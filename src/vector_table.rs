@@ -35,15 +35,37 @@ pub unsafe extern "C" fn default_handler() {
 /// 运行时注册的外设中断回调 (供 [`register_irq`] / [`crate::intc`] 使用)
 type IrqHandler = unsafe extern "C" fn();
 
-/// 回调表容器 (144 槽位, 对应 INT000~INT143)
+/// 回调槽位: 原子函数指针存储 (null = 未注册)
 ///
-/// 访问路径由分发入口 (中断上下文) 与 register_irq (初始化期, 中断未
-/// 使能) 显式同步, 不经过该类型共享引用读取内部, 因此 Send/Sync 安全。
-struct IrqHandlerCell(core::cell::UnsafeCell<[Option<IrqHandler>; 144]>);
+/// 纯原子实现, 无 `unsafe impl Sync`: 注册 (Release 写) 与中断分发
+/// (Acquire 读) 无需临界区 —— 运行时重复注册/注销也是竞态安全的,
+/// 不依赖"仅初始化期注册"的文档约定。
+struct IrqSlot(core::sync::atomic::AtomicPtr<()>);
 
-unsafe impl Sync for IrqHandlerCell {}
+impl IrqSlot {
+    const fn new() -> Self {
+        Self(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()))
+    }
 
-static IRQ_HANDLERS: IrqHandlerCell = IrqHandlerCell(core::cell::UnsafeCell::new([None; 144]));
+    fn store(&self, handler: IrqHandler) {
+        use core::sync::atomic::Ordering;
+        self.0.store(handler as *mut (), Ordering::Release);
+    }
+
+    fn load(&self) -> Option<IrqHandler> {
+        use core::sync::atomic::Ordering;
+        let v = self.0.load(Ordering::Acquire);
+        if v.is_null() {
+            None
+        } else {
+            // 存储的必然是合法函数指针 (store 的输入), 指针 ↔ fn 同宽
+            Some(unsafe { core::mem::transmute::<*mut (), IrqHandler>(v) })
+        }
+    }
+}
+
+/// 回调表 (144 槽位, 对应 INT000~INT143)
+static IRQ_HANDLERS: [IrqSlot; 144] = [const { IrqSlot::new() }; 144];
 
 /// 注册外设中断回调 (INT000~INT143)
 ///
@@ -52,17 +74,13 @@ static IRQ_HANDLERS: IrqHandlerCell = IrqHandlerCell(core::cell::UnsafeCell::new
 /// [`crate::intc::register`] 一步完成路由+注册。
 pub fn register_irq(n: usize, handler: IrqHandler) {
     assert!(n < 144, "register_irq: 仅支持 INT000~INT143");
-    unsafe {
-        (*IRQ_HANDLERS.0.get())[n] = Some(handler);
-    }
+    IRQ_HANDLERS[n].store(handler);
 }
 
-/// 移除外设中断回调 (置 None; 未注册的槽位触发时静默返回)
+/// 移除外设中断回调 (置空; 未注册的槽位触发时静默返回)
 pub fn unregister_irq(n: usize) {
     assert!(n < 144, "unregister_irq: 仅支持 INT000~INT143");
-    unsafe {
-        (*IRQ_HANDLERS.0.get())[n] = None;
-    }
+    IRQ_HANDLERS[n].0.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
 }
 
 /// 生成分发入口: 查表调用对应槽位的回调 (未注册时静默返回)
@@ -70,11 +88,8 @@ macro_rules! irq_dispatch {
     ($name:ident, $n:literal) => {
         #[unsafe(no_mangle)]
         extern "C" fn $name() {
-            unsafe {
-                let h = (*IRQ_HANDLERS.0.get())[$n];
-                if let Some(f) = h {
-                    f();
-                }
+            if let Some(f) = IRQ_HANDLERS[$n].load() {
+                unsafe { f() };
             }
         }
     };

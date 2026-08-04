@@ -55,3 +55,18 @@ pub fn with<R>(f: impl FnOnce(CriticalSection<'_>) -> R) -> R {
     }
     result
 }
+
+/// 当前是否运行在中断上下文 (IPSR != 0)
+///
+/// 供 `debug_assert!` 拦截"中断上下文调用线程专用 API"的误用
+/// (阻塞式 IPC/延时/加锁打印等 —— 在 ISR 中会挂起被打断的线程,
+/// 或对打印互斥量死锁)。release 构建下 `debug_assert!` 被移除,
+/// 零运行时开销。
+#[inline]
+pub fn in_isr() -> bool {
+    let ipsr: u32;
+    unsafe {
+        core::arch::asm!("mrs {}, ipsr", out(reg) ipsr);
+    }
+    ipsr != 0
+}

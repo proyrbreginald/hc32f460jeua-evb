@@ -33,6 +33,18 @@ pub(crate) const TS_CLOSE: u8 = 4;
 /// 线程栈填充魔数 (溢出检测)
 pub(crate) const STACK_PATTERN: u32 = 0xA5A5_A5A5;
 
+/// 栈底 canary 字大小 (字节): 位于栈区最下端, 栈向下溢出时
+/// 最先被破坏, 由空闲线程巡检 ([`check_stack_canaries`]) 检出。
+pub(crate) const CANARY_SIZE: usize = 4;
+
+/// MPU 栈守卫区大小: 位于栈区**下方** (线程自身分配内), 硬件
+/// 无访问区域 —— 栈溢出先触发 MemManage 故障 (见 mpu 模块)。
+/// 与 [`crate::mpu::STACK_GUARD_SIZE`] 一致。
+pub(crate) const GUARD_SIZE: usize = crate::mpu::STACK_GUARD_SIZE;
+
+/// 栈分配额外开销: MPU 守卫 (32B) + 32B 对齐裕量 (守卫区须 32B 对齐)
+const STACK_ALLOC_EXTRA: usize = GUARD_SIZE + 32;
+
 /// 睡眠队列 (线程延时挂起; 与 IPC 挂起队列共用 suspend_node)
 static SLEEP_LIST: KCell<ListHead> = KCell::new(ListHead::const_new());
 
@@ -58,9 +70,15 @@ pub struct Thread {
     pub(crate) kernel_self: Option<Arc<Thread>>,
     /// 保存的线程栈指针 (PSP, 由 PendSV 汇编读写)
     pub(crate) sp: usize,
-    /// 栈基址 / 大小
+    /// 栈基址 (守卫区上方) / 大小
     pub(crate) stack_addr: usize,
     pub(crate) stack_size: usize,
+    /// 栈底 canary 字地址 (软件溢出检测, 见 [`check_stack_canaries`])
+    pub(crate) canary_addr: usize,
+    /// MPU 栈守卫区基址 (32B 对齐, 硬件无访问区域, 见 mpu 模块)
+    pub(crate) guard_addr: usize,
+    /// 堆分配基址 (含守卫区/对齐裕量, 回收时按此释放)
+    pub(crate) alloc_addr: usize,
     /// 入口参数 (诊断用, 当前版本仅用于初始栈帧)
     #[allow(dead_code)]
     pub(crate) parameter: usize,
@@ -198,12 +216,18 @@ pub fn thread_create(
     assert!(priority < PRIORITY_MAX, "thread_create: 优先级超出范围");
     assert!(stack_size >= 256, "thread_create: 栈过小");
 
-    // 分配线程栈 (8 字节对齐), 填充溢出检测魔数
-    let layout = Layout::from_size_align(stack_size, 8).expect("栈布局无效");
+    // 分配线程栈 (8 字节对齐): 分配 = [对齐裕量 | MPU 守卫 32B | 栈],
+    // 守卫区 32B 对齐 (MPU 区域要求)。栈向下溢出先撞守卫区 (硬件
+    // MemManage 故障), 再撞软件 canary (MPU 关闭时的后备检测)。
+    let layout = Layout::from_size_align(stack_size + STACK_ALLOC_EXTRA, 8).expect("栈布局无效");
     let stack = unsafe { alloc(layout) };
     assert!(!stack.is_null(), "thread_create: 栈分配失败");
+    let alloc_addr = stack as usize;
+    let guard_addr = (alloc_addr + 31) & !31; // 守卫区 32B 对齐
+    let stack_addr = guard_addr + GUARD_SIZE;
     unsafe {
-        let words = stack as *mut u32;
+        core::ptr::write_volatile(stack_addr as *mut u32, STACK_PATTERN);
+        let words = stack_addr as *mut u32;
         for i in 0..stack_size / 4 {
             words.add(i).write_volatile(STACK_PATTERN);
         }
@@ -214,8 +238,11 @@ pub fn thread_create(
     let arc: Arc<Thread> = Arc::new(Thread {
         kernel_self: None,
         sp: 0,
-        stack_addr: stack as usize,
+        stack_addr,
         stack_size,
+        canary_addr: stack_addr,
+        guard_addr,
+        alloc_addr,
         parameter: param,
         name,
         init_priority: priority,
@@ -243,9 +270,10 @@ pub fn thread_create(
     let user_arc = unsafe { Arc::from_raw(t) };
 
     // 构造初始栈帧: 入口返回后硬件跳入 thread_exit
+    // (栈区从 canary 上方开始, 避免初始帧压到 canary 字)
     unsafe {
         (*t).sp = context::init_stack(
-            stack,
+            stack_addr as *mut u8,
             stack_size,
             entry as usize,
             param,
@@ -290,6 +318,10 @@ pub struct ThreadInfo {
     pub priority: u8,
     /// 线程状态 (见 [`thread_state_name`])
     pub state: u8,
+    /// 栈已用字节数 (高水位, 由填充魔数扫描得到)
+    pub stack_used: usize,
+    /// 栈总大小 (字节)
+    pub stack_size: usize,
 }
 
 /// 全部已创建线程的快照列表 (按创建顺序, 供诊断命令使用)
@@ -304,6 +336,8 @@ pub fn thread_info_list() -> alloc::vec::Vec<ThreadInfo> {
                 name: (*t).name,
                 priority: (*t).current_priority,
                 state: (*t).state,
+                stack_used: stack_watermark(t),
+                stack_size: (*t).stack_size,
             });
             node = (*node).next_node();
         }
@@ -348,6 +382,10 @@ unsafe fn delete_bookkeeping(t: *mut Thread, cs: CriticalSection<'_>) {
 
 /// 线程延时 (tick); 0 时等价于让出 CPU
 pub fn thread_delay(ticks: u32) {
+    debug_assert!(
+        ticks == 0 || !crate::critical_section::in_isr(),
+        "线程延时不能在中断上下文使用"
+    );
     if ticks == 0 {
         unsafe { sched::yield_thread() };
         return;
@@ -441,9 +479,57 @@ pub(crate) fn blocked_wait() -> bool {
 /// [`Arc<Thread>`] 句柄, TCB 继续存活 —— 句柄不会悬垂。
 pub(crate) unsafe fn free_thread(t: *mut Thread) {
     (*t).list_node.remove();
-    let layout = Layout::from_size_align((*t).stack_size, 8).expect("内存布局无效");
-    unsafe { dealloc((*t).stack_addr as *mut u8, layout) };
+    // 分配时为 [裕量 | 守卫 | 栈] (stack_size + STACK_ALLOC_EXTRA),
+    // 释放须用同一布局, 基址为 alloc_addr
+    let layout = Layout::from_size_align((*t).stack_size + STACK_ALLOC_EXTRA, 8)
+        .expect("内存布局无效");
+    unsafe { dealloc((*t).alloc_addr as *mut u8, layout) };
     // 释放内核侧强引用; 若用户句柄仍存活, 此处仅递减引用计数,
     // TCB 在最后一个句柄释放时才被回收
     unsafe { (*t).kernel_self.take() };
+}
+
+// ============================== 栈溢出检测 ==============================
+
+/// 检查全部线程栈的底部 canary, 返回第一个被破坏的线程名
+///
+/// 由空闲线程周期性调用 (见 `idle` 模块): 栈向下溢出时 canary 字
+/// 被覆写, 立即检出并交由调用方处理 (panic/复位)。调用方须在
+/// 线程上下文 (canary 巡检在临界区内进行, 期间被检线程不会运行,
+/// 单字读取无撕裂)。
+pub(crate) fn check_stack_canaries() -> Option<&'static str> {
+    critical_section::with(|cs| unsafe {
+        let head = ALL_THREADS.get(cs) as *const ListHead as *mut ListHead;
+        let mut node = (*head).next_node();
+        while !node.is_null() && node != head {
+            let t = crate::rtos::klist::container_of!(node, Thread, list_node);
+            if core::ptr::read_volatile((*t).canary_addr as *const u32) != STACK_PATTERN {
+                return Some((*t).name);
+            }
+            node = (*node).next_node();
+        }
+        None
+    })
+}
+
+/// 线程栈已使用字节数 (高水位, 从栈底向上扫描未破坏的填充区)
+///
+/// 填充魔数区 = 从未被触及的栈区; 首个非魔数字以下为使用区。
+/// 供 `ps` 等诊断显示栈余量 (仅对非运行线程有意义 —— 巡检运行
+/// 于空闲线程, 被检线程此刻必然未运行)。
+pub(crate) fn stack_watermark(t: *mut Thread) -> usize {
+    let base = unsafe { (*t).stack_addr };
+    let size = unsafe { (*t).stack_size };
+    let words = size / 4;
+    let mut unused_words = words;
+    unsafe {
+        for i in 0..words {
+            let v = core::ptr::read_volatile((base + i * 4) as *const u32);
+            if v != STACK_PATTERN {
+                unused_words = i;
+                break;
+            }
+        }
+    }
+    size - unused_words * 4
 }

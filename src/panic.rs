@@ -33,10 +33,12 @@ use crate::console::write_fmt_raw as write_fmt;
 /// 死循环无法定位。无锁输出 (write_fmt_raw), 中断上下文安全。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmi_handler() {
+    let status = crate::sram::status();
+    let err = crate::sram::error();
     write_fmt(core::format_args!(
-        "\r\n[NMI] SRAM 奇偶/ECC 错误? 状态 = {:#x}, 标志 = {:#x}\r\n",
-        crate::sram::status(),
-        crate::sram::status()
+        "\r\n[NMI] SRAM 奇偶/ECC 错误? CKSR = {:#x}, 最高位错误 = {:?}\r\n",
+        status,
+        err
     ));
     loop {
         unsafe { core::arch::asm!("wfi") };

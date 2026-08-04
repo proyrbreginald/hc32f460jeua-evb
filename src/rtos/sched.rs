@@ -137,6 +137,11 @@ pub(crate) fn schedule() {
         // 前也可能已溢出并破坏相邻 TCB, 每次调度检查缩短发现窗口)
         stack_guard_check(cur);
         stack_guard_check(to);
+        // MPU 线程栈守卫: 把硬件无访问区域指向目标线程的守卫区,
+        // 栈溢出由硬件 MemManage 故障精确捕获 (CFG_MPU_ENABLE 开关)
+        if crate::config::MPU_ENABLE {
+            crate::mpu::set_thread_guard((*to).guard_addr);
+        }
         (*cur).yielded = false;
         (*to).yielded = false;
         set_current(to);

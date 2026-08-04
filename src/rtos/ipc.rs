@@ -66,6 +66,20 @@ impl Timeout {
     }
 }
 
+/// 断言当前为线程上下文 (阻塞调用入口使用)
+///
+/// 阻塞式等待 (`timeout != Ticks(0)`) 会挂起当前执行流并移交调度器,
+/// 在**中断上下文**调用将挂起被打断的线程, 破坏调度器状态。
+/// `debug_assert!` 使误用仅出现在 debug 构建 (release 零开销),
+/// 但足以在开发期拦截这类内核级 bug。
+#[inline]
+fn assert_thread_context(timeout: Timeout) {
+    debug_assert!(
+        timeout == Timeout::Ticks(0) || !crate::critical_section::in_isr(),
+        "阻塞式 IPC 调用 (超时非 0) 不能在中断上下文使用"
+    );
+}
+
 /// 内核调用错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -193,6 +207,7 @@ impl Semaphore {
     /// **唤醒即获得资源**: `release` 对等待者是"唤醒或计数+1"二选一,
     /// 被唤醒即代表资源已移交, 不得重查计数 (重查必为 0 导致再挂起死锁)。
     pub fn take(&self, timeout: Timeout) -> Result<(), Error> {
+        assert_thread_context(timeout);
         let mut outcome = Ok(());
         let mut blocked = false;
         critical_section::with(|cs| unsafe {
@@ -353,6 +368,7 @@ impl<T: ?Sized> Mutex<T> {
     /// 时执行释放, 并把所有权转移给被唤醒的等待者, 唤醒后不得重查
     /// 持有权。
     pub fn lock(&self, timeout: Timeout) -> Result<MutexGuard<'_, T>, Error> {
+        assert_thread_context(timeout);
         // 初始为 Ok: 阻塞唤醒 (所有权已由 release 转移) 亦属成功路径;
         // 仅立即超时/重复获取置 Err
         let mut outcome = Ok(());
@@ -583,6 +599,7 @@ impl Event {
 
     /// 等待事件 (可超时); 成功返回唤醒时的事件位
     pub fn recv(&self, wanted: u32, opt: EventOpt, timeout: Timeout) -> Result<u32, Error> {
+        assert_thread_context(timeout);
         let mut outcome = Err(Error::TimedOut);
         let mut blocked = false;
         critical_section::with(|cs| unsafe {
@@ -699,6 +716,7 @@ impl<T: Copy> Mailbox<T> {
     }
 
     fn send_impl(&self, msg: T, timeout: Timeout, urgent: bool) -> Result<(), Error> {
+        assert_thread_context(timeout);
         loop {
             let mut outcome = Err(Error::Full);
             let mut need = false;
@@ -745,6 +763,7 @@ impl<T: Copy> Mailbox<T> {
     /// 阻塞等待者被 [`Mailbox::send`] 唤醒后回到循环重新检查
     /// (对齐 RT-Thread 语义), 消息不会滞留。
     pub fn recv(&self, timeout: Timeout) -> Result<T, Error> {
+        assert_thread_context(timeout);
         loop {
             let mut outcome = Err(Error::TimedOut);
             let mut need = false;
@@ -871,6 +890,7 @@ impl MessageQueue {
     }
 
     fn send_impl(&self, buf: &[u8], timeout: Timeout, urgent: bool) -> Result<(), Error> {
+        assert_thread_context(timeout);
         loop {
             let mut outcome = Err(Error::Full);
             let mut need = false;
@@ -928,6 +948,7 @@ impl MessageQueue {
 
     /// 接收消息: 拷贝到 `buf`, 返回实际字节数 (空时按超时阻塞)
     pub fn recv(&self, buf: &mut [u8], timeout: Timeout) -> Result<usize, Error> {
+        assert_thread_context(timeout);
         loop {
         let mut outcome = Err(Error::TimedOut);
         let mut need = false;

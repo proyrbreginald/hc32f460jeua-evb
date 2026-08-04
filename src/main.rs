@@ -14,10 +14,12 @@ mod efm; // 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
 mod heap; // 全局堆分配器 (边界标记 + 首次适配)
 mod icg; // ICG 硬件配置段
 mod intc; // 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
+mod mpu; // 内存保护单元: FLASH 只读 + SRAM/外设 XN + 线程栈守卫
 mod panic;
 mod sram; // 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
 mod startup; // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
 mod vector_table; // 复位/异常/144 外设中断向量表 // panic 与硬件 fault 诊断
+mod wdt; // 硬件看门狗 (WDT): 空闲线程喂狗, 溢出复位
 
 // -- 外设驱动 (寄存器级, 零依赖) --
 mod clk; // 时钟链: XTAL + MPLL → 200MHz, 失败自动回退
@@ -106,6 +108,14 @@ pub(crate) fn main() -> ! {
         intc::Line::new(config::UART_RX_IRQ_CHANNEL as u8),
         config::UART_RX_IRQ_PRIORITY,
     );
+
+    // 硬件看门狗 (CFG_WDT_ENABLE): 立即启动计数, 由空闲线程每节拍喂狗;
+    // 任意线程死循环/死锁 → ~2.7s 后硬件复位
+    if config::WDT_ENABLE {
+        wdt::init(wdt::DEFAULT);
+        wdt::feed(); // 首次喂狗启动计数 (软件启动模式)
+        log_debug!("WDT: 已启动 (溢出 ≈2.7s, 空闲线程喂狗)");
+    }
 
     // 内核启动横幅 (创建线程后、启动前, 就绪统计包含所有线程;
     // 开头先清屏, 使每次启动与上次输出明确分隔)
@@ -496,6 +506,13 @@ fn hardware_init() -> config::ConsoleUart {
         clk::system_clock_hz(),
         config::CLOCK_SOURCE
     );
+
+    // MPU: FLASH 只读 + SRAM/外设 XN + 线程栈守卫 (硬件捕获栈溢出与
+    // 野指针破坏; CFG_MPU_ENABLE 开关, 须在调度器启动前初始化)
+    if config::MPU_ENABLE {
+        mpu::init();
+        log_debug!("MPU: 已使能 (FLASH 只读, SRAM/外设 XN, 线程栈守卫)");
+    }
 
     // GPIO
     let gpio = Gpio::take();

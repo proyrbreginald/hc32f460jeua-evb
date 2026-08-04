@@ -502,58 +502,70 @@ impl<const U: u8> Uart<U> {
 
 /// 接收环形缓冲大小 (字节) (.cargo/config.toml `CFG_UART_RX_BUF_SIZE`)
 pub const RX_BUF_SIZE: usize = crate::config::UART_RX_BUF_SIZE;
+const _: () = assert!(
+    RX_BUF_SIZE.is_power_of_two(),
+    "CFG_UART_RX_BUF_SIZE 须为 2 的幂 (环形索引用掩码)"
+);
 
-/// 接收环形缓冲: ISR (单生产者) 写 head, 应用 (单消费者) 读 tail
+/// 无锁单生产者单消费者 (SPSC) 环形缓冲
+///
+/// 全部字段为原子类型, **无任何 unsafe 代码**: ISR 是唯一写者
+/// (head), 应用是唯一读者 (tail), 单写单读天然无竞争; 内存序
+/// `Release`/`Acquire` 保证"数据先于索引发布"。
+///
+/// - `push` (ISR): 满时丢弃新字节 (与旧实现一致);
+/// - `pop`/`count` (应用): 无临界区, 可安全用于中断接收模式。
 struct RxRing {
-    buf: [u8; RX_BUF_SIZE],
-    head: usize,
-    tail: usize,
+    buf: [core::sync::atomic::AtomicU8; RX_BUF_SIZE],
+    head: core::sync::atomic::AtomicUsize, // 写索引 (仅 ISR 修改)
+    tail: core::sync::atomic::AtomicUsize, // 读索引 (仅应用修改)
 }
 
 impl RxRing {
     const fn new() -> Self {
         Self {
-            buf: [0; RX_BUF_SIZE],
-            head: 0,
-            tail: 0,
+            buf: [const { core::sync::atomic::AtomicU8::new(0) }; RX_BUF_SIZE],
+            head: core::sync::atomic::AtomicUsize::new(0),
+            tail: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    fn push(&mut self, byte: u8) {
-        let next = (self.head + 1) % RX_BUF_SIZE;
-        if next == self.tail {
+    fn push(&self, byte: u8) {
+        use core::sync::atomic::Ordering;
+        let h = self.head.load(Ordering::Relaxed);
+        let next = (h + 1) & (RX_BUF_SIZE - 1);
+        if next == self.tail.load(Ordering::Acquire) {
             return; // 缓冲满: 丢弃新字节
         }
-        self.buf[self.head] = byte;
-        self.head = next;
+        self.buf[h & (RX_BUF_SIZE - 1)].store(byte, Ordering::Relaxed);
+        self.head.store(next, Ordering::Release);
     }
 
-    fn pop(&mut self) -> Option<u8> {
-        if self.head == self.tail {
+    fn pop(&self) -> Option<u8> {
+        use core::sync::atomic::Ordering;
+        let t = self.tail.load(Ordering::Relaxed);
+        if t == self.head.load(Ordering::Acquire) {
             return None;
         }
-        let b = self.buf[self.tail];
-        self.tail = (self.tail + 1) % RX_BUF_SIZE;
+        let b = self.buf[t & (RX_BUF_SIZE - 1)].load(Ordering::Relaxed);
+        self.tail.store((t + 1) & (RX_BUF_SIZE - 1), Ordering::Release);
         Some(b)
     }
 
     fn count(&self) -> usize {
-        (self.head + RX_BUF_SIZE - self.tail) % RX_BUF_SIZE
+        use core::sync::atomic::Ordering;
+        let h = self.head.load(Ordering::Acquire);
+        let t = self.tail.load(Ordering::Relaxed);
+        h.wrapping_sub(t) & (RX_BUF_SIZE - 1)
     }
 }
 
-/// 各 USART 单元的接收环形缓冲容器
-struct RxRingCell(core::cell::UnsafeCell<RxRing>);
-
-// 访问路径: ISR (rx_irq_handler) 与 critical_section 保护的读侧,
-// 无共享引用越权访问, Send/Sync 安全。
-unsafe impl Sync for RxRingCell {}
-
-static RX_RINGS: [RxRingCell; 4] = [
-    RxRingCell(core::cell::UnsafeCell::new(RxRing::new())),
-    RxRingCell(core::cell::UnsafeCell::new(RxRing::new())),
-    RxRingCell(core::cell::UnsafeCell::new(RxRing::new())),
-    RxRingCell(core::cell::UnsafeCell::new(RxRing::new())),
+/// 各 USART 单元的接收环形缓冲容器 (纯原子, 自动 Sync, 无 unsafe impl)
+static RX_RINGS: [RxRing; 4] = [
+    RxRing::new(),
+    RxRing::new(),
+    RxRing::new(),
+    RxRing::new(),
 ];
 
 /// 各 USART 单元的"数据到达"信号量 (ISR 释放, 应用侧等待)
@@ -604,7 +616,7 @@ unsafe extern "C" fn rx_irq_handler<const U: u8>() {
         if sr & (SR_RXNE | SR_PE | SR_FE | SR_ORE) != 0 {
             // 读 RDR: 清 RXNE/ORE, 同时取出数据 (对齐示例先读再判错)
             let byte = core::ptr::read_volatile((base + 0x06) as *const u16) as u8;
-            let ring = &mut *RX_RINGS[U as usize - 1].0.get();
+            let ring = &RX_RINGS[U as usize - 1];
             let errors = &RX_ERRORS[U as usize - 1];
             if sr & SR_RXNE != 0 {
                 ring.push(byte);
@@ -668,14 +680,15 @@ impl<const U: u8> Uart<U> {
 }
 
 impl<const U: u8> Uart<U> {
-    /// 环形缓冲中待读取的字节数
+    /// 环形缓冲中待读取的字节数 (原子读取, 无临界区)
     pub fn rx_count(&self) -> usize {
-        crate::critical_section::with(|_| unsafe { (*RX_RINGS[U as usize - 1].0.get()).count() })
+        RX_RINGS[U as usize - 1].count()
     }
 
-    /// 从环形缓冲非阻塞读取一个字节 (中断接收模式下使用)
+    /// 从环形缓冲非阻塞读取一个字节 (中断接收模式下使用; 原子操作,
+    /// 单消费者, 无临界区)
     pub fn read_rx(&self) -> Option<u8> {
-        crate::critical_section::with(|_| unsafe { (*RX_RINGS[U as usize - 1].0.get()).pop() })
+        RX_RINGS[U as usize - 1].pop()
     }
 
     /// 从环形缓冲读取多个字节到 `buf`, 返回读取数量 (非阻塞)

@@ -469,13 +469,15 @@ fn cmd_uptime(_rest: &str) -> CmdResult {
 /// 线程列表 (仿 ps)
 fn cmd_ps(_rest: &str) -> CmdResult {
     let list = crate::rtos::thread_info_list();
-    println!("NAME                 PRIO  STATE   (count={})", list.len());
+    println!("NAME                 PRIO  STATE    STACK (used/total)  (count={})", list.len());
     for t in list {
         println!(
-            "{:<20} {:>4}  {}",
+            "{:<20} {:>4}  {:<8} {:>6}/{:<6}",
             t.name,
             t.priority,
-            crate::rtos::thread_state_name(t.state)
+            crate::rtos::thread_state_name(t.state),
+            t.stack_used,
+            t.stack_size
         );
     }
     CmdResult::Ok

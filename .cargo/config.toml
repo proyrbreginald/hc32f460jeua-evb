@@ -92,6 +92,12 @@ CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出
 # [rtc] 实时时钟 (LRC 源), 同时作为日志时间戳 (天:时:分:秒)
 CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
 
+# [wdt] 硬件看门狗 (空闲线程喂狗, 溢出约 2.7s 复位; 调试期建议关闭)
+CFG_WDT_ENABLE = "false"
+
+# [mpu] 内存保护单元 (FLASH 只读 + SRAM/外设 XN + 线程栈守卫, 默认开启)
+CFG_MPU_ENABLE = "true"
+
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
 # 是否启用内核自检 (true/false); 启用后通过 shell 命令 `selftest` 手动启动,
 # 不再开机自动运行; false 时命令提示未启用
@@ -100,7 +106,7 @@ CFG_APP_SHELL_STACK = "8192"     # 自检在 shell 线程内同步执行, 需更
 CFG_APP_SHELL_PRIORITY = "1"
 CFG_APP_SHELL_TIMESLICE = "10"
 CFG_APP_TIMER_PERIOD_MS = "2000"
-CFG_APP_LED_STACK = "4096"
+CFG_APP_LED_STACK = "1024"
 CFG_APP_LED_PRIORITY = "2"
 CFG_APP_LED_TIMESLICE = "10"
 CFG_APP_LED_BLINK_MS = "500"

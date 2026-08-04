@@ -34,9 +34,18 @@ pub(crate) fn create_idle() {
     );
 }
 
-/// 空闲线程主循环: 回收僵尸线程 → 让出 CPU → 等待中断
+/// 空闲线程主循环: 栈溢出巡检 → 喂狗 → 回收僵尸线程 → 让出 CPU
 extern "C" fn idle_entry(_param: usize) {
     loop {
+        // 栈溢出巡检: 任一线程栈底 canary 被破坏即 panic
+        // (panic 处理器按 STRATEGY 停机或复位, 见 panic 模块)
+        if let Some(name) = crate::rtos::thread::check_stack_canaries() {
+            panic!("线程栈溢出: {}", name);
+        }
+        // 看门狗喂狗 (CFG_WDT_ENABLE 编译期开关, false 时整段消除)
+        if crate::config::WDT_ENABLE {
+            crate::wdt::feed();
+        }
         defunct_execute();
         sched::schedule();
         // 无更紧急线程时进入低功耗等待 (SysTick 等中断唤醒)
