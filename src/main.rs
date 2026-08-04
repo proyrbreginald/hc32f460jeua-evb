@@ -526,6 +526,7 @@ fn hardware_init() -> config::ConsoleUart {
         parity: config::UART_PARITY,
         stop_bits: config::UART_STOP_BITS,
         first_bit: config::UART_FIRST_BIT,
+        start_bit_polarity: config::UART_START_POLARITY,
         flow_control: config::UART_FLOW_CTRL,
         noise_filter: config::UART_NOISE_FILTER,
     })

@@ -114,6 +114,15 @@ pub const XTAL_DRV: u32 = if eq_str(env!("CFG_XTAL_DRV"), "ulow") {
 } else {
     panic!("CFG_XTAL_DRV 非法 (可用 ulow/low/mid/high)")
 };
+/// XTAL 超强驱动 (CFG_XTAL_SUPDRV = true/false, XTALCFGR.SUPDRV;
+/// 对齐 DDL CLK_XTAL_SUPDRV_ON, 评估板默认开启)
+pub const XTAL_SUPDRV: bool = if eq_str(env!("CFG_XTAL_SUPDRV"), "true") {
+    true
+} else if eq_str(env!("CFG_XTAL_SUPDRV"), "false") {
+    false
+} else {
+    panic!("CFG_XTAL_SUPDRV 非法 (可用 true/false)")
+};
 /// HRC 频率 (MHz) (CFG_HRC_FREQ = 16/20)
 ///
 /// 写入 flash 0x404 的 ICG1 配置字 (bit0 = HRCFREQSEL, 0=20MHz/1=16MHz),
@@ -271,6 +280,15 @@ pub const UART_FIRST_BIT: uart::FirstBit = if eq_str(env!("CFG_UART_FIRST_BIT"),
 } else {
     panic!("CFG_UART_FIRST_BIT 非法 (可用 lsb/msb)")
 };
+/// 起始位检测极性 (CFG_UART_START_POLARITY = falling/low; DDL 默认下降沿)
+pub const UART_START_POLARITY: uart::StartBitPolarity =
+    if eq_str(env!("CFG_UART_START_POLARITY"), "falling") {
+        uart::StartBitPolarity::Falling
+    } else if eq_str(env!("CFG_UART_START_POLARITY"), "low") {
+        uart::StartBitPolarity::Low
+    } else {
+        panic!("CFG_UART_START_POLARITY 非法 (可用 falling/low)")
+    };
 /// 硬件流控 (CFG_UART_FLOW_CTRL = none/cts; RTS 为 F460 默认行为)
 pub const UART_FLOW_CTRL: uart::FlowControl = if eq_str(env!("CFG_UART_FLOW_CTRL"), "none") {
     uart::FlowControl::None

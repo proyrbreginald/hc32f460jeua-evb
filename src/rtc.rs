@@ -60,7 +60,7 @@ const ERRCRL: usize = 0x3C;
 const CR0_RESET: u8 = 1 << 0; // 软件复位 (写 1 复位, 需等待清零)
 const CR1_PRDS: u8 = 0x07; // 周期中断节拍
 const CR1_AMPM: u8 = 1 << 3; // 1 = 24 小时制
-const CR1_ALMFCLR: u8 = 1 << 4; // 写 1 清闹钟标志
+const CR1_ALMFCLR: u8 = 1 << 4; // 闹钟标志清除 (写 0 清除, 自动回 1; 对齐 DDL)
 const CR1_START: u8 = 1 << 7; // 1 = 启动计数
 const CR2_RWREQ: u8 = 1 << 0; // RW 模式请求
 const CR2_RWEN: u8 = 1 << 1; // RW 模式使能 (硬件应答)
@@ -207,12 +207,15 @@ pub fn init(cfg: Config) {
         ClockSource::Xtal32 => 0,
     };
     write8(CR3, cr3);
-    // CR1: 小时制 + 周期节拍 (START 保持 0)
+    // CR1: 小时制 + 周期节拍 (START 保持 0; 读-改-写保留
+    // ONEHZOE/ONEHZSEL/ALMFCLR, 对齐 DDL RTC_Init 的 MODIFY)
     let amp = match cfg.hour_format {
         HourFormat::H24 => CR1_AMPM,
         HourFormat::H12 => 0,
     };
-    write8(CR1, amp | (cfg.int_period as u8));
+    modify8(CR1, |v| {
+        (v & !(CR1_PRDS | CR1_AMPM)) | amp | (cfg.int_period as u8)
+    });
 }
 
 /// 软件复位 (对齐 DDL `RTC_DeInit`)
@@ -259,16 +262,20 @@ pub fn running() -> bool {
 // ============================== RW 模式 ==============================
 
 /// 进入读写模式 (CR2.RWREQ → 等 RWEN; 对齐 DDL `RTC_EnterRwMode`)
+///
+/// 注意: 以**读-改-写**置 RWREQ 并写 1 清 ALMF 标志 —— 完整写入会
+/// 清掉 CR2 的 PRDIE/ALMIE/ALME 中断配置 (DDL 用 SET_REG8_BIT)。
 fn enter_rw() {
     if read8(CR1) & CR1_START != 0 && read8(CR2) & CR2_RWEN == 0 {
-        write8(CR2, CR2_RWREQ | CR2_ALMF);
+        modify8(CR2, |v| v | CR2_RWREQ | CR2_ALMF);
         wait_rw_en();
     }
 }
 
-/// 退出读写模式 (清 RWREQ, 等 RWEN 清 0; 对齐 DDL `RTC_ExitRwMode`)
+/// 退出读写模式 (清 RWREQ 并写 1 清闹钟标志, 等 RWEN 清 0;
+/// 对齐 DDL `RTC_ExitRwMode` 的 MODIFY(CR2, RWREQ|ALMF, ~RWREQ))
 fn exit_rw() {
-    modify8(CR2, |v| v & !CR2_RWREQ);
+    modify8(CR2, |v| (v & !CR2_RWREQ) | CR2_ALMF);
     for _ in 0..wait_timeout() {
         if read8(CR2) & CR2_RWEN == 0 {
             break;
@@ -308,7 +315,9 @@ pub fn set_time(t: Time) {
 /// 读取时间 (对齐 DDL `RTC_GetTime`)
 pub fn get_time() -> Time {
     enter_rw();
-    let hour = bcd2dec(read8(HOUR) & 0x3F);
+    // 掩 0x1F: 清除 12H 制 PM 位 (bit5), 否则 bcd2dec 会把 PM 位算进数值
+    // (对齐 DDL 的 CLR_REG8_BIT(HOUR, RTC_HOUR_12H_PM))
+    let hour = bcd2dec(read8(HOUR) & 0x1F);
     let pm = read8(HOUR) & HOUR_12H_PM != 0;
     let minute = bcd2dec(read8(MIN));
     let second = bcd2dec(read8(SEC));
@@ -369,7 +378,7 @@ pub fn set_alarm(a: Alarm) {
 /// 读取闹钟
 pub fn get_alarm() -> Alarm {
     Alarm {
-        hour: bcd2dec(read8(ALMHOUR) & 0x3F),
+        hour: bcd2dec(read8(ALMHOUR) & 0x1F), // 掩 0x1F: 清除 12H 制 PM 位
         minute: bcd2dec(read8(ALMMIN)),
         weekday_mask: read8(ALMWEEK) & 0x7F,
         pm: read8(ALMHOUR) & HOUR_12H_PM != 0,
@@ -385,10 +394,19 @@ pub fn alarm_enable(enable: bool) {
 }
 
 /// 周期/闹钟中断使能 (CR2.PRDIE/ALMIE, 对齐 DDL `RTC_IntCmd`)
+///
+/// 使能中断的同时写 1 清 ALMF (对齐 DDL 的 `u32IntTemp | FLAG_MASK`
+/// 写入), 避免使能瞬间残留的闹钟标志立即触发中断。
 pub fn int_enable(period: bool, alarm: bool) {
     modify8(CR2, |v| {
         let v = if period { v | CR2_PRDIE } else { v & !CR2_PRDIE };
-        if alarm { v | CR2_ALMIE } else { v & !CR2_ALMIE }
+        let v = if alarm { v | CR2_ALMIE } else { v & !CR2_ALMIE };
+        // 任一中断使能时顺带清闹钟标志 (写 1 清除, 对齐 DDL)
+        if period || alarm {
+            v | CR2_ALMF
+        } else {
+            v
+        }
     });
 }
 
@@ -398,8 +416,12 @@ pub fn alarm_flag() -> bool {
 }
 
 /// 清除闹钟标志 (CR1.ALMFCLR)
+///
+/// ALMFCLR 为**写 0 清除、自动回 1** 的硬件标志位 (对齐 DDL
+/// `RTC_ClearStatus` 的 CLR_REG8_BIT(CR1, ALMFCLR); 与 CR2.ALMF
+/// 的写 1 清除是两套机制)。
 pub fn clear_alarm_flag() {
-    write8(CR1, read8(CR1) | CR1_ALMFCLR);
+    modify8(CR1, |v| v & !CR1_ALMFCLR);
 }
 
 // ============================== 运行时长 (日志时间戳) ==============================

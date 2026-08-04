@@ -33,7 +33,8 @@
 //!
 //! [`UartConfig`] 支持: 波特率 / 过采样 (8·16) / 时钟预分频 (1·4·16·64) /
 //! 数据位 (8·9) / 校验 (无·偶·奇) / 停止位 (1·2) / 首字节 (LSB·MSB) /
-//! CTS 流控 / 噪声滤波。默认 115200 8N1。
+//! 起始位极性 (低电平·下降沿) / CTS 流控 / 噪声滤波。默认 115200 8N1
+//! (起始位下降沿检测, 对齐 DDL USART_UART_StructInit)。
 //!
 //! # 波特率 (UART 模式, 8 位过采样)
 //!
@@ -115,6 +116,7 @@ const CR1_OVER8: u32 = 1 << 15; // 8 位过采样
 const CR1_ML: u32 = 1 << 28; // 先发 MSB
 const CR1_FBME: u32 = 1 << 29; // 小数波特率使能
 const CR1_NFE: u32 = 1 << 30; // 噪声滤波 (RX 三取二采样)
+const CR1_SBS: u32 = 1 << 31; // 起始位极性: 0=低电平, 1=下降沿
 
 /// CR2 位
 const CR2_STOP: u32 = 1 << 13; // 停止位: 0=1, 1=2
@@ -207,12 +209,25 @@ pub enum FirstBit {
     Msb,
 }
 
+/// 起始位检测极性 (CR1.SBS, 对齐 DDL USART_START_BIT_POLARITY_*)
+///
+/// DDL `USART_UART_StructInit` 默认 USART_START_BIT_FALLING (下降沿)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartBitPolarity {
+    /// 低电平检测 (SBS=0)
+    Low,
+    /// 下降沿检测 (SBS=1, DDL 默认)
+    Falling,
+}
+
 /// 硬件流控 (CR3.CTSE, 对齐 DDL USART_HW_FLOWCTRL_*)
 ///
-/// 注: F460 的 RTS 为默认行为 (无独立使能位), 仅 CTS 可配置。
+/// 注: DDL 的 RTS 模式即"CTSE 关闭" (USART_SetHWFlowControl 的 else 分支
+/// 仅清 CTSE), 无额外 RTS 使能位写入 —— 与 F460 的默认 RTS 行为等价,
+/// 因此本模块仅区分 None/Cts。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowControl {
-    /// 无硬件流控
+    /// 无硬件流控 (RTS 输出为默认行为, 对齐 DDL USART_HW_FLOWCTRL_RTS)
     None,
     /// CTS 输入流控 (对端拉低即暂停发送)
     Cts,
@@ -235,6 +250,8 @@ pub struct UartConfig {
     pub stop_bits: StopBits,
     /// 发送顺序 (LSB/MSB)
     pub first_bit: FirstBit,
+    /// 起始位检测极性 (DDL 默认下降沿)
+    pub start_bit_polarity: StartBitPolarity,
     /// 硬件流控 (CTS; RTS 为 F460 默认行为)
     pub flow_control: FlowControl,
     /// 噪声滤波 (CR1.NFE, 三取二采样)
@@ -251,6 +268,7 @@ impl Default for UartConfig {
             parity: Parity::None,
             stop_bits: StopBits::One,
             first_bit: FirstBit::Lsb,
+            start_bit_polarity: StartBitPolarity::Falling,
             flow_control: FlowControl::None,
             noise_filter: false,
         }
@@ -355,8 +373,7 @@ impl<const U: u8> Uart<U> {
         let (div_int, div_frac, fbme) = calc_brr(usart_clk, config.baudrate, config.oversample)?;
 
         // 3. CR1: 过采样 / 数据位 / 校验 / 噪声滤波 / 首字节 / 起始位极性
-        //    (对齐 DDL USART_UART_Init: OVER8/M/PCE/PS/NFE/ML/SBS,
-        //    起始位极性取默认低电平 SBS=0)
+        //    (对齐 DDL USART_UART_Init: OVER8/M/PCE/PS/NFE/ML/SBS)
         let mut cr1 = 0u32;
         if config.oversample == Oversample::Eight {
             cr1 |= CR1_OVER8;
@@ -374,6 +391,9 @@ impl<const U: u8> Uart<U> {
         }
         if config.first_bit == FirstBit::Msb {
             cr1 |= CR1_ML;
+        }
+        if config.start_bit_polarity == StartBitPolarity::Falling {
+            cr1 |= CR1_SBS;
         }
         self.cr1().write(cr1);
 

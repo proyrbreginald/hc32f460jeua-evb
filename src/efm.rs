@@ -13,6 +13,9 @@
 //! - **BUSHLDCTL=0 (bus hold)**: 擦写期间总线被占用, CPU 取指/中断响应
 //!   自动 stall, 直到操作完成 —— 从 Flash 运行也可安全执行扇区擦除/
 //!   单字编程 (执行代码所在扇区未被擦除);
+//! - **缓存**: 擦/写操作自动保存并关闭 CACHE (对齐 DDL), 完成后恢复;
+//!   200MHz 运行时建议经 [`enable_cache`] 开启缓存 (由 clk 模块在
+//!   切换到 PLL 后调用, 对齐 BSP_CLK_Init);
 //! - **全片擦除/序列编程会擦除执行代码所在 Flash, 必须从 RAM 运行**
 //!   (DDL 标记 `__RAM_FUNC`), 本模块不提供, 需要时请自建 RAM 函数;
 //! - 操作不关中断: bus hold 期间中断挂起, 操作结束后按优先级响应。
@@ -46,12 +49,18 @@ const EFM_BASE: usize = 0x4001_0400;
 // ---- 寄存器偏移 (SVD/DDL 逐项核对) ----
 const FAPRT: usize = 0x00; // 写保护键 (0x0123→0x3210 解锁, 读回 1 = 已解锁; 0x0000 锁定)
 const FSTP: usize = 0x04; // Flash 停止 (bit0, 1=停止)
-const FRMC: usize = 0x08; // FLWT[7:4] 读等待, CACHE[16]
+const FRMC: usize = 0x08; // FLWT[7:4] 读等待, CACHE[16] 数据/指令缓存, CRST[24] 缓存 RAM 复位
 const FWMC: usize = 0x0C; // PEMODE[0] 寄存器可写, PEMOD[6:4] 操作模式, BUSHLDCTL[8]
 const FSR: usize = 0x10; // 状态
 const FSCLR: usize = 0x14; // 状态清除 (写 1)
 const FSWP: usize = 0x1C; // swap 状态
 const UQID0: usize = 0x50; // 唯一 ID (3 × 32bit)
+
+// ---- FRMC ----
+const FRMC_CACHE: u32 = 1 << 16; // 数据/指令缓存使能 (对齐 EFM_FRMC_CACHE)
+const FRMC_CRST: u32 = 1 << 24; // 缓存 RAM 复位 (写 1 复位, 对齐 EFM_FRMC_CRST)
+/// 缓存相关位 (对齐 DDL `EFM_CACHE_ALL` = CRST | CACHE)
+const FRMC_CACHE_ALL: u32 = FRMC_CACHE | FRMC_CRST;
 
 // ---- FSR 位 ----
 const FSR_PEWERR: u32 = 1 << 0; // 编程/擦除错误
@@ -189,6 +198,61 @@ fn set_op_mode(mode: OpMode) {
     }
 }
 
+/// 关闭缓存并返回原缓存位状态 (对齐 DDL 擦/写前的 CACHE 处理)
+///
+/// 擦写期间必须关闭数据/指令缓存: 缓存可能命中旧数据, 且缓存 RAM
+/// 内容在编程后失效。返回值为 FRMC 的 CRST|CACHE 原值, 供
+/// [`restore_cache`] 恢复。
+fn disable_cache() -> u32 {
+    unsafe {
+        let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile(
+            (EFM_BASE + FRMC) as *mut u32,
+            v & !FRMC_CACHE_ALL,
+        );
+        v & FRMC_CACHE_ALL
+    }
+}
+
+/// 恢复缓存位 (写回 [`disable_cache`] 的返回值, 对齐 DDL 擦/写后的恢复)
+fn restore_cache(saved: u32) {
+    unsafe {
+        let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile(
+            (EFM_BASE + FRMC) as *mut u32,
+            (v & !FRMC_CACHE_ALL) | saved,
+        );
+    }
+}
+
+/// 使能 Flash 数据/指令缓存 (对齐 DDL BSP_CLK_Init: CacheRamReset 先复位
+/// 缓存 RAM, 再使能 CACHE)。由 [`crate::clk::switch_to_pll`] 在切换
+/// 200MHz 系统时钟后调用。
+pub fn enable_cache() {
+    unlock();
+    unsafe {
+        // 复位缓存 RAM (置位后清除, 对齐 EFM_CacheRamReset(ENABLE/DISABLE))
+        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, frmc | FRMC_CRST);
+        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, frmc & !FRMC_CRST);
+        // 使能缓存
+        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, frmc | FRMC_CACHE);
+    }
+    lock();
+}
+
+/// 失能 Flash 数据/指令缓存 (FRMC.CACHE 清位, 对齐 DDL `EFM_CacheCmd`)
+pub fn disable_cache_cmd() {
+    unlock();
+    unsafe {
+        let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, v & !FRMC_CACHE);
+    }
+    lock();
+}
+
 /// 等待操作结束: RDY 置位 → OPTEND 置位并清除 (对齐 DDL `EFM_WaitEnd`)
 fn wait_end(timeout: u32) -> Result<(), EfmError> {
     let mut i = 0u32;
@@ -250,6 +314,8 @@ pub fn sector_erase(addr: u32) -> Result<(), EfmError> {
     unlock();
     enable_program_mode();
     clear_status(FSR_ERRORS | FSR_OPTEND);
+    // 关闭缓存 (对齐 DDL EFM_SectorErase: 擦除前保存并清除 CACHE)
+    let cache = disable_cache();
     set_op_mode(OpMode::SectorErase);
 
     // 触发: 向目标地址写 0 (擦除 = 全 1, 任意值均可, DDL 用 0)
@@ -260,6 +326,7 @@ pub fn sector_erase(addr: u32) -> Result<(), EfmError> {
     };
 
     set_op_mode(OpMode::ReadOnly);
+    restore_cache(cache);
     disable_program_mode();
     lock();
     result?;
@@ -284,6 +351,8 @@ pub fn program(addr: u32, data: &[u8]) -> Result<(), EfmError> {
     unlock();
     enable_program_mode();
     clear_status(FSR_ERRORS | FSR_OPTEND);
+    // 关闭缓存 (对齐 DDL EFM_Program: 编程前保存并清除 CACHE)
+    let cache = disable_cache();
     set_op_mode(OpMode::Program);
 
     let mut result = Ok(());
@@ -305,6 +374,7 @@ pub fn program(addr: u32, data: &[u8]) -> Result<(), EfmError> {
     }
 
     set_op_mode(OpMode::ReadOnly);
+    restore_cache(cache);
     disable_program_mode();
     lock();
     result?;

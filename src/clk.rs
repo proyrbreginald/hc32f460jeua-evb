@@ -25,6 +25,11 @@
 //! **PLL 源 (XTAL 或 HRC) 由 `CFG_PLL_SRC` 决定**, 无晶振的板子
 //! 可配 HRC 源 (16/20MHz × 倍频)。
 //!
+//! 与 DDL 对齐的硬件细节: XTAL 起振写入含超强驱动位 (SUPDRV, 见
+//! `CFG_XTAL_SUPDRV`); 系统时钟源在 **PLL 与其他源之间切换**时,
+//! CKSWR/SCFGR 写入窗口关闭全部外设时钟 (FCG0~3 备份/恢复);
+//! 切到 PLL 后使能 Flash 缓存 (对齐 BSP_CLK_Init)。
+//!
 //! 各外设通过 [`system_clock_hz`] / [`hclk_hz`] / [`pclk1_hz`] 等查询
 //! 实际频率 (systick/uart 模块已接入); 频率测量可用 [`mco1_config`]
 //! 把时钟输出到 PA8。
@@ -106,9 +111,7 @@ const XTALSTBCR_XTALSTB_MASK: u32 = 0x0F; // 稳定时间选择
 
 /// XTALCFGR 位
 const XTALCFGR_XTALDRV_POS: u32 = 4; // [5:4] 驱动能力
-const XTALCFGR_SUPDRV: u32 = 1 << 7; // 超强驱动
-
-/// SCFGR 位
+const XTALCFGR_SUPDRV: u32 = 1 << 7; // 超强驱动/// SCFGR 位
 const SCFGR_PCLK0S_POS: u32 = 0; // [2:0] PCLK0 分频
 const SCFGR_PCLK1S_POS: u32 = 4; // [6:4] PCLK1 分频
 const SCFGR_PCLK2S_POS: u32 = 8; // [10:8] PCLK2 分频
@@ -141,8 +144,33 @@ const XTAL_STABLE_TIME: u32 = crate::config::XTAL_STABLE_TIME;
 /// 驱动能力编码 (0=HIGH, 1=MID, 2=LOW, 3=ULOW), 来自配置 CFG_XTAL_DRV
 /// (对齐 DDL CLK_XTAL_DRV_*; ULOW 典型 4~8MHz 晶振)
 const XTAL_DRV: u32 = crate::config::XTAL_DRV << XTALCFGR_XTALDRV_POS;
+/// 超强驱动使能 (XTALCFGR.SUPDRV), 来自配置 CFG_XTAL_SUPDRV
+/// (对齐 DDL CLK_XTAL_SUPDRV_ON; 评估板默认开启, 对齐 BSP_CLK_Init)
+const XTAL_SUPDRV: u32 = if crate::config::XTAL_SUPDRV {
+    XTALCFGR_SUPDRV
+} else {
+    0
+};
 /// 振荡模式 (对齐 DDL CLK_XTAL_MD_OSC)
 const XTAL_MODE_OSC: u32 = 0x00;
+
+// ---- FCG 时钟门控 (PWC 空间) ----
+/// PWC.FCGR0~3 偏移 (0x00~0x0C; 清位 = 使能, 复位默认值 = 全关闭)
+const PWC_FCG0: usize = 0x00;
+const PWC_FCG1: usize = 0x04;
+const PWC_FCG2: usize = 0x08;
+const PWC_FCG3: usize = 0x0C;
+/// PWC.FCGR0PC 偏移: PRT0=1 解除 FCG0 写保护 (键 0xA5A5, 对齐 DDL
+/// PWC_FCG0_REG_UNLOCK_KEY / LOCK_KEY)
+const PWC_FCG0PC: usize = 0x10;
+const FCG0PC_UNLOCK: u32 = 0xA5A5_0001;
+const FCG0PC_LOCK: u32 = 0xA5A5_0000;
+/// FCG 关闭值 (对齐 DDL CLK_FCG0~3_DEFAULT = 复位默认: FCG0 保留 SRAM
+/// 位, FCG1~3 全关闭)
+const FCG0_DEFAULT: u32 = 0xFFFF_FAEE;
+const FCG1_DEFAULT: u32 = 0xFFFF_FFFF;
+const FCG2_DEFAULT: u32 = 0xFFFF_FFFF;
+const FCG3_DEFAULT: u32 = 0xFFFF_FFFF;
 
 /// 系统时钟方案 (由 [`init`] 按配置统一编排)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -336,6 +364,11 @@ pub fn pll_init(cfg: PllConfig) -> Result<(), ClkError> {
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1)、
 /// GPIO 读等待 (PCCR.RDWT) 并切换到高性能电源模式 (200MHz 必需),
 /// 顺序不可颠倒 (高时钟下取指/栈/IO 采样必须先行满足时序)。
+///
+/// CKSWR 写入期间按 DDL `SetSysClockSrc` 要求 **关闭全部外设时钟
+/// (FCG0~3) 再恢复** —— 系统时钟源在 PLL 与其他源之间切换时, 外设
+/// 时钟必须在切换窗口内保持关闭 (硬件要求, 防止切换毛刺损坏外设
+/// 状态); 切换完成后使能 Flash 缓存 (对齐 BSP_CLK_Init)。
 pub fn switch_to_pll() {
     // 目标频率 = 已配置 PLLCFGR 的实际输出 (运行时计算)
     let target = pll_hz();
@@ -347,14 +380,62 @@ pub fn switch_to_pll() {
     // 高性能电源模式 (200MHz 必需)
     pwc_high_performance();
 
+    // CKSWR 切换窗口: 关闭 FCG0~3 (备份), 切换, 恢复
+    let fcg = fcg_close();
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_PLL);
     delay_short();
     cmu_lock();
+    fcg_restore(fcg);
+    // 使能 Flash 缓存 (对齐 BSP_CLK_Init: CacheRamReset + CacheCmd)
+    crate::efm::enable_cache();
     // 仅当 PLL 源为 XTAL 时报告晶振激活 (HRC 源时 XTAL 未启动)
     if pll_src_is_xtal() {
         XTAL_STATUS.store(STATUS_ACTIVE, Ordering::Relaxed);
     }
+}
+
+/// 备份并关闭全部外设时钟 (FCG0~3), 返回备份值 (对齐 DDL `SetSysClockSrc`
+/// 的 FCG 关闭段)
+///
+/// FCG0 的写入受 FCG0PC.PRT0 保护 (复位默认 0 = 受保护, 写被忽略),
+/// 关闭前需以键 0xA5A5 置 PRT0=1 (对齐 DDL PWC_FCG0_REG_Unlock);
+/// 恢复时 [`fcg_restore`] 会恢复 PRT0 为受保护态。
+fn fcg_close() -> [u32; 4] {
+    let saved = unsafe {
+        // 解除 FCG0 写保护 (PRT0=1)
+        core::ptr::write_volatile((PWC_BASE + PWC_FCG0PC) as *mut u32, FCG0PC_UNLOCK);
+        let saved = [
+            read32(PWC_BASE + PWC_FCG0),
+            read32(PWC_BASE + PWC_FCG1),
+            read32(PWC_BASE + PWC_FCG2),
+            read32(PWC_BASE + PWC_FCG3),
+        ];
+        write32(PWC_BASE + PWC_FCG0, FCG0_DEFAULT);
+        write32(PWC_BASE + PWC_FCG1, FCG1_DEFAULT);
+        write32(PWC_BASE + PWC_FCG2, FCG2_DEFAULT);
+        write32(PWC_BASE + PWC_FCG3, FCG3_DEFAULT);
+        saved
+    };
+    // 等待外设时钟关闭稳定 (对齐 DDL CLK_SYSCLK_SW_STB = 30µs)
+    delay_short();
+    delay_short();
+    saved
+}
+
+/// 恢复外设时钟并恢复 FCG0 写保护 (对齐 DDL `SetSysClockSrc` 的 FCG 恢复段)
+fn fcg_restore(saved: [u32; 4]) {
+    unsafe {
+        write32(PWC_BASE + PWC_FCG0, saved[0]);
+        write32(PWC_BASE + PWC_FCG1, saved[1]);
+        write32(PWC_BASE + PWC_FCG2, saved[2]);
+        write32(PWC_BASE + PWC_FCG3, saved[3]);
+        // 恢复 FCG0 写保护 (PRT0=0, 复位默认态)
+        core::ptr::write_volatile((PWC_BASE + PWC_FCG0PC) as *mut u32, FCG0PC_LOCK);
+    }
+    // 等待外设时钟恢复稳定
+    delay_short();
+    delay_short();
 }
 
 /// 总线时钟分频配置 (SCFGR), 分频系数来自 .cargo/config.toml `CFG_DIV_*`:
@@ -373,7 +454,9 @@ pub fn switch_to_pll() {
 /// UART/定时器等外设全部失效。
 ///
 /// 调用时机: PLL 启动后、CKSWR 切换前 (此时非 PLL 时钟源, 无需 FCG
-/// 备份, 对齐 DDL SetSysClockDiv 的 PLL 分支条件)。
+/// 备份, 对齐 DDL SetSysClockDiv 的 PLL 分支条件)。若在系统时钟已为
+/// PLL 时再次调用 (运行时重配), 按 DDL 语义在 SCFGR 写入窗口关闭
+/// 外设时钟。
 pub fn set_bus_clock_div() {
     let scfgr = (div_code(crate::config::DIV_PCLK0) << SCFGR_PCLK0S_POS) // PCLK0
         | (div_code(crate::config::DIV_PCLK1) << SCFGR_PCLK1S_POS) // PCLK1
@@ -383,10 +466,26 @@ pub fn set_bus_clock_div() {
         | (div_code(crate::config::DIV_EXCLK) << SCFGR_EXCKS_POS) // EXCLK
         | (div_code(crate::config::DIV_HCLK) << SCFGR_HCLKS_POS); // HCLK
 
+    // 当前系统时钟为 PLL 时, SCFGR 写入窗口需关闭外设时钟 (DDL
+    // SetSysClockDiv 的 PLL 分支条件); 启动流程中调用时 (非 PLL) 为
+    // 空操作, 零开销。
+    let fcg = if system_clk_is_pll() {
+        Some(fcg_close())
+    } else {
+        None
+    };
     cmu_unlock();
     write32(CMU_BASE + CMU_SCFGR, scfgr);
     delay_short(); // 对齐 DDL CLK_SYSCLK_SW_STB
     cmu_lock();
+    if let Some(saved) = fcg {
+        fcg_restore(saved);
+    }
+}
+
+/// 当前系统时钟源是否为 MPLL (CKSWR 实时查询)
+fn system_clk_is_pll() -> bool {
+    read8(CMU_BASE + CMU_CKSWR) & 0x7 == CLK_SRC_PLL
 }
 
 /// GPIO 读等待周期: 126~200MHz 输入采样需要 3 个等待周期
@@ -485,8 +584,9 @@ pub fn xtal_init() -> Result<(), ClkError> {
 
     // 3. 稳定时间 (必须 ≥ 晶振厂商要求)
     write8(CMU_BASE + CMU_XTALSTBCR, XTAL_STABLE_TIME);
-    // 4. 驱动能力/模式
-    write8(CMU_BASE + CMU_XTALCFGR, XTAL_DRV | XTAL_MODE_OSC);
+    // 4. 驱动能力/超强驱动/模式 (对齐 DDL CLK_XtalInit 的
+    //    (u8SuperDrv | u8Drv | u8Mode) 写入)
+    write8(CMU_BASE + CMU_XTALCFGR, XTAL_DRV | XTAL_SUPDRV | XTAL_MODE_OSC);
     // 5. 启动晶振 (XTALSTP=0)
     write8(CMU_BASE + CMU_XTALCR, 0);
 
@@ -540,27 +640,48 @@ pub fn xtal_cmd(enable: bool) -> Result<(), ClkError> {
 ///
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1),
 /// 顺序不可颠倒 (高时钟下取指/栈操作必须先满足时序)。
+///
+/// 从 PLL 切换回来时按 DDL `SetSysClockSrc` 要求关闭外设时钟
+/// (当前或目标源为 PLL 时, 切换窗口内 FCG 必须关闭)。
 pub fn switch_to_hrc() {
     crate::efm::set_wait_cycle(hrc_hz());
     crate::sram::set_wait_cycles(hrc_hz());
+    let fcg = if system_clk_is_pll() {
+        Some(fcg_close())
+    } else {
+        None
+    };
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_HRC);
     delay_short();
     cmu_lock();
+    if let Some(saved) = fcg {
+        fcg_restore(saved);
+    }
 }
 
 /// 切换系统时钟源到外部晶振
 ///
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1):
 /// 高时钟下若等待周期不足, 切换瞬间取指/栈操作即出错, 顺序不可颠倒。
+///
+/// 从 PLL 切换回来时按 DDL `SetSysClockSrc` 要求关闭外设时钟。
 pub fn switch_to_xtal() {
     crate::efm::set_wait_cycle(XTAL_HZ);
     crate::sram::set_wait_cycles(XTAL_HZ);
+    let fcg = if system_clk_is_pll() {
+        Some(fcg_close())
+    } else {
+        None
+    };
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_XTAL);
     // 等待时钟源切换稳定 (对齐 DDL CLK_SYSCLK_SW_STB)
     delay_short();
     cmu_lock();
+    if let Some(saved) = fcg {
+        fcg_restore(saved);
+    }
     // 记录使用中状态
     XTAL_STATUS.store(STATUS_ACTIVE, Ordering::Relaxed);
 }
