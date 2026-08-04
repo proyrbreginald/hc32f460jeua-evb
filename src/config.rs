@@ -43,59 +43,6 @@ const fn parse_u8(s: &str) -> u8 {
     v as u8
 }
 
-/// 编译期解析十进制定点字符串 → ×1000 整数 (支持 `-`/`.`/`_`; 非法
-/// 字符/超过 3 位小数 → 编译报错)
-///
-/// 用于 OTS 定标参数 K/M 等需要小数的配置项: "3002.59" → 3002590。
-/// 本工程**禁止浮点** (README 验证记录: 浮点格式化在 no_std 下导致
-/// 内存破坏), 定标参数一律按千分度整数存储。
-const fn parse_fixed(s: &str) -> i64 {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut neg = false;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        neg = bytes[i] == b'-';
-        i += 1;
-    }
-    let mut v: i64 = 0;
-    let mut frac_digits: u32 = 0;
-    let mut seen_dot = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'_' {
-            i += 1;
-            continue;
-        }
-        if b == b'.' && !seen_dot {
-            seen_dot = true;
-            i += 1;
-            continue;
-        }
-        assert!(b >= b'0' && b <= b'9', "非法配置值: 应为十进制定点数");
-        if seen_dot {
-            assert!(frac_digits < 3, "非法配置值: 小数位最多 3 位");
-            v = v * 10 + (b - b'0') as i64;
-            frac_digits += 1;
-        } else {
-            v = v * 10 + (b - b'0') as i64;
-        }
-        i += 1;
-    }
-    // 按 3 位小数补齐 (×1000): 小数位不足 3 位时右移补齐
-    let mut scale: i64 = 1;
-    let mut k = frac_digits;
-    while k < 3 {
-        scale *= 10;
-        k += 1;
-    }
-    let v = v * scale;
-    if neg {
-        -v
-    } else {
-        v
-    }
-}
-
 /// 编译期字符串比较 (str 的 PartialEq 尚未 const 稳定, 用字节逐位比较)
 const fn eq_str(a: &str, b: &str) -> bool {
     let (x, y) = (a.as_bytes(), b.as_bytes());
@@ -391,63 +338,6 @@ pub const RTC_ENABLE: bool = if eq_str(env!("CFG_RTC_ENABLE"), "true") {
 } else {
     panic!("CFG_RTC_ENABLE 非法 (可用 true/false)")
 };
-
-// ============================== [ots] ==============================
-
-/// 是否启用 OTS 片内温度传感器 (CFG_OTS_ENABLE = true/false)
-///
-/// 启用时开机初始化 (时钟源/K/M/自关断均来自下方配置), shell `temp`
-/// 命令可实时查看芯片温度; 运行时可经 `temp on|off` 切换,
-/// 重启后恢复此配置默认值。
-pub const OTS_ENABLE: bool = if eq_str(env!("CFG_OTS_ENABLE"), "true") {
-    true
-} else if eq_str(env!("CFG_OTS_ENABLE"), "false") {
-    false
-} else {
-    panic!("CFG_OTS_ENABLE 非法 (可用 true/false)")
-};
-/// OTS 时钟源 (CFG_OTS_CLK_SOURCE = xtal/hrc)
-///
-/// - hrc: 内部高速 RC (默认; 需板载 XTAL32 晶振启动, 本板有;
-///   参数 K=3002.59, M=27.92);
-/// - xtal: 外部晶振 (需 8MHz 晶振, 本板有; 参数 K=737272.73, M=27.55)。
-///   定标参数必须与时钟源匹配 (见 DDL 例程 ots_base)。
-///
-/// 注: HRC 源且无 XTAL32 晶振的板子 (如裸芯片) 采样永不完成,
-/// 必须改用 XTAL 源。
-pub const OTS_CLOCK_SOURCE: crate::ots::ClockSource =
-    if eq_str(env!("CFG_OTS_CLK_SOURCE"), "xtal") {
-        crate::ots::ClockSource::Xtal
-    } else if eq_str(env!("CFG_OTS_CLK_SOURCE"), "hrc") {
-        crate::ots::ClockSource::Hrc
-    } else {
-        panic!("CFG_OTS_CLK_SOURCE 非法 (可用 xtal/hrc)")
-    };
-/// 采样完成后的模拟传感器状态 (CFG_OTS_AUTO_OFF = true/false)
-///
-/// true = 采样完成关闭模拟传感器 (TSSTP=1, 默认, 省电);
-/// false = 保持开启 (下次采样跳过稳定时间, 持续耗电, 适合连续测温)。
-/// OTSST 采样完成恒自动清零, 与该项无关 (轮询不受影响)。
-pub const OTS_AUTO_OFF: bool = if eq_str(env!("CFG_OTS_AUTO_OFF"), "true") {
-    true
-} else if eq_str(env!("CFG_OTS_AUTO_OFF"), "false") {
-    false
-} else {
-    panic!("CFG_OTS_AUTO_OFF 非法 (可用 true/false)")
-};
-/// OTS 定标斜率 K ×1000 (CFG_OTS_SLOPE_K, 定点字符串, 见 [`parse_fixed`])
-///
-/// 默认值与 `CFG_OTS_CLK_SOURCE` 配套 (DDL 例程内置参数):
-/// hrc → "3002.59" → 3002590, xtal → "737272.73" → 737272730。
-/// 定标实验可获本芯片精确值 (shell `temp raw` 输出 DR1/DR2/ECR 供反推)。
-pub const OTS_SLOPE_K: i32 = parse_fixed(env!("CFG_OTS_SLOPE_K")) as i32;
-/// OTS 定标偏移 M ×1000 (CFG_OTS_OFFSET_M): hrc → "27.92" → 27920, xtal → 27550
-pub const OTS_OFFSET_M: i32 = parse_fixed(env!("CFG_OTS_OFFSET_M")) as i32;
-/// OTS 轮询采样超时 (ms, CFG_OTS_TIMEOUT_MS)
-///
-/// 绝对时间预算 (基于 RTOS uptime), 与 CPU 频率无关; 需覆盖冷启动
-/// 首次采样的传感器稳定时间, 默认 100ms 足够。
-pub const OTS_TIMEOUT_MS: u32 = parse_u32(env!("CFG_OTS_TIMEOUT_MS"));
 
 // ============================== [log] ==============================
 

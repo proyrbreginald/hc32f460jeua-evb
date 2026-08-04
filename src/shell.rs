@@ -22,8 +22,8 @@
 //! 开关) 仍由各自的 `CFG_*` 配置控制。
 //!
 //! 当前命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) /
-//! `echo` / `led on|off` / `temp [raw|on|off]` / `log` / `selftest` /
-//! `clear` / `whoami` / `reboot` / `logout`(exit)。
+//! `echo` / `led on|off` / `log` / `selftest` / `clear` / `whoami` /
+//! `reboot` / `logout`(exit)。
 //!
 //! # 输入处理
 //!
@@ -100,7 +100,6 @@ static COMMANDS: &[Command] = &[
     cmd("free", &["mem"], "堆内存统计", cmd_free),
     cmd("echo", &[], "回显 <文本>", cmd_echo),
     cmd("led", &[], "板载 LED on|off", cmd_led),
-    cmd("temp", &[], "芯片温度 (raw 原始数据, on|off 开关)", cmd_temp),
     cmd("selftest", &[], "内核自检 (rtos 功能自检)", cmd_selftest),
     cmd("log", &[], "日志开关/级别 (on|off|level <级>)", cmd_log),
     cmd("clear", &[], "清屏", cmd_clear),
@@ -413,29 +412,6 @@ fn cmd_sysinfo(_rest: &str) -> CmdResult {
             config::SHELL_LOGIN_TRIES
         ),
     );
-    let (kw, kh, kt, ku) = crate::ots::split_milli(config::OTS_SLOPE_K);
-    let (mw, mh, mt, mu) = crate::ots::split_milli(config::OTS_OFFSET_M);
-    sysinfo_line(
-        "OTS",
-        format_args!(
-            "{}, 源 {}, 自关断 {}, K {}.{}{}{} M {}.{}{}{}",
-            if config::OTS_ENABLE {
-                "启用"
-            } else {
-                "禁用"
-            },
-            config::OTS_CLOCK_SOURCE.name(),
-            if config::OTS_AUTO_OFF { "开" } else { "关" },
-            kw,
-            kh,
-            kt,
-            ku,
-            mw,
-            mh,
-            mt,
-            mu
-        ),
-    );
     sysinfo_line(
         "线程",
         format_args!(
@@ -544,89 +520,6 @@ fn cmd_led(rest: &str) -> CmdResult {
         _ => println!("用法: led on|off"),
     }
     CmdResult::Ok
-}
-
-/// 芯片温度 (OTS): 无参数显示当前温度; `raw` 附加原始采样数据
-/// (DR1/DR2/ECR/A, 供定标反推 K/M); `on|off` 运行时开关
-/// (重启后恢复 `CFG_OTS_ENABLE` 默认值)。
-///
-/// 温度经 [`ots::to_deci`] 转十分度整数输出 —— 规避 no_std 下 core 浮点
-/// 格式化崩溃问题 (见 README 验证记录)。
-fn cmd_temp(rest: &str) -> CmdResult {
-    let raw = match rest.trim() {
-        "" => false,
-        "raw" | "--raw" => true,
-        "on" | "off" => {
-            if rest.trim() == "on" {
-                if ots_init_from_config() {
-                    println!("OTS 已开启");
-                } else {
-                    println!("OTS 开启失败 (检查时钟源/晶振配置)");
-                }
-            } else {
-                crate::ots::deinit();
-                println!("OTS 已关闭");
-            }
-            return CmdResult::Ok;
-        }
-        _ => {
-            println!("用法: temp [raw|on|off]");
-            return CmdResult::Ok;
-        }
-    };
-
-    if !crate::ots::enabled() {
-        println!(
-            "OTS 未初始化 (CFG_OTS_ENABLE={}, 可 `temp on` 运行时开启)",
-            config::OTS_ENABLE
-        );
-        return CmdResult::Ok;
-    }
-    match crate::ots::polling_until(crate::rtos::uptime_ms() + config::OTS_TIMEOUT_MS) {
-        Ok(t) => {
-            let (w, f) = crate::ots::split_deci(crate::ots::to_deci(t));
-            if raw {
-                let (dr1, dr2, ecr) = crate::ots::read_raw();
-                let (kw, kh, kt, ku) = crate::ots::split_milli(config::OTS_SLOPE_K);
-                let (mw, mh, mt, mu) = crate::ots::split_milli(config::OTS_OFFSET_M);
-                println!(
-                    "芯片温度: {}.{}°C  [DR1={} DR2={} ECR={} K={}.{}{}{} M={}.{}{}{}]",
-                    w,
-                    f,
-                    dr1,
-                    dr2,
-                    ecr,
-                    kw,
-                    kh,
-                    kt,
-                    ku,
-                    mw,
-                    mh,
-                    mt,
-                    mu
-                );
-            } else {
-                println!("芯片温度: {}.{}°C", w, f);
-            }
-        }
-        Err(_) => println!("采样超时 (检查 LRC/时钟源是否正常)"),
-    }
-    CmdResult::Ok
-}
-
-/// 按 `.cargo/config.toml` 的 [ots] 配置初始化 OTS (供 `temp on` 运行时开启)
-fn ots_init_from_config() -> bool {
-    crate::ots::init(crate::ots::Config {
-        clock_src: config::OTS_CLOCK_SOURCE,
-        slope_k: config::OTS_SLOPE_K,
-        offset_m: config::OTS_OFFSET_M,
-        auto_off: if config::OTS_AUTO_OFF {
-            crate::ots::AutoOff::Enable
-        } else {
-            crate::ots::AutoOff::Disable
-        },
-    })
-    .is_ok()
 }
 
 /// 内核自检: **同步执行** (完成后才出下一提示符, 可按 ESC 中断)

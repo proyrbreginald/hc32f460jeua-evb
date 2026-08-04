@@ -221,7 +221,6 @@ pub mod src {
     pub const I2C3_TEI: u32 = 430;
     pub const LVD1: u32 = 433;
     pub const LVD2: u32 = 434;
-    pub const OTS: u32 = 435; // OTS 采样完成 (独立线 INT110, 见 ots 模块)
     pub const WDT_REFUDF: u32 = 439;
     pub const ADC1_EOCA: u32 = 448;
     pub const ADC1_EOCB: u32 = 449;

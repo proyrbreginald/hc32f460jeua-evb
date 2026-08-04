@@ -223,10 +223,6 @@ pub enum ClkError {
     HrcStableTimeout,
     /// MPLL 锁定超时 (检查倍频/分频参数与 VCO 范围)
     PllStableTimeout,
-    /// LRC 是当前系统时钟源, 不可失能 (对齐 DDL `CLK_LrcCmd` 的 BUSY 返回)
-    LrcBusy,
-    /// XTAL32 是当前系统时钟源, 不可失能 (对齐 DDL `CLK_Xtal32Cmd` 的 BUSY 返回)
-    Xtal32Busy,
 }
 
 /// 外部晶振状态 (由 [`xtal_init`] / [`switch_to_xtal`] 更新, [`xtal_status`] 查询)
@@ -540,46 +536,6 @@ pub fn xtal_cmd(enable: bool) -> Result<(), ClkError> {
     Ok(())
 }
 
-/// 内部低速 RC (LRC) 使能/失能 (CMU_LRCCR.LRCSTP=0 开启, 对齐 DDL
-/// `CLK_LrcCmd`)
-///
-/// LRC 为 32.768kHz 内部振荡器, 是 OTS/RTC/WDT 等工作的基础时钟
-/// (OTS 每次采样依赖 LRC 产生工作时序, 见 `ots` 模块)。
-/// 失能时若 LRC 仍是系统时钟源 (CKSWR) 则返回 Err (对齐 DDL 行为);
-/// 使能后延时 ~160µs (对齐 DDL CLK_LRC_TIMEOUT) 等待起振。
-pub fn lrc_cmd(enable: bool) -> Result<(), ClkError> {
-    const CMU_LRCCR: usize = 0x427; // LRC 控制 (8 位, LRCSTP=0 开启)
-    if !enable && system_clock_hz() == LRC_HZ {
-        return Err(ClkError::LrcBusy);
-    }
-    cmu_unlock();
-    write8(CMU_BASE + CMU_LRCCR, if enable { 0 } else { 1 });
-    cmu_lock();
-    // 等待起振 (对齐 DDL CLK_LRC_TIMEOUT = 160µs)
-    delay_us(160);
-    Ok(())
-}
-
-/// 外部低速晶振 (XTAL32) 使能/失能 (CMU_XTAL32CR.XTAL32STP=0 开启,
-/// 对齐 DDL `CLK_Xtal32Cmd`)
-///
-/// 32.768kHz 晶振接 PC14 (IN) / PC15 (OUT)。OTS 选择 HRC 为测温时钟时
-/// **必须先启动 XTAL32** (消除 HRC 频率误差, 计算时用 ECR 补偿,
-/// 参考手册 17.2 节), 见 `ots` 模块。失能时若 XTAL32 仍是系统时钟源
-/// 则返回 Err (对齐 DDL 行为)。
-pub fn xtal32_cmd(enable: bool) -> Result<(), ClkError> {
-    const CMU_XTAL32CR: usize = 0x420; // XTAL32 控制 (8 位, XTAL32STP=0 开启)
-    if !enable && system_clock_hz() == XTAL32_HZ {
-        return Err(ClkError::Xtal32Busy);
-    }
-    cmu_unlock();
-    write8(CMU_BASE + CMU_XTAL32CR, if enable { 0 } else { 1 });
-    cmu_lock();
-    // 等待起振 (对齐 DDL CLK_XTAL32_TIMEOUT ≈ 5 × XTAL32 周期)
-    delay_us(160);
-    Ok(())
-}
-
 /// 切换系统时钟源到内部高速 RC (HRC 16/20MHz)
 ///
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1),
@@ -785,16 +741,6 @@ fn write32(addr: usize, value: u32) {
 /// 短延时 (时钟源切换稳定等待)
 fn delay_short() {
     for _ in 0..200 {
-        unsafe {
-            core::arch::asm!("nop");
-        }
-    }
-}
-
-/// 忙等延时 (微秒, 按 HCLK 折算; 仅启动阶段使用, 时钟已稳定)
-fn delay_us(us: u32) {
-    let cycles = (us as u64 * hclk_hz() as u64 / 1_000_000) as u32;
-    for _ in 0..cycles {
         unsafe {
             core::arch::asm!("nop");
         }
