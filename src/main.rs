@@ -30,6 +30,7 @@ mod sram; // 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
 mod wdt; // 硬件看门狗 (WDT): 空闲线程喂狗, 溢出复位
 
 // ---- 外设驱动 ----
+mod can; // CAN 控制器: CAN2.0B, 位时间计算, 回环自测支持
 mod clk; // 时钟链: XTAL + MPLL → 200MHz, 失败自动回退
 mod gpio; // GPIO: 寄存器/端口/引脚分层, const 泛型封装
 mod systick; // SysTick 节拍 (1kHz, RTOS 的时钟源)

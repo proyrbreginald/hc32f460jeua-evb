@@ -60,18 +60,19 @@ const PCR_DDIS: u16 = 1 << 15; // 关闭数字输入 (模拟模式)
 const PFSR_FSEL_MASK: u16 = 0x003F; // FSEL[5:0] 周边复用功能号
 const PFSR_BFE: u16 = 0x0100; // [8] 子功能使能 (TMRA 等外设的通道切换用)
 
-// ================================ 功能复用号 (表 2-2) ================================
+// ================================ 功能复用号 (数据手册表 2-2) ================================
 
 /// 周边复用功能号 (PFSR.FSEL, 数据手册表 2-2, 与 DDL 的 GPIO_FUNC_* 一致)。
 ///
 /// Func32~63 按引脚的 **Func_Grp1/Grp2 分组**映射 (组由硬件固定, 与引脚
 /// 相关): 同一功能号在不同引脚可能对应不同外设, 使用前请查数据手册
-/// "引脚功能表"。USART1/2 在 Grp1 (32~47), USART3/4 在 Grp2 (48~63)。
+/// "引脚功能表"。**Grp1 与 Grp2 的 32~47 均为 USART/SPI, 48~59 分别为
+/// I2C1/2+I2S1/2 与 I2C3/CAN+I2S3/4** (表 2-2), Func60~63 未定义。
 pub mod func {
-    // ---- Func_Grp1: USART1 / USART2 / SPI1 / SPI2 ----
-    /// USART1_TX (如 PA9, PH1)
+    // ---- Func_Grp1/Grp2: USART1~4 / SPI1~4 (Func32~47) ----
+    /// USART1_TX (Grp1, 如 PA9)
     pub const USART1_TX: u8 = 32;
-    /// USART1_RX (如 PA10, PC1)
+    /// USART1_RX (Grp1, 如 PA10)
     pub const USART1_RX: u8 = 33;
     /// USART1_RTS
     pub const USART1_RTS: u8 = 34;
@@ -101,40 +102,90 @@ pub mod func {
     pub const SPI2_SS0: u8 = 46;
     /// SPI2_SCK
     pub const SPI2_SCK: u8 = 47;
-
-    // ---- Func_Grp2: USART3 / USART4 / SPI3 / SPI4 ----
-    /// USART3_TX
-    pub const USART3_TX: u8 = 48;
-    /// USART3_RX
-    pub const USART3_RX: u8 = 49;
+    /// USART3_TX (Grp2)
+    pub const USART3_TX: u8 = 32;
+    /// USART3_RX (Grp2)
+    pub const USART3_RX: u8 = 33;
     /// USART3_RTS
-    pub const USART3_RTS: u8 = 50;
+    pub const USART3_RTS: u8 = 34;
     /// USART3_CTS
-    pub const USART3_CTS: u8 = 51;
-    /// USART4_TX
-    pub const USART4_TX: u8 = 52;
-    /// USART4_RX
-    pub const USART4_RX: u8 = 53;
+    pub const USART3_CTS: u8 = 35;
+    /// USART4_TX (Grp2, 如 PE6)
+    pub const USART4_TX: u8 = 36;
+    /// USART4_RX (Grp2, 如 PB9)
+    pub const USART4_RX: u8 = 37;
     /// USART4_RTS
-    pub const USART4_RTS: u8 = 54;
+    pub const USART4_RTS: u8 = 38;
     /// USART4_CTS
-    pub const USART4_CTS: u8 = 55;
+    pub const USART4_CTS: u8 = 39;
     /// SPI3_MOSI
-    pub const SPI3_MOSI: u8 = 56;
+    pub const SPI3_MOSI: u8 = 40;
     /// SPI3_MISO
-    pub const SPI3_MISO: u8 = 57;
+    pub const SPI3_MISO: u8 = 41;
     /// SPI3_SS0
-    pub const SPI3_SS0: u8 = 58;
+    pub const SPI3_SS0: u8 = 42;
     /// SPI3_SCK
-    pub const SPI3_SCK: u8 = 59;
+    pub const SPI3_SCK: u8 = 43;
     /// SPI4_MOSI
-    pub const SPI4_MOSI: u8 = 60;
+    pub const SPI4_MOSI: u8 = 44;
     /// SPI4_MISO
-    pub const SPI4_MISO: u8 = 61;
+    pub const SPI4_MISO: u8 = 45;
     /// SPI4_SS0
-    pub const SPI4_SS0: u8 = 62;
+    pub const SPI4_SS0: u8 = 46;
     /// SPI4_SCK
-    pub const SPI4_SCK: u8 = 63;
+    pub const SPI4_SCK: u8 = 47;
+
+    // ---- Func_Grp1: I2C1/2 + I2S1/2 (Func48~59) ----
+    /// I2C1_SDA (Grp1, Func48)
+    pub const I2C1_SDA: u8 = 48;
+    /// I2C1_SCL (Grp1, Func49)
+    pub const I2C1_SCL: u8 = 49;
+    /// I2C2_SDA (Grp1, Func50)
+    pub const I2C2_SDA: u8 = 50;
+    /// I2C2_SCL (Grp1, Func51)
+    pub const I2C2_SCL: u8 = 51;
+    /// I2S1_SD (Grp1, Func52)
+    pub const I2S1_SD: u8 = 52;
+    /// I2S1_SDIN (Grp1, Func53)
+    pub const I2S1_SDIN: u8 = 53;
+    /// I2S1_WS (Grp1, Func54)
+    pub const I2S1_WS: u8 = 54;
+    /// I2S1_CK (Grp1, Func55)
+    pub const I2S1_CK: u8 = 55;
+    /// I2S2_SD (Grp1, Func56)
+    pub const I2S2_SD: u8 = 56;
+    /// I2S2_SDIN (Grp1, Func57)
+    pub const I2S2_SDIN: u8 = 57;
+    /// I2S2_WS (Grp1, Func58)
+    pub const I2S2_WS: u8 = 58;
+    /// I2S2_CK (Grp1, Func59)
+    pub const I2S2_CK: u8 = 59;
+
+    // ---- Func_Grp2: I2C3 + CAN + I2S3/4 (Func48~59) ----
+    /// I2C3_SDA (Grp2, Func48)
+    pub const I2C3_SDA: u8 = 48;
+    /// I2C3_SCL (Grp2, Func49)
+    pub const I2C3_SCL: u8 = 49;
+    /// CAN_TxD (Grp2, Func50, 如 PB7)
+    pub const CAN_TXD: u8 = 50;
+    /// CAN_RxD (Grp2, Func51, 如 PB6)
+    pub const CAN_RXD: u8 = 51;
+    /// I2S3_SD (Grp2, Func52)
+    pub const I2S3_SD: u8 = 52;
+    /// I2S3_SDIN (Grp2, Func53)
+    pub const I2S3_SDIN: u8 = 53;
+    /// I2S3_WS (Grp2, Func54)
+    pub const I2S3_WS: u8 = 54;
+    /// I2S3_CK (Grp2, Func55)
+    pub const I2S3_CK: u8 = 55;
+    /// I2S4_SD (Grp2, Func56)
+    pub const I2S4_SD: u8 = 56;
+    /// I2S4_SDIN (Grp2, Func57)
+    pub const I2S4_SDIN: u8 = 57;
+    /// I2S4_WS (Grp2, Func58)
+    pub const I2S4_WS: u8 = 58;
+    /// I2S4_CK (Grp2, Func59)
+    pub const I2S4_CK: u8 = 59;
 }
 
 // ================================ 寄存器层 ================================

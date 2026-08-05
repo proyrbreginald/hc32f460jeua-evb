@@ -359,6 +359,14 @@ pub fn pll_init(cfg: PllConfig) -> Result<(), ClkError> {
     Ok(())
 }
 
+/// 外部晶振是否已起振稳定 (OSCSTBSR.XTALSTBF 实时查询)
+///
+/// CAN 通信时钟 (CANCLK) 固定来自 XTAL (参考手册 30.4.1), CAN 驱动
+/// 据此判断是否需要先启动晶振。
+pub fn xtal_stable() -> bool {
+    read8(CMU_BASE + CMU_OSCSTBSR) & OSCSTBSR_XTALSTBF != 0
+}
+
 /// 切换系统时钟源到 MPLL (200MHz)
 ///
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1)、

@@ -46,6 +46,57 @@ fn abort_requested() -> bool {
     esc
 }
 
+/// CAN 内部回环自测: 初始化 → 发送模式数据帧 → 接收校验
+///
+/// 内部回环模式 (ILB) 下信号在芯片内部环回, 无需 PB6/PB7 引脚与
+/// 外部收发器; 自应答使能保证发送帧回环到接收缓冲 (RX.CTRL.TX=1)。
+/// 对齐 DDL `can_loopback` 例程的 CanTx/CanRx 校验流程。
+fn can_loopback_test() -> bool {
+    // 初始化: 内部回环 + 自应答 + 全接受滤波 + 500Kbps
+    let cfg = crate::can::Config {
+        mode: crate::can::WorkMode::InternalLoopback,
+        self_ack: true,
+        baudrate: 500_000,
+        ..Default::default()
+    };
+    if crate::can::init(cfg).is_err() {
+        return false; // XTAL 未起振/波特率不可实现等
+    }
+
+    // 发送一帧: ID=0x5A5 (标准帧), 8 字节递增模式数据
+    let mut data = [0u8; 8];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (0xA0 + i as u8).wrapping_add(1);
+    }
+    let tx = crate::can::TxFrame {
+        id: 0x5A5,
+        ide: false,
+        rtr: false,
+        dlc: 8,
+        data,
+    };
+    if crate::can::send(&tx).is_err() {
+        crate::can::local_reset();
+        return false;
+    }
+
+    // 接收回环帧 (带超时 ~50ms) 并校验: ID/数据/自发标志
+    let ok = match crate::can::recv_timeout() {
+        Ok(rx) => {
+            rx.id == 0x5A5
+                && rx.self_tx
+                && rx.dlc == 8
+                && rx.data == data
+                && crate::can::error_counts() == (0, 0)
+        }
+        Err(_) => false,
+    };
+
+    // 清理: 本地复位, 退出回环 (不影响后续使用)
+    crate::can::local_reset();
+    ok
+}
+
 /// 运行内核自检 (由 shell `selftest` 命令调用)
 pub(crate) fn run() {
     crate::log_info!("[selftest] 开始 (rtos 内核功能自检), 按 ESC 可中断");
@@ -326,6 +377,17 @@ pub(crate) fn run() {
                 "X25={:#06X} CCITT-F={:#06X} CRC32={:#010X} MPEG2={:#010X}",
                 x25, ccitt, ieee, mpeg2
             ),
+        );
+    }
+
+    // CAN 控制器: 内部回环收发一致 (ILB 模式无需引脚/外部收发器;
+    // CANCLK = XTAL, 本配置下 8MHz → 500Kbps, 位时间 16 TQ)
+    if !aborted.get() {
+        let ok = can_loopback_test();
+        check(
+            ok,
+            "CAN: 内部回环收发一致",
+            format_args!("ILB 500Kbps, 标准帧 ID=0x5A5, 8B 模式数据"),
         );
     }
 
