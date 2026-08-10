@@ -34,6 +34,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 数据位 / 校验 / 停止位 / 过采样 / 流控 / 噪声滤波 / 缓冲 / 中断参数 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
+| `CFG_SHELL_HISTORY_SIZE` | RAM 中保留的历史命令条数 (1~16，默认 8，复位后清空) |
 | `CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` / `CFG_NANO_MAX_BYTES` | nano 终端探测回退尺寸 / 单文件编辑上限 |
 | `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
 | `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
@@ -78,7 +79,8 @@ src/
 ├── log.rs             # 应用日志: 分级+彩色标签, 与内核打印分离 (可开关)
 ├── shell.rs           # 登录、命令注册与文件系统命令
 ├── shell/
-│   └── editor.rs      # nano 风格 ANSI 全屏文本编辑器
+│   ├── editor.rs      # nano 风格 ANSI 全屏文本编辑器
+│   └── path.rs        # 固定容量 Linux 风格路径解析与当前目录维护
 ├── build.rs           # 构建元数据 (日期/rustc 版本, 供启动横幅使用)
 └── rtos/              # RTOS 内核 (RT-Thread 架构移植, 不依赖应用模块)
     ├── mod.rs         # 公共 API: init/start/tick/thread_create 等
@@ -95,7 +97,7 @@ src/
 文件系统算法位于独立的 `no_std` workspace crate：
 
 ```text
-crates/littlefs/  # 块设备/磁盘格式 + mount/format/read/write/remove/rename/list
+crates/littlefs/  # 块设备/磁盘格式 + 文件/目录/原子快照操作
 ```
 
 ## 时钟管理 (clk, CMU 模块)
@@ -176,29 +178,38 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
 
 首版不是 littlefs 2.x 的 Rust 翻译，也不兼容其磁盘格式。它保留 littlefs
 最关键的原则（新数据先落盘、CRC 校验、最后发布引用、旧版本在发布前不
-擦除），再用**有界单层命名空间 + 完整不可变快照**删除目录树、CTZ、
-metadata pair 追加日志、FCRC、orphan/move 状态机：
+擦除），再以**有界目录树 + 完整不可变快照**取代 CTZ、metadata pair
+追加日志、FCRC、orphan/move 状态机：
 
 - API：`format` / `mount` / 整文件 `write` / `read` / `stat` / `list` /
-  `max_write_size` / `remove` / `rename` / `clear` / `verify`；无堆分配、
-  无 `unsafe`；
+  `read_dir` / `mkdir` / `rmdir` / `max_write_size` / `remove` / `rename` /
+  `clear` / `verify`；`stat` 返回文件或目录类型，`read_dir` 只枚举指定目录
+  的直接子项；无堆分配、无 `unsafe`；
+- 根目录隐式存在，核心 API 在 `stat` / `read_dir` 中以空字符串表示根；
+  持久路径采用无前导 `/` 的规范 UTF-8 路径，完整路径最长 63B，禁止尾随
+  `/`、空分量、`.`、`..` 和 NUL；文件与目录合计最多 32 个条目。Shell
+  在此之上提供以 `/` 为根的绝对/相对路径解析；
+- `mkdir` 要求父目录已存在，`rmdir` 只删除空目录；`rename` 可移动文件或
+  完整目录树，所有后代路径在同一个候选快照中改名，不会在恢复后暴露
+  部分移动的目录树；
 - 每次变更写到当前快照之后的不重叠扇区，完整 `sync` + 回读验证后，最后
   单独编程一个此前未写过的 4B commit word；挂载只接受 marker、header
-  CRC、payload CRC、逐文件 CRC 和全部结构边界同时有效的版本；
+  CRC、payload CRC、逐文件 CRC、父目录关系和全部结构边界同时有效的版本；
 - generation 使用回绕序列比较；快照起点按环形前移，擦除分布到整个分区，
   不把固定 superblock 提前磨损；
 - 任一擦除、编程字节或同步点掉电后，只会挂载到完整旧版本或完整新版本；
   写事务返回设备错误后必须 remount，防止继续使用不确定的内存 generation；
-- 文件名为 UTF-8，最长 63B，最多 32 个文件；不支持子目录、随机写、打开
-  句柄、属性、权限、时间戳、坏块迁移和静态磨损均衡；
+- 不支持递归删除、隐式创建父目录、随机写、打开句柄、符号链接、属性、
+  权限、时间戳、坏块迁移和静态磨损均衡；
 - 预留扇区 54~61 (`0x6C000..0x7BFFF`, 64KiB)，旧/新快照必须共存，
   因而单个序列化快照最多占 4 个扇区，可用容量略小于 32KiB；完整快照会
   放大写入，适合小型配置/状态文件，不适合高频大日志。
 
 磁盘格式、提交顺序与安全论证见
 [`crates/littlefs/DESIGN.md`](crates/littlefs/DESIGN.md)。主机模拟 NOR 会在
-4B 编程字内部按多种字节顺序制造部分 `1 -> 0`，并枚举 write/remove/rename/
-format 以及三扇区跨尾部快照的每个掉电边界：
+4B 编程字内部按多种字节顺序制造部分 `1 -> 0`，并枚举 `write` / `remove` /
+文件 `rename` / `mkdir` / `rmdir` / 目录树 `rename` / `format` 以及三扇区
+跨尾部快照的每个掉电边界：
 
 ```bash
 cargo test --workspace --target x86_64-unknown-linux-gnu
@@ -216,22 +227,38 @@ cargo test --workspace --target x86_64-unknown-linux-gnu
 常用 Shell 命令：
 
 ```text
-ls                         # 列出文件
-write config mode=normal   # 原子创建或完整覆盖短文本文件 (别名 put)
-nano config                # ANSI 全屏编辑文件；不存在时新建
-cat config                 # 分块读取；不可打印字节显示为 \xNN
-stat config                # 文件大小与 CRC
-mv config settings         # 原子重命名
-rm settings                # 原子删除
-df                         # 容量/文件数/generation (别名 fsinfo)
-fsck                       # 只读校验当前快照
-mount                      # 丢弃内存状态并重新挂载
-mkfs --force               # 显式清空全部文件
+pwd                          # 显示当前路径，上电/登录后默认为 /
+mkdir /etc                  # 原子创建目录；父目录必须已存在
+cd /etc                     # 切换当前路径；无参数时回到 /
+write config mode=normal    # 相对路径：原子创建或完整覆盖文件 (别名 put)
+nano ./config               # ANSI 全屏编辑文件；不存在时新建
+cat /etc/config             # 绝对路径：分块读取，非打印字节显示为 \xNN
+stat config                 # 显示文件或目录类型；文件另含大小与 CRC
+ls .                        # 列出目录的直接子项；也可用 ls [路径]
+cd /
+mv /etc /settings           # 在一个快照中原子移动完整目录树
+rm /settings/config         # 原子删除文件
+rmdir /settings             # 原子删除空目录
+df                          # 容量/条目数/generation (别名 fsinfo)
+fsck                        # 只读校验当前快照
+mount                       # 丢弃内存状态并重新挂载，当前路径回到 /
+mkfs --force                # 显式清空全部文件与目录
+history                     # 按编号查看 RAM 中的历史命令
+history -c                  # 清空命令历史
 ```
 
-Shell 输入上限默认 128B，超长命令会整行拒绝而不会截断写入；`write` 面向短
-单行文本，文件系统本身仍支持约 32KiB 快照。每个变更命令成功返回时已经
-完成同步和回读，无需额外 `sync` 命令。
+Shell 当前路径默认为根目录 `/`；以 `/` 开头的是绝对路径，其余路径相对
+当前目录解析。重复 `/`、`.` 和 `..` 会被规范化，根目录下的 `..` 仍停留
+在根目录。文件/目录移动后若当前路径位于被移动的目录树中，提示符会同步
+更新；`rmdir` 会拒绝删除当前目录或其祖先。Shell 命令输入仅接受 ASCII，
+非 ASCII 或超过默认 128B 上限的命令会整行拒绝，不会静默改写或截断执行；
+`write` 面向短单行文本，文件系统本身仍支持约 32KiB 快照。每个变更命令
+成功返回时已经完成同步和回读，无需额外 `sync` 命令。
+
+普通命令输入时可用方向键上/下浏览历史；首次向上前的未提交输入会作为
+草稿保存，向下越过最新记录时恢复。历史保存在固定容量 RAM 中，相邻重复
+命令不重复记录；`history` 查看，`history -c` 清空，容量由
+`CFG_SHELL_HISTORY_SIZE` 配置。退出登录后历史仍保留，复位后清空。
 
 `nano <文件>` 提供适合串口终端的精简全屏编辑：方向键、Home/End、翻页、
 插入、退格和 Delete 均可用；`Ctrl+O` 保存，`Ctrl+X` 退出，`Ctrl+G` 显示
@@ -460,18 +487,19 @@ continue
 - 启动后先登录: 用户名 + 密码 (密码不显示), 配置见 `.cargo/config.toml`
   的 `CFG_SHELL_*` (编译期读取, 改密码无需改代码);
 - 密码错误次数可配置 (默认 3 次), 超限提示 "Too many login failures";
-- 命令提示符 `root@HC32F460JEUA:~$` (用户名@芯片型号);
+- 命令提示符包含当前路径，例如根目录为 `root@HC32F460JEUA:/$`，进入
+  `/etc` 后为 `root@HC32F460JEUA:/etc$`;
 - **命令系统**: 命令注册在 `src/shell.rs` 的静态命令表 [`COMMANDS`]
   (名称/别名/帮助/执行函数), 分发与实现解耦; **新增命令 = 表内追加一项
   + 加入 `CFG_SHELL_COMMANDS` 启用列表**, 无需修改分发/帮助逻辑;
 - **每个命令可单独启用/禁用**: `CFG_SHELL_COMMANDS` 为逗号分隔的命令名
   列表, 未列出的命令执行时提示 "未启用" 且不出现在 `help` 中;
 - 命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) / `echo` /
-  `ls` / `cat` / `write`(put) / `nano` / `rm` / `mv` / `stat` / `df`(fsinfo) /
-  `fsck` /
-  `mount` / `mkfs --force` / `led` / `log` / `selftest` / `clear` / `whoami` /
-  `reboot` / `logout`(exit);
-- 输入: 回车提交, 退格删除, Ctrl+C 清行;
+  `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` / `write`(put) /
+  `nano` / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` / `mount` /
+  `mkfs --force` / `led` / `log` / `selftest` / `clear` / `whoami` / `reboot` /
+  `logout`(exit);
+- 输入: 回车提交, 退格删除, Ctrl+C 清行, 方向键上/下浏览历史；
 - 输入采用中断驱动 (RX ISR 发出 OS 无关通知, `uart_rtos` 释放信号量,
   线程阻塞等待, 无轮询)。
 

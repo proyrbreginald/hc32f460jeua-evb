@@ -1,8 +1,49 @@
 mod common;
 
 use common::{RamError, RamNor, read_all};
-use littlefs::format::{COMMIT_OFFSET, HEADER_SIZE, SnapshotHeader, generation_is_newer};
-use littlefs::{Error, FileSystem, Geometry, MAX_FILES};
+use littlefs::format::{
+    COMMIT_OFFSET, HEADER_SIZE, RECORD_FLAG_DIRECTORY, RECORD_HEADER_SIZE, RecordHeader,
+    SnapshotHeader, crc32_mpeg2, generation_is_newer,
+};
+use littlefs::{EntryKind, Error, FileSystem, Geometry, MAX_FILES};
+
+fn raw_snapshot(records: &[(&str, u16, &[u8])]) -> RamNor {
+    let geometry = Geometry::new(512, 8);
+    let mut payload = Vec::new();
+    for &(name, flags, data) in records {
+        let header = RecordHeader::new(
+            name.len() as u16,
+            data.len() as u32,
+            crc32_mpeg2(data),
+            flags,
+        )
+        .unwrap();
+        payload.extend_from_slice(&header.encode().unwrap());
+        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(data);
+        payload.resize(
+            payload.len() + header.record_len as usize
+                - RECORD_HEADER_SIZE
+                - name.len()
+                - data.len(),
+            0,
+        );
+    }
+
+    let header = SnapshotHeader::new(
+        0,
+        0,
+        payload.len() as u32,
+        crc32_mpeg2(&payload),
+        records.len() as u32,
+        geometry,
+    )
+    .unwrap();
+    let device = RamNor::new(geometry.block_size, geometry.block_count);
+    device.overwrite_raw(0, &header.encode_committed().unwrap());
+    device.overwrite_raw(HEADER_SIZE, &payload);
+    device
+}
 
 #[test]
 fn basic_file_workflow_survives_remount() {
@@ -49,9 +90,19 @@ fn basic_file_workflow_survives_remount() {
 #[test]
 fn names_and_namespace_errors_are_explicit() {
     let mut fs = FileSystem::format(RamNor::new(512, 8)).unwrap();
-    for invalid in ["", "a/b", "\0", &"x".repeat(64)] {
+    for invalid in [
+        "",
+        "/absolute",
+        "trailing/",
+        "a//b",
+        "a/./b",
+        "a/../b",
+        "\0",
+        &"x".repeat(64),
+    ] {
         assert_eq!(fs.write(invalid, b"x"), Err(Error::InvalidName));
     }
+    assert_eq!(fs.write("missing/file", b"x"), Err(Error::NotFound));
 
     fs.write("source", b"value").unwrap();
     fs.write("target", b"other").unwrap();
@@ -62,6 +113,140 @@ fn names_and_namespace_errors_are_explicit() {
 
     fs.write("配置", b"utf8-name").unwrap();
     assert_eq!(read_all(&mut fs, "配置").unwrap(), b"utf8-name");
+}
+
+#[test]
+fn directory_workflow_is_typed_and_survives_remount() {
+    let mut fs = FileSystem::format(RamNor::new(512, 8)).unwrap();
+    assert_eq!(fs.stat("").unwrap().kind, EntryKind::Directory);
+
+    fs.mkdir("etc").unwrap();
+    fs.mkdir("etc/network").unwrap();
+    fs.write("etc/config", b"mode=normal").unwrap();
+    fs.write("root-file", b"root").unwrap();
+
+    assert_eq!(fs.stat("etc").unwrap().kind, EntryKind::Directory);
+    assert_eq!(fs.stat("etc/config").unwrap().kind, EntryKind::File);
+    assert_eq!(fs.info().entry_count, 4);
+    assert_eq!(fs.info().entry_count, fs.info().file_count);
+
+    let mut root = Vec::new();
+    fs.read_dir("", |name, info| {
+        root.push((name.to_owned(), info.kind, info.size))
+    })
+    .unwrap();
+    assert_eq!(
+        root,
+        [
+            ("etc".to_owned(), EntryKind::Directory, 0),
+            ("root-file".to_owned(), EntryKind::File, 4),
+        ]
+    );
+
+    let mut etc = Vec::new();
+    fs.read_dir("etc", |name, info| etc.push((name.to_owned(), info.kind)))
+        .unwrap();
+    assert_eq!(
+        etc,
+        [
+            ("network".to_owned(), EntryKind::Directory),
+            ("config".to_owned(), EntryKind::File),
+        ]
+    );
+
+    assert_eq!(fs.read("etc", 0, &mut [0; 1]), Err(Error::IsDirectory));
+    assert_eq!(fs.max_write_size("etc"), Err(Error::IsDirectory));
+    assert_eq!(fs.write("etc", b"file"), Err(Error::IsDirectory));
+    assert_eq!(fs.remove("etc"), Err(Error::IsDirectory));
+    assert_eq!(fs.rmdir("etc/config"), Err(Error::NotDirectory));
+    assert_eq!(fs.rmdir("etc"), Err(Error::DirectoryNotEmpty));
+    assert_eq!(fs.mkdir("etc"), Err(Error::AlreadyExists));
+
+    fs.write("plain", b"file").unwrap();
+    assert_eq!(fs.mkdir("plain/child"), Err(Error::NotDirectory));
+    assert_eq!(fs.write("plain/child", b"x"), Err(Error::NotDirectory));
+
+    let mut fs = FileSystem::mount(fs.into_device()).unwrap();
+    fs.verify().unwrap();
+    assert_eq!(read_all(&mut fs, "etc/config").unwrap(), b"mode=normal");
+    fs.remove("etc/config").unwrap();
+    fs.rmdir("etc/network").unwrap();
+    fs.rmdir("etc").unwrap();
+    assert_eq!(fs.stat("etc"), Err(Error::NotFound));
+}
+
+#[test]
+fn directory_rename_moves_one_complete_subtree() {
+    let mut fs = FileSystem::format(RamNor::new(512, 8)).unwrap();
+    fs.mkdir("a").unwrap();
+    fs.mkdir("a/sub").unwrap();
+    fs.write("a/sub/file", b"payload").unwrap();
+    fs.write("ab", b"prefix-neighbor").unwrap();
+
+    fs.rename("a", "moved").unwrap();
+    assert_eq!(fs.stat("a"), Err(Error::NotFound));
+    assert_eq!(fs.stat("a/sub"), Err(Error::NotFound));
+    assert_eq!(fs.stat("moved").unwrap().kind, EntryKind::Directory);
+    assert_eq!(fs.stat("moved/sub").unwrap().kind, EntryKind::Directory);
+    assert_eq!(read_all(&mut fs, "moved/sub/file").unwrap(), b"payload");
+    assert_eq!(read_all(&mut fs, "ab").unwrap(), b"prefix-neighbor");
+
+    assert_eq!(
+        fs.rename("moved", "moved/sub/deeper"),
+        Err(Error::InvalidMove)
+    );
+    fs.write("target", b"occupied").unwrap();
+    assert_eq!(fs.rename("moved", "target"), Err(Error::AlreadyExists));
+
+    let mut remounted = FileSystem::mount(fs.into_device()).unwrap();
+    remounted.verify().unwrap();
+    assert_eq!(
+        read_all(&mut remounted, "moved/sub/file").unwrap(),
+        b"payload"
+    );
+}
+
+#[test]
+fn directory_rename_preflights_every_descendant_length() {
+    let mut fs = FileSystem::format(RamNor::new(512, 8)).unwrap();
+    fs.mkdir("d").unwrap();
+    let child = format!("d/{}", "x".repeat(60));
+    assert_eq!(child.len(), 62);
+    fs.write(&child, b"value").unwrap();
+
+    assert_eq!(fs.rename("d", "long"), Err(Error::InvalidName));
+    assert!(!fs.recovery_required());
+    assert_eq!(read_all(&mut fs, &child).unwrap(), b"value");
+    assert_eq!(fs.stat("long"), Err(Error::NotFound));
+}
+
+#[test]
+fn mount_accepts_legacy_files_and_rejects_invalid_trees() {
+    let legacy = raw_snapshot(&[("legacy", 0, b"old-format-root-file")]);
+    let mut fs = FileSystem::mount(legacy).unwrap();
+    assert_eq!(fs.stat("legacy").unwrap().kind, EntryKind::File);
+    assert_eq!(
+        read_all(&mut fs, "legacy").unwrap(),
+        b"old-format-root-file"
+    );
+
+    let orphan = raw_snapshot(&[("missing/child", 0, b"orphan")]);
+    assert!(matches!(
+        FileSystem::mount(orphan),
+        Err(Error::<RamError>::NotFormatted)
+    ));
+
+    let file_parent = raw_snapshot(&[("parent", 0, b"file"), ("parent/child", 0, b"child")]);
+    assert!(matches!(
+        FileSystem::mount(file_parent),
+        Err(Error::<RamError>::NotFormatted)
+    ));
+
+    let nonempty_directory = raw_snapshot(&[("dir", RECORD_FLAG_DIRECTORY, b"not-empty")]);
+    assert!(matches!(
+        FileSystem::mount(nonempty_directory),
+        Err(Error::<RamError>::NotFormatted)
+    ));
 }
 
 #[test]

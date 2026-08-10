@@ -2,8 +2,8 @@
 
 ## Scope
 
-The first format is a bounded, flat filesystem for small configuration, log,
-and state files. It deliberately trades capacity and write amplification for a
+The first format is a bounded filesystem for small configuration, log, and
+state files. It deliberately trades capacity and write amplification for a
 small recovery state machine that can be exhaustively fault tested.
 
 The implementation is `no_std`, does not allocate, uses explicit little-endian
@@ -53,8 +53,8 @@ an erase-block boundary and may wrap at the end of the partition.
 | - header CRC         |
 | - commit word LAST   |
 +----------------------+ offset 64
-| FILE record          |
-| FILE record          |
+| file/directory record|
+| file/directory record|
 | ...                  |
 +----------------------+ payload_len
 ```
@@ -67,12 +67,17 @@ only if all of these checks pass:
 1. exact magic, format version, feature flags, geometry, and commit word;
 2. header CRC and a canonical block span;
 3. generation selected with wrapping serial-number comparison;
-4. payload CRC, record boundaries, name rules, file count, and uniqueness;
-5. every file's independent data CRC.
+4. payload CRC, record boundaries, path rules, entry count, and uniqueness;
+5. every file's independent data CRC;
+6. directory records have no data, and every non-root parent exists as a
+   directory record.
 
-Each FILE record contains a fixed 20-byte header followed immediately by its
-name and file data, then zero padding to a four-byte record boundary. Payload
-length is therefore a multiple of four and no program word is rewritten.
+Each record contains a fixed 20-byte header followed immediately by its path and
+file data, then zero padding to a four-byte record boundary. A directory is a
+record with the directory flag, zero data length, and the CRC of empty data.
+The root is implicit and consumes no record. Paths are canonical root-relative
+UTF-8 strings no longer than 63 bytes. Payload length is therefore a multiple of
+four and no program word is rewritten.
 
 ## Transaction order
 
@@ -122,9 +127,15 @@ snapshot was synchronized and read back. On reset during an operation, mount
 returns either the complete old version or the complete new version, never a
 mixture. A device error requires remount before another mutation.
 
+Renaming a directory rewrites its record and every descendant path in one
+candidate snapshot. All destination lengths and namespace constraints are
+checked before erase begins. It is never implemented as a sequence of child
+renames, so recovery cannot expose a partially moved tree.
+
 ## Deliberate omissions
 
-The format has no nested directories, append log, random overwrite, streaming
-file handle, sparse file, permissions, timestamps, extended attributes,
-bad-block relocation, static wear leveling, encryption, or authentication.
-CRC detects accidental corruption and torn writes; it is not a security MAC.
+The format has no recursive removal, implicit parent creation, append log,
+random overwrite, streaming file handle, sparse file, symbolic link,
+permissions, timestamps, extended attributes, bad-block relocation, static
+wear leveling, encryption, or authentication. CRC detects accidental corruption
+and torn writes; it is not a security MAC.

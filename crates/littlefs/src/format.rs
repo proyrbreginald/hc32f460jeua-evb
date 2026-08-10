@@ -35,14 +35,18 @@ pub const SNAPSHOT_PREFIX_SIZE: usize = COMMIT_OFFSET;
 pub const RECORD_MAGIC: u32 = 0x454c_4946;
 /// Encoded record-header size.
 pub const RECORD_HEADER_SIZE: usize = 20;
-/// Maximum UTF-8 filename length in bytes.
+/// Maximum canonical root-relative UTF-8 path length in bytes.
 pub const MAX_NAME_LEN: usize = 63;
-/// Maximum number of files in one snapshot.
+/// Backward-compatible name for the maximum snapshot entry count.
 pub const MAX_FILES: u32 = 32;
+/// Maximum number of file and directory entries in one snapshot.
+pub const MAX_ENTRIES: u32 = MAX_FILES;
 /// Feature bits understood by this format version.
 pub const SUPPORTED_FEATURES: u32 = 0;
+/// Record flag identifying a directory entry.
+pub const RECORD_FLAG_DIRECTORY: u16 = 1 << 0;
 /// Record flag bits understood by this format version.
-pub const SUPPORTED_RECORD_FLAGS: u16 = 0;
+pub const SUPPORTED_RECORD_FLAGS: u16 = RECORD_FLAG_DIRECTORY;
 
 /// Runtime geometry reported by a block device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -426,7 +430,7 @@ pub const fn commit_marker_bytes() -> [u8; PROGRAM_SIZE] {
     COMMIT_MARKER.to_le_bytes()
 }
 
-/// Fields stored in each 20-byte file-record header.
+/// Fields stored in each 20-byte entry-record header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordHeader {
     pub record_len: u32,
@@ -764,6 +768,13 @@ mod tests {
         assert_eq!(&encoded[16..18], &3u16.to_le_bytes());
         assert_eq!(RecordHeader::decode(&encoded), Ok(header));
         assert!(is_aligned_4(header.record_len));
+
+        let directory =
+            RecordHeader::new(3, 0, CRC32_MPEG2_INITIAL, RECORD_FLAG_DIRECTORY).unwrap();
+        assert_eq!(
+            RecordHeader::decode(&directory.encode().unwrap()),
+            Ok(directory)
+        );
     }
 
     #[test]
@@ -779,8 +790,8 @@ mod tests {
             })
         );
         assert_eq!(
-            RecordHeader::new(1, 0, 0, 1),
-            Err(FormatError::UnsupportedRecordFlags { found: 1 })
+            RecordHeader::new(1, 0, 0, 2),
+            Err(FormatError::UnsupportedRecordFlags { found: 2 })
         );
 
         let header = RecordHeader::new(1, 0, 0, 0).unwrap();

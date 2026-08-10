@@ -486,6 +486,11 @@ fn save_error_message(error: &FsError) -> &'static str {
         littlefs::Error::NotFound | littlefs::Error::AlreadyExists => {
             "Filesystem state changed; buffer kept"
         }
+        littlefs::Error::IsDirectory => "Path is a directory; buffer kept",
+        littlefs::Error::NotDirectory => "Parent is not a directory; buffer kept",
+        littlefs::Error::DirectoryNotEmpty | littlefs::Error::InvalidMove => {
+            "Filesystem path changed; buffer kept"
+        }
         littlefs::Error::InvalidGeometry => "Invalid filesystem geometry; buffer kept",
     }
 }
@@ -921,7 +926,10 @@ impl fmt::Display for Frame<'_, '_> {
         };
         write!(formatter, "{}", prefix)?;
         let name_width = columns.saturating_sub(prefix.len() + suffix.len());
-        write_ascii_clipped(formatter, editor.name, name_width)?;
+        if name_width != 0 {
+            write!(formatter, "/")?;
+            write_ascii_clipped(formatter, editor.name, name_width - 1)?;
+        }
         write!(formatter, "{}\x1b[0m", suffix)?;
 
         let mut current_line = line_offset(&editor.buffer, editor.top_line);

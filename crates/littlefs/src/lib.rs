@@ -9,7 +9,7 @@
 pub mod format;
 mod fs;
 
-pub use format::{BlockDevice, Geometry, MAX_FILES, MAX_NAME_LEN};
+pub use format::{BlockDevice, Geometry, MAX_ENTRIES, MAX_FILES, MAX_NAME_LEN};
 pub use fs::FileSystem;
 
 /// Filesystem operation failure.
@@ -25,13 +25,21 @@ pub enum Error<E> {
     NotFormatted,
     /// A committed snapshot or file record failed validation.
     Corrupt,
-    /// A filename is empty, too long, or contains a forbidden byte.
+    /// A canonical root-relative path is malformed or too long.
     InvalidName,
-    /// The requested file does not exist.
+    /// The requested entry or one of its parents does not exist.
     NotFound,
-    /// The rename destination already exists.
+    /// The destination entry already exists.
     AlreadyExists,
-    /// The file count or serialized snapshot exceeds its fixed bound.
+    /// A file operation was requested for a directory.
+    IsDirectory,
+    /// A directory operation was requested for a file.
+    NotDirectory,
+    /// A directory still contains entries.
+    DirectoryNotEmpty,
+    /// A directory cannot be moved into its own subtree.
+    InvalidMove,
+    /// The entry count or serialized snapshot exceeds its fixed bound.
     NoSpace,
     /// A file length cannot be represented by this format.
     FileTooLarge,
@@ -39,17 +47,31 @@ pub enum Error<E> {
     RecoveryRequired,
 }
 
-/// Immutable file metadata.
+/// Type of a persistent filesystem entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileInfo {
+pub enum EntryKind {
+    File,
+    Directory,
+}
+
+/// Immutable entry metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryInfo {
+    pub kind: EntryKind,
     pub size: u32,
     pub crc32: u32,
 }
+
+/// Backward-compatible name for entry metadata.
+pub type FileInfo = EntryInfo;
 
 /// Current filesystem and capacity information.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FsInfo {
     pub generation: u32,
+    /// Total file and directory record count.
+    pub entry_count: u32,
+    /// Backward-compatible alias of [`FsInfo::entry_count`].
     pub file_count: u32,
     pub serialized_bytes: u32,
     pub active_blocks: u32,

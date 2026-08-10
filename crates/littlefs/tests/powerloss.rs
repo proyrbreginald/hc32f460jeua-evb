@@ -1,7 +1,7 @@
 mod common;
 
 use common::{RamError, RamNor, read_all};
-use littlefs::{Error, FileSystem};
+use littlefs::{EntryKind, Error, FileSystem};
 
 const TEAR_ORDERS: [[usize; 4]; 4] = [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1], [1, 3, 0, 2]];
 
@@ -146,6 +146,146 @@ fn every_rename_cut_has_exactly_one_name() {
             assert_ne!(before, after, "cut={cut} order={order:?}");
             let name = if before { "before" } else { "after" };
             assert_eq!(read_all(&mut recovered, name).unwrap(), value);
+        }
+    }
+}
+
+fn measured_mkdir_events(base: &RamNor) -> u64 {
+    let device = base.fork();
+    let observer = device.clone();
+    let mut fs = FileSystem::mount(device).unwrap();
+    observer.reset_events();
+    fs.mkdir("created").unwrap();
+    observer.events()
+}
+
+#[test]
+fn every_mkdir_cut_is_absent_or_a_complete_directory() {
+    let fs = FileSystem::format(RamNor::new(128, 8)).unwrap();
+    let base = fs.into_device();
+    let event_count = measured_mkdir_events(&base);
+
+    for cut in 0..event_count {
+        let device = base.fork();
+        device.arm_power_loss(cut, TEAR_ORDERS[0]);
+        let mut fs = FileSystem::mount(device).unwrap();
+        assert_power_loss(fs.mkdir("created"));
+
+        let recovered_device = fs.into_device();
+        recovered_device.power_cycle();
+        let mut recovered = FileSystem::mount(recovered_device).unwrap();
+        match recovered.stat("created") {
+            Ok(info) => assert_eq!(info.kind, EntryKind::Directory, "cut={cut}"),
+            Err(Error::NotFound) => {}
+            other => panic!("cut={cut}: {other:?}"),
+        }
+        recovered.verify().unwrap();
+    }
+}
+
+fn measured_rmdir_events(base: &RamNor) -> u64 {
+    let device = base.fork();
+    let observer = device.clone();
+    let mut fs = FileSystem::mount(device).unwrap();
+    observer.reset_events();
+    fs.rmdir("empty").unwrap();
+    observer.events()
+}
+
+#[test]
+fn every_rmdir_cut_is_present_or_completely_removed() {
+    let mut fs = FileSystem::format(RamNor::new(128, 8)).unwrap();
+    fs.mkdir("empty").unwrap();
+    let base = fs.into_device();
+    let event_count = measured_rmdir_events(&base);
+
+    for cut in 0..event_count {
+        let device = base.fork();
+        device.arm_power_loss(cut, TEAR_ORDERS[1]);
+        let mut fs = FileSystem::mount(device).unwrap();
+        assert_power_loss(fs.rmdir("empty"));
+
+        let recovered_device = fs.into_device();
+        recovered_device.power_cycle();
+        let mut recovered = FileSystem::mount(recovered_device).unwrap();
+        match recovered.stat("empty") {
+            Ok(info) => assert_eq!(info.kind, EntryKind::Directory, "cut={cut}"),
+            Err(Error::NotFound) => {}
+            other => panic!("cut={cut}: {other:?}"),
+        }
+        recovered.verify().unwrap();
+    }
+}
+
+fn directory_tree() -> RamNor {
+    let mut fs = FileSystem::format(RamNor::new(128, 8)).unwrap();
+    fs.mkdir("tree").unwrap();
+    fs.mkdir("tree/sub").unwrap();
+    fs.write("tree/root", b"root-value").unwrap();
+    fs.write("tree/sub/leaf", b"leaf-value").unwrap();
+    fs.write("treehouse", b"prefix-neighbor").unwrap();
+    fs.into_device()
+}
+
+fn measured_directory_rename_events(base: &RamNor) -> u64 {
+    let device = base.fork();
+    let observer = device.clone();
+    let mut fs = FileSystem::mount(device).unwrap();
+    observer.reset_events();
+    fs.rename("tree", "moved").unwrap();
+    observer.events()
+}
+
+#[test]
+fn every_directory_rename_cut_recovers_one_complete_tree() {
+    let base = directory_tree();
+    let event_count = measured_directory_rename_events(&base);
+
+    for order in TEAR_ORDERS {
+        for cut in 0..event_count {
+            let device = base.fork();
+            device.arm_power_loss(cut, order);
+            let mut fs = FileSystem::mount(device).unwrap();
+            assert_power_loss(fs.rename("tree", "moved"));
+
+            let recovered_device = fs.into_device();
+            recovered_device.power_cycle();
+            let mut recovered = FileSystem::mount(recovered_device).unwrap_or_else(|error| {
+                panic!("directory rename cut={cut} order={order:?}: {error:?}")
+            });
+            let old = recovered.stat("tree").is_ok();
+            let new = recovered.stat("moved").is_ok();
+            assert_ne!(old, new, "cut={cut} order={order:?}");
+
+            let root = if old { "tree" } else { "moved" };
+            let other = if old { "moved" } else { "tree" };
+            assert_eq!(
+                recovered.stat(root).unwrap().kind,
+                EntryKind::Directory,
+                "cut={cut} order={order:?}"
+            );
+            assert_eq!(
+                recovered.stat(&format!("{root}/sub")).unwrap().kind,
+                EntryKind::Directory
+            );
+            assert_eq!(
+                read_all(&mut recovered, &format!("{root}/root")).unwrap(),
+                b"root-value"
+            );
+            assert_eq!(
+                read_all(&mut recovered, &format!("{root}/sub/leaf")).unwrap(),
+                b"leaf-value"
+            );
+            assert_eq!(recovered.stat(other), Err(Error::NotFound));
+            assert_eq!(
+                recovered.stat(&format!("{other}/sub/leaf")),
+                Err(Error::NotFound)
+            );
+            assert_eq!(
+                read_all(&mut recovered, "treehouse").unwrap(),
+                b"prefix-neighbor"
+            );
+            recovered.verify().unwrap();
         }
     }
 }

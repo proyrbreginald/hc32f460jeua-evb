@@ -2,11 +2,11 @@ use core::str;
 
 use crate::format::{
     BlockDevice, Crc32Mpeg2, Geometry, HEADER_SIZE, MAX_FILES, MAX_NAME_LEN, PROGRAM_SIZE,
-    RECORD_HEADER_SIZE, RecordHeader, SnapshotHeader, commit_marker_bytes, crc32_mpeg2,
-    generation_is_newer,
+    RECORD_FLAG_DIRECTORY, RECORD_HEADER_SIZE, RecordHeader, SnapshotHeader, commit_marker_bytes,
+    crc32_mpeg2, generation_is_newer,
 };
 
-use crate::{Error, FileInfo, FsInfo};
+use crate::{EntryKind, Error, FileInfo, FsInfo};
 
 const COPY_BUFFER_SIZE: usize = 64;
 const ZERO_WORD: [u8; PROGRAM_SIZE] = [0; PROGRAM_SIZE];
@@ -18,6 +18,7 @@ struct Record {
     data_offset: u32,
     data_len: u32,
     data_crc: u32,
+    flags: u16,
     name_len: usize,
     name: [u8; MAX_NAME_LEN],
 }
@@ -27,8 +28,21 @@ impl Record {
         self.name_len == name.len() && &self.name[..self.name_len] == name.as_bytes()
     }
 
+    const fn kind(&self) -> EntryKind {
+        if self.flags & RECORD_FLAG_DIRECTORY != 0 {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        }
+    }
+
+    const fn is_directory(&self) -> bool {
+        matches!(self.kind(), EntryKind::Directory)
+    }
+
     const fn info(&self) -> FileInfo {
         FileInfo {
+            kind: self.kind(),
             size: self.data_len,
             crc32: self.data_crc,
         }
@@ -95,6 +109,7 @@ impl<D: BlockDevice> FileSystem<D> {
     pub fn info(&self) -> FsInfo {
         FsInfo {
             generation: self.active.generation,
+            entry_count: self.active.file_count,
             file_count: self.active.file_count,
             serialized_bytes: self.active.payload_len,
             active_blocks: self.active.block_span,
@@ -114,7 +129,14 @@ impl<D: BlockDevice> FileSystem<D> {
         validate_snapshot(&mut self.device, &self.active)
     }
 
+    /// Return metadata for a canonical root-relative path.
+    ///
+    /// The empty path denotes the implicit root directory. Persistent paths do
+    /// not begin or end with `/`, and contain no empty, `.` or `..` component.
     pub fn stat(&mut self, name: &str) -> Result<FileInfo, Error<D::Error>> {
+        if name.is_empty() {
+            return Ok(root_info());
+        }
         validate_name(name)?;
         find_record(&mut self.device, &self.active, name)?
             .map(|record| record.info())
@@ -127,7 +149,11 @@ impl<D: BlockDevice> FileSystem<D> {
     /// record, while creating a file also accounts for the namespace limit.
     pub fn max_write_size(&mut self, name: &str) -> Result<u32, Error<D::Error>> {
         validate_name(name)?;
+        ensure_parent_directory(&mut self.device, &self.active, name)?;
         let existing = find_record(&mut self.device, &self.active, name)?;
+        if existing.is_some_and(|record| record.is_directory()) {
+            return Err(Error::IsDirectory);
+        }
         if existing.is_none() && self.active.file_count >= MAX_FILES {
             return Err(Error::NoSpace);
         }
@@ -157,6 +183,9 @@ impl<D: BlockDevice> FileSystem<D> {
     ) -> Result<usize, Error<D::Error>> {
         validate_name(name)?;
         let record = find_record(&mut self.device, &self.active, name)?.ok_or(Error::NotFound)?;
+        if record.is_directory() {
+            return Err(Error::IsDirectory);
+        }
         if offset >= record.data_len || buffer.is_empty() {
             return Ok(0);
         }
@@ -175,7 +204,10 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(read_len)
     }
 
-    /// Visit every file. The borrowed name is valid only for the callback.
+    /// Visit every persistent entry recursively.
+    ///
+    /// Names are canonical root-relative paths. The borrowed name is valid only
+    /// for the callback. Prefer [`FileSystem::read_dir`] for shell-style listing.
     pub fn list<F>(&mut self, mut visitor: F) -> Result<(), Error<D::Error>>
     where
         F: FnMut(&str, FileInfo),
@@ -198,23 +230,91 @@ impl<D: BlockDevice> FileSystem<D> {
         Ok(())
     }
 
+    /// Visit the direct children of a directory.
+    ///
+    /// The empty path denotes the implicit root directory. Child names contain
+    /// only the final path component and are valid only for the callback.
+    pub fn read_dir<F>(&mut self, directory: &str, mut visitor: F) -> Result<(), Error<D::Error>>
+    where
+        F: FnMut(&str, FileInfo),
+    {
+        if !directory.is_empty() {
+            validate_name(directory)?;
+            let record =
+                find_record(&mut self.device, &self.active, directory)?.ok_or(Error::NotFound)?;
+            if !record.is_directory() {
+                return Err(Error::NotDirectory);
+            }
+        }
+
+        let mut offset = 0;
+        let mut index = 0;
+        while index < self.active.file_count {
+            let record = read_record(&mut self.device, &self.active, offset)?;
+            let name =
+                str::from_utf8(&record.name[..record.name_len]).map_err(|_| Error::Corrupt)?;
+            if parent_name(name) == non_root(directory) {
+                visitor(base_name(name), record.info());
+            }
+            offset = offset
+                .checked_add(record.record_len)
+                .ok_or(Error::Corrupt)?;
+            index += 1;
+        }
+        if offset != self.active.payload_len {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
+    }
+
     /// Atomically create or replace a complete file.
     pub fn write(&mut self, name: &str, data: &[u8]) -> Result<(), Error<D::Error>> {
         validate_name(name)?;
         u32::try_from(data.len()).map_err(|_| Error::FileTooLarge)?;
+        ensure_parent_directory(&mut self.device, &self.active, name)?;
+        if find_record(&mut self.device, &self.active, name)?
+            .is_some_and(|record| record.is_directory())
+        {
+            return Err(Error::IsDirectory);
+        }
         self.mutate(Change::Write { name, data })
     }
 
     /// Atomically remove a file.
     pub fn remove(&mut self, name: &str) -> Result<(), Error<D::Error>> {
         validate_name(name)?;
-        if find_record(&mut self.device, &self.active, name)?.is_none() {
-            return Err(Error::NotFound);
+        match find_record(&mut self.device, &self.active, name)? {
+            None => return Err(Error::NotFound),
+            Some(record) if record.is_directory() => return Err(Error::IsDirectory),
+            Some(_) => {}
         }
         self.mutate(Change::Remove { name })
     }
 
-    /// Atomically rename one file within the flat namespace.
+    /// Atomically create an empty directory.
+    pub fn mkdir(&mut self, name: &str) -> Result<(), Error<D::Error>> {
+        validate_name(name)?;
+        ensure_parent_directory(&mut self.device, &self.active, name)?;
+        if find_record(&mut self.device, &self.active, name)?.is_some() {
+            return Err(Error::AlreadyExists);
+        }
+        self.mutate(Change::Mkdir { name })
+    }
+
+    /// Atomically remove an empty directory.
+    pub fn rmdir(&mut self, name: &str) -> Result<(), Error<D::Error>> {
+        validate_name(name)?;
+        let record = find_record(&mut self.device, &self.active, name)?.ok_or(Error::NotFound)?;
+        if !record.is_directory() {
+            return Err(Error::NotDirectory);
+        }
+        if snapshot_has_descendant(&mut self.device, &self.active, name)? {
+            return Err(Error::DirectoryNotEmpty);
+        }
+        self.mutate(Change::Remove { name })
+    }
+
+    /// Atomically rename a file or a complete directory subtree.
     pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), Error<D::Error>> {
         validate_name(old_name)?;
         validate_name(new_name)?;
@@ -225,16 +325,30 @@ impl<D: BlockDevice> FileSystem<D> {
                 Err(Error::NotFound)
             };
         }
-        if find_record(&mut self.device, &self.active, old_name)?.is_none() {
-            return Err(Error::NotFound);
-        }
+        let source =
+            find_record(&mut self.device, &self.active, old_name)?.ok_or(Error::NotFound)?;
         if find_record(&mut self.device, &self.active, new_name)?.is_some() {
             return Err(Error::AlreadyExists);
         }
-        self.mutate(Change::Rename { old_name, new_name })
+        if source.is_directory() && is_descendant(new_name, old_name) {
+            return Err(Error::InvalidMove);
+        }
+        ensure_parent_directory(&mut self.device, &self.active, new_name)?;
+        preflight_rename(
+            &mut self.device,
+            &self.active,
+            old_name,
+            new_name,
+            source.is_directory(),
+        )?;
+        self.mutate(Change::Rename {
+            old_name,
+            new_name,
+            recursive: source.is_directory(),
+        })
     }
 
-    /// Atomically remove all files while preserving generation history.
+    /// Atomically remove all entries while preserving generation history.
     pub fn clear(&mut self) -> Result<(), Error<D::Error>> {
         self.mutate(Change::Clear)
     }
@@ -278,12 +392,16 @@ enum Change<'a> {
         name: &'a str,
         data: &'a [u8],
     },
+    Mkdir {
+        name: &'a str,
+    },
     Remove {
         name: &'a str,
     },
     Rename {
         old_name: &'a str,
         new_name: &'a str,
+        recursive: bool,
     },
     Clear,
 }
@@ -296,16 +414,57 @@ enum ExistingAction<'a> {
 }
 
 impl<'a> Change<'a> {
-    fn action_for(self, name: &str) -> ExistingAction<'a> {
-        match self {
+    fn action_for<'buffer, E>(
+        self,
+        name: &str,
+        renamed: &'buffer mut NameBuffer,
+    ) -> Result<ExistingAction<'buffer>, Error<E>> {
+        let action = match self {
             Self::Write { name: replaced, .. } if name == replaced => ExistingAction::Skip,
             Self::Remove { name: removed } if name == removed => ExistingAction::Skip,
-            Self::Rename { old_name, new_name } if name == old_name => {
-                ExistingAction::Rename(new_name)
+            Self::Rename {
+                old_name,
+                new_name,
+                recursive,
+            } if name == old_name || (recursive && is_descendant(name, old_name)) => {
+                ExistingAction::Rename(renamed.replace_prefix(name, old_name, new_name)?)
             }
             Self::Clear => ExistingAction::Skip,
             _ => ExistingAction::Keep,
+        };
+        Ok(action)
+    }
+}
+
+struct NameBuffer {
+    bytes: [u8; MAX_NAME_LEN],
+    len: usize,
+}
+
+impl NameBuffer {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; MAX_NAME_LEN],
+            len: 0,
         }
+    }
+
+    fn replace_prefix<E>(
+        &mut self,
+        name: &str,
+        old_prefix: &str,
+        new_prefix: &str,
+    ) -> Result<&str, Error<E>> {
+        let suffix = name.get(old_prefix.len()..).ok_or(Error::Corrupt)?;
+        let len = new_prefix
+            .len()
+            .checked_add(suffix.len())
+            .filter(|length| *length <= MAX_NAME_LEN)
+            .ok_or(Error::InvalidName)?;
+        self.bytes[..new_prefix.len()].copy_from_slice(new_prefix.as_bytes());
+        self.bytes[new_prefix.len()..len].copy_from_slice(suffix.as_bytes());
+        self.len = len;
+        str::from_utf8(&self.bytes[..self.len]).map_err(|_| Error::Corrupt)
     }
 }
 
@@ -313,12 +472,44 @@ fn validate_name<E>(name: &str) -> Result<(), Error<E>> {
     let bytes = name.as_bytes();
     if bytes.is_empty()
         || bytes.len() > MAX_NAME_LEN
-        || bytes.iter().any(|byte| *byte == 0 || *byte == b'/')
+        || bytes.first() == Some(&b'/')
+        || bytes.last() == Some(&b'/')
+        || bytes.contains(&0)
     {
-        Err(Error::InvalidName)
-    } else {
-        Ok(())
+        return Err(Error::InvalidName);
     }
+    for component in name.split('/') {
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err(Error::InvalidName);
+        }
+    }
+    Ok(())
+}
+
+const fn root_info() -> FileInfo {
+    FileInfo {
+        kind: EntryKind::Directory,
+        size: 0,
+        crc32: crate::format::CRC32_MPEG2_INITIAL,
+    }
+}
+
+fn non_root(path: &str) -> Option<&str> {
+    if path.is_empty() { None } else { Some(path) }
+}
+
+fn parent_name(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+fn base_name(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
+fn is_descendant(path: &str, directory: &str) -> bool {
+    path.len() > directory.len()
+        && path.as_bytes().get(directory.len()) == Some(&b'/')
+        && path.starts_with(directory)
 }
 
 fn checked_geometry<D: BlockDevice>(device: &D) -> Result<Geometry, Error<D::Error>> {
@@ -468,6 +659,11 @@ fn read_record<D: BlockDevice>(
         .ok_or(Error::Corrupt)?;
     segment_read(device, snapshot, logical, &mut encoded)?;
     let header = RecordHeader::decode(&encoded).map_err(|_| Error::Corrupt)?;
+    if header.flags == RECORD_FLAG_DIRECTORY
+        && (header.data_len != 0 || header.data_crc != crc32_mpeg2(&[]))
+    {
+        return Err(Error::Corrupt);
+    }
     let record_end = payload_offset
         .checked_add(header.record_len)
         .ok_or(Error::Corrupt)?;
@@ -501,6 +697,7 @@ fn read_record<D: BlockDevice>(
         data_offset,
         data_len: header.data_len,
         data_crc: header.data_crc,
+        flags: header.flags,
         name_len,
         name,
     })
@@ -527,6 +724,73 @@ fn find_record<D: BlockDevice>(
         return Err(Error::Corrupt);
     }
     Ok(None)
+}
+
+fn ensure_parent_directory<D: BlockDevice>(
+    device: &mut D,
+    snapshot: &SnapshotHeader,
+    name: &str,
+) -> Result<(), Error<D::Error>> {
+    let Some(parent) = parent_name(name) else {
+        return Ok(());
+    };
+    let record = find_record(device, snapshot, parent)?.ok_or(Error::NotFound)?;
+    if !record.is_directory() {
+        return Err(Error::NotDirectory);
+    }
+    Ok(())
+}
+
+fn snapshot_has_descendant<D: BlockDevice>(
+    device: &mut D,
+    snapshot: &SnapshotHeader,
+    directory: &str,
+) -> Result<bool, Error<D::Error>> {
+    let mut offset = 0;
+    let mut index = 0;
+    while index < snapshot.file_count {
+        let record = read_record(device, snapshot, offset)?;
+        let name = str::from_utf8(&record.name[..record.name_len]).map_err(|_| Error::Corrupt)?;
+        if is_descendant(name, directory) {
+            return Ok(true);
+        }
+        offset = offset
+            .checked_add(record.record_len)
+            .ok_or(Error::Corrupt)?;
+        index += 1;
+    }
+    if offset != snapshot.payload_len {
+        return Err(Error::Corrupt);
+    }
+    Ok(false)
+}
+
+fn preflight_rename<D: BlockDevice>(
+    device: &mut D,
+    snapshot: &SnapshotHeader,
+    old_name: &str,
+    new_name: &str,
+    recursive: bool,
+) -> Result<(), Error<D::Error>> {
+    let mut offset = 0;
+    let mut index = 0;
+    let mut renamed = NameBuffer::new();
+    while index < snapshot.file_count {
+        let record = read_record(device, snapshot, offset)?;
+        let name = str::from_utf8(&record.name[..record.name_len]).map_err(|_| Error::Corrupt)?;
+        if name == old_name || (recursive && is_descendant(name, old_name)) {
+            renamed.replace_prefix::<D::Error>(name, old_name, new_name)?;
+        }
+        offset = offset
+            .checked_add(record.record_len)
+            .ok_or(Error::Corrupt)?;
+        index += 1;
+    }
+    if offset != snapshot.payload_len {
+        return Err(Error::Corrupt);
+    }
+
+    Ok(())
 }
 
 fn crc_segment_range<D: BlockDevice>(
@@ -647,6 +911,22 @@ fn validate_snapshot<D: BlockDevice>(
     if offset != snapshot.payload_len {
         return Err(Error::Corrupt);
     }
+
+    // Every non-root parent is explicit and must itself be a directory. Run
+    // this after the boundary/CRC pass so arbitrary record offsets are never
+    // followed before the whole payload has been structurally validated.
+    let mut child = 0usize;
+    while child < snapshot.file_count as usize {
+        let record = read_record(device, snapshot, offsets[child])?;
+        let name = str::from_utf8(&record.name[..record.name_len]).map_err(|_| Error::Corrupt)?;
+        if let Some(parent) = parent_name(name) {
+            let parent = find_record(device, snapshot, parent)?.ok_or(Error::Corrupt)?;
+            if !parent.is_directory() {
+                return Err(Error::Corrupt);
+            }
+        }
+        child += 1;
+    }
     Ok(())
 }
 
@@ -737,9 +1017,11 @@ fn record_encoding(
     name: &str,
     data_len: u32,
     data_crc: u32,
+    flags: u16,
 ) -> Result<(RecordHeader, [u8; RECORD_HEADER_SIZE]), Error<core::convert::Infallible>> {
     let name_len = u16::try_from(name.len()).map_err(|_| Error::InvalidName)?;
-    let header = RecordHeader::new(name_len, data_len, data_crc, 0).map_err(|_| Error::NoSpace)?;
+    let header =
+        RecordHeader::new(name_len, data_len, data_crc, flags).map_err(|_| Error::NoSpace)?;
     let encoded = header.encode().map_err(|_| Error::NoSpace)?;
     Ok((header, encoded))
 }
@@ -748,10 +1030,11 @@ fn stats_new_record<E>(
     builder: &mut StatsBuilder,
     name: &str,
     data: &[u8],
+    flags: u16,
 ) -> Result<(), Error<E>> {
     let data_len = u32::try_from(data.len()).map_err(|_| Error::FileTooLarge)?;
     let (header, encoded) =
-        record_encoding(name, data_len, crc32_mpeg2(data)).map_err(|error| match error {
+        record_encoding(name, data_len, crc32_mpeg2(data), flags).map_err(|error| match error {
             Error::InvalidName => Error::InvalidName,
             _ => Error::NoSpace,
         })?;
@@ -774,7 +1057,8 @@ fn stats_renamed_record<D: BlockDevice>(
     new_name: &str,
 ) -> Result<(), Error<D::Error>> {
     let (header, encoded) =
-        record_encoding(new_name, record.data_len, record.data_crc).map_err(|_| Error::NoSpace)?;
+        record_encoding(new_name, record.data_len, record.data_crc, record.flags)
+            .map_err(|_| Error::NoSpace)?;
     builder.bytes(&encoded)?;
     builder.bytes(new_name.as_bytes())?;
     stats_segment(
@@ -798,12 +1082,13 @@ fn calculate_change<D: BlockDevice>(
     change: Change<'_>,
 ) -> Result<PlanStats, Error<D::Error>> {
     let mut builder = StatsBuilder::new();
+    let mut renamed = NameBuffer::new();
     let mut offset = 0;
     let mut index = 0;
     while index < snapshot.file_count {
         let record = read_record(device, snapshot, offset)?;
         let name = str::from_utf8(&record.name[..record.name_len]).map_err(|_| Error::Corrupt)?;
-        match change.action_for(name) {
+        match change.action_for(name, &mut renamed)? {
             ExistingAction::Keep => {
                 stats_segment(
                     &mut builder,
@@ -828,8 +1113,10 @@ fn calculate_change<D: BlockDevice>(
         return Err(Error::Corrupt);
     }
 
-    if let Change::Write { name, data } = change {
-        stats_new_record(&mut builder, name, data)?;
+    match change {
+        Change::Write { name, data } => stats_new_record(&mut builder, name, data, 0)?,
+        Change::Mkdir { name } => stats_new_record(&mut builder, name, &[], RECORD_FLAG_DIRECTORY)?,
+        _ => {}
     }
 
     builder
@@ -932,10 +1219,11 @@ fn emit_new_record<D: BlockDevice>(
     writer: &mut SegmentWriter<'_, D>,
     name: &str,
     data: &[u8],
+    flags: u16,
 ) -> Result<(), Error<D::Error>> {
     let data_len = u32::try_from(data.len()).map_err(|_| Error::FileTooLarge)?;
     let (header, encoded) =
-        record_encoding(name, data_len, crc32_mpeg2(data)).map_err(|_| Error::NoSpace)?;
+        record_encoding(name, data_len, crc32_mpeg2(data), flags).map_err(|_| Error::NoSpace)?;
     writer.bytes(&encoded)?;
     writer.bytes(name.as_bytes())?;
     writer.bytes(data)?;
@@ -953,7 +1241,8 @@ fn emit_renamed_record<D: BlockDevice>(
     new_name: &str,
 ) -> Result<(), Error<D::Error>> {
     let (header, encoded) =
-        record_encoding(new_name, record.data_len, record.data_crc).map_err(|_| Error::NoSpace)?;
+        record_encoding(new_name, record.data_len, record.data_crc, record.flags)
+            .map_err(|_| Error::NoSpace)?;
     writer.bytes(&encoded)?;
     writer.bytes(new_name.as_bytes())?;
     writer.copy_payload(source, record.data_offset, record.data_len)?;
@@ -972,11 +1261,12 @@ fn emit_change<D: BlockDevice>(
     if let Some(source) = source {
         let mut offset = 0;
         let mut index = 0;
+        let mut renamed = NameBuffer::new();
         while index < source.file_count {
             let record = read_record(writer.device, source, offset)?;
             let name =
                 str::from_utf8(&record.name[..record.name_len]).map_err(|_| Error::Corrupt)?;
-            match change.action_for(name) {
+            match change.action_for(name, &mut renamed)? {
                 ExistingAction::Keep => {
                     writer.copy_payload(source, record.record_offset, record.record_len)?;
                 }
@@ -997,8 +1287,10 @@ fn emit_change<D: BlockDevice>(
         return Err(Error::Corrupt);
     }
 
-    if let Change::Write { name, data } = change {
-        emit_new_record(writer, name, data)?;
+    match change {
+        Change::Write { name, data } => emit_new_record(writer, name, data, 0)?,
+        Change::Mkdir { name } => emit_new_record(writer, name, &[], RECORD_FLAG_DIRECTORY)?,
+        _ => {}
     }
     Ok(())
 }

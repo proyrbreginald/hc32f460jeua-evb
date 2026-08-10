@@ -358,7 +358,7 @@ pub(crate) fn run() {
         }
         check(
             ok,
-            "Flash: 扇区擦除/编程/回读",
+            "Flash: 扇区擦除/编程/读取校验",
             format_args!("addr=0x{:08X} len={}B", FLASH_TEST_ADDR, data.len()),
         );
     }

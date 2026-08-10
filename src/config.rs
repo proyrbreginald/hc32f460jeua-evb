@@ -359,6 +359,16 @@ pub const SHELL_PASSWORD: &str = env!("CFG_SHELL_PASSWORD");
 pub const SHELL_LOGIN_TRIES: u32 = parse_u32(env!("CFG_SHELL_LOGIN_TRIES"));
 /// 输入行缓冲区大小 (字节) (CFG_SHELL_LINE_BUF)
 pub const SHELL_LINE_BUF_SIZE: usize = parse_u32(env!("CFG_SHELL_LINE_BUF")) as usize;
+/// RAM 中保留的历史命令条数 (CFG_SHELL_HISTORY_SIZE)
+pub const SHELL_HISTORY_SIZE: usize = parse_u32(env!("CFG_SHELL_HISTORY_SIZE")) as usize;
+const _: () = assert!(
+    SHELL_LINE_BUF_SIZE >= 32 && SHELL_LINE_BUF_SIZE <= 256,
+    "CFG_SHELL_LINE_BUF 应为 32~256"
+);
+const _: () = assert!(
+    SHELL_HISTORY_SIZE >= 1 && SHELL_HISTORY_SIZE <= 16,
+    "CFG_SHELL_HISTORY_SIZE 应为 1~16"
+);
 /// nano 风格编辑器无法自动探测 ANSI 终端时使用的回退宽度与高度。
 pub const NANO_COLUMNS: usize = parse_u32(env!("CFG_NANO_COLUMNS")) as usize;
 pub const NANO_ROWS: usize = parse_u32(env!("CFG_NANO_ROWS")) as usize;
