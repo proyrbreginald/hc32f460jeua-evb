@@ -52,10 +52,66 @@ const HOSTNAME: &str = config::CHIP_MODEL;
 const LINE_BUF: usize = config::SHELL_LINE_BUF_SIZE;
 /// CR 后等待可选 LF 的时间，同时兼容 CR-only 终端。
 const INPUT_CRLF_TIMEOUT_MS: u32 = 25;
+/// 终端探测或转义序列预读期间需要按原顺序回放的输入容量。
+const PENDING_RX_CAPACITY: usize = 64;
 
 struct InputLine {
     text: alloc::string::String,
     overflowed: bool,
+}
+
+struct PendingRx {
+    bytes: [u8; PENDING_RX_CAPACITY],
+    head: usize,
+    len: usize,
+}
+
+impl PendingRx {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; PENDING_RX_CAPACITY],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let byte = self.bytes[self.head];
+        self.head = (self.head + 1) % PENDING_RX_CAPACITY;
+        self.len -= 1;
+        Some(byte)
+    }
+
+    fn push_front(&mut self, byte: u8) -> bool {
+        if self.len == PENDING_RX_CAPACITY {
+            return false;
+        }
+        self.head = (self.head + PENDING_RX_CAPACITY - 1) % PENDING_RX_CAPACITY;
+        self.bytes[self.head] = byte;
+        self.len += 1;
+        true
+    }
+
+    fn push_back(&mut self, byte: u8) -> bool {
+        if self.len == PENDING_RX_CAPACITY {
+            return false;
+        }
+        let tail = (self.head + self.len) % PENDING_RX_CAPACITY;
+        self.bytes[tail] = byte;
+        self.len += 1;
+        true
+    }
+
+    const fn is_full(&self) -> bool {
+        self.len == PENDING_RX_CAPACITY
+    }
+
+    const fn remaining_capacity(&self) -> usize {
+        PENDING_RX_CAPACITY - self.len
+    }
 }
 
 type FsError = littlefs::Error<crate::filesystem::FlashError>;
@@ -64,7 +120,7 @@ type FsError = littlefs::Error<crate::filesystem::FlashError>;
 struct ShellState {
     filesystem: Option<crate::filesystem::FileSystem>,
     last_mount_error: Option<FsError>,
-    pending_rx: Option<u8>,
+    pending_rx: PendingRx,
 }
 
 impl ShellState {
@@ -80,7 +136,7 @@ impl ShellState {
                 Self {
                     filesystem: Some(filesystem),
                     last_mount_error: None,
-                    pending_rx: None,
+                    pending_rx: PendingRx::new(),
                 }
             }
             Ok(crate::filesystem::Startup::Formatted(filesystem)) => {
@@ -88,7 +144,7 @@ impl ShellState {
                 Self {
                     filesystem: Some(filesystem),
                     last_mount_error: None,
-                    pending_rx: None,
+                    pending_rx: PendingRx::new(),
                 }
             }
             Err(error) => {
@@ -101,7 +157,7 @@ impl ShellState {
                 Self {
                     filesystem: None,
                     last_mount_error: Some(error),
-                    pending_rx: None,
+                    pending_rx: PendingRx::new(),
                 }
             }
         }
@@ -909,9 +965,13 @@ fn cmd_df(state: &mut ShellState, rest: &str) -> CmdResult {
         .saturating_mul(100)
         .checked_div(info.capacity_bytes)
         .unwrap_or(0);
-    println!("Filesystem       Size      Used  Use%  Files  Gen  Blocks");
     println!(
-        "internal-flash  {:>6} B  {:>6} B  {:>3}%  {:>5}  {:>3}  {}/{}",
+        "{:<14}  {:>7}  {:>7}  {:>4}  {:>5}  {:>10}  {}",
+        "Filesystem", "Size(B)", "Used(B)", "Use%", "Files", "Gen", "Blocks"
+    );
+    println!(
+        "{:<14}  {:>7}  {:>7}  {:>3}%  {:>5}  {:>10}  {}/{}",
+        "internal-flash",
         info.capacity_bytes,
         info.serialized_bytes,
         usage,
@@ -1063,26 +1123,66 @@ fn cmd_log(_state: &mut ShellState, rest: &str) -> CmdResult {
     CmdResult::Ok
 }
 
+fn read_pending_timeout<const U: u8>(
+    pending_rx: &mut PendingRx,
+    uart: &crate::uart::Uart<U>,
+    timeout_ms: u32,
+) -> Option<u8> {
+    pending_rx
+        .pop_front()
+        .or_else(|| uart.read_rx_timeout_ms(timeout_ms))
+}
+
+fn discard_shell_csi<const U: u8>(pending_rx: &mut PendingRx, uart: &crate::uart::Uart<U>) {
+    for _ in 0..48 {
+        let Some(byte) = read_pending_timeout(pending_rx, uart, INPUT_CRLF_TIMEOUT_MS) else {
+            return;
+        };
+        if (0x40..=0x7e).contains(&byte) {
+            return;
+        }
+    }
+}
+
+fn consume_shell_escape<const U: u8>(pending_rx: &mut PendingRx, uart: &crate::uart::Uart<U>) {
+    let Some(next) = read_pending_timeout(pending_rx, uart, INPUT_CRLF_TIMEOUT_MS) else {
+        return;
+    };
+    match next {
+        b'[' | 0x9b => discard_shell_csi(pending_rx, uart),
+        b'O' => discard_shell_csi(pending_rx, uart),
+        byte => {
+            let queued = pending_rx.push_front(byte);
+            debug_assert!(queued);
+        }
+    }
+}
+
 /// 从 UART 读取一行 (阻塞, 支持退格/Ctrl+C)
 ///
 /// `masked` 为 true 时输入不回显 (密码模式)。
 /// 中断驱动: 挂起在数据到达信号量上, 由 RX ISR 唤醒, 无轮询。
-fn read_line(pending_rx: &mut Option<u8>, masked: bool, max: usize) -> InputLine {
+fn read_line(pending_rx: &mut PendingRx, masked: bool, max: usize) -> InputLine {
     let uart = crate::board::BoardResources::get().console();
     let mut line = alloc::string::String::new();
     let mut overflow = 0usize;
     loop {
-        let b = pending_rx.take().unwrap_or_else(|| uart.read_rx_blocking());
+        let b = pending_rx
+            .pop_front()
+            .unwrap_or_else(|| uart.read_rx_blocking());
         match b {
             b'\r' => {
-                if let Some(next) = uart.read_rx_timeout_ms(INPUT_CRLF_TIMEOUT_MS)
+                if let Some(next) = read_pending_timeout(pending_rx, uart, INPUT_CRLF_TIMEOUT_MS)
                     && next != b'\n'
                 {
-                    *pending_rx = Some(next);
+                    let queued = pending_rx.push_front(next);
+                    debug_assert!(queued);
                 }
                 break;
             }
             b'\n' => break,
+            0x1b => consume_shell_escape(pending_rx, uart),
+            0x9b => discard_shell_csi(pending_rx, uart),
             0x08 | 0x7F => {
                 // 超出缓冲区的字符没有回显，先消费对应的退格。
                 if overflow > 0 {

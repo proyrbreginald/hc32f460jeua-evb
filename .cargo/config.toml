@@ -85,7 +85,7 @@ CFG_SHELL_LINE_BUF = "128"     # 输入行缓冲区 (字节)
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
 CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,ls,cat,write,nano,rm,mv,stat,df,fsck,mount,mkfs,led,log,selftest,clear,whoami,reboot,logout"
 
-# [nano] 轻量全屏文本编辑器 (ASCII, ANSI 终端)
+# [nano] 轻量全屏文本编辑器 (ASCII, ANSI 终端; 行列为自动探测失败时的回退值)
 CFG_NANO_COLUMNS = "80"
 CFG_NANO_ROWS = "24"
 CFG_NANO_MAX_BYTES = "16384"

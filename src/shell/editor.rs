@@ -7,17 +7,129 @@ use crate::print;
 use crate::println;
 use crate::uart_rtos::UartRtosExt;
 
-use super::{FsError, ShellState};
+use super::{FsError, PendingRx, ShellState};
 
-const COLUMNS: usize = crate::config::NANO_COLUMNS;
-const ROWS: usize = crate::config::NANO_ROWS;
-const TEXT_ROWS: usize = ROWS - 3;
 const TAB_WIDTH: usize = 4;
 const ESCAPE_TIMEOUT_MS: u32 = 25;
 const CRLF_TIMEOUT_MS: u32 = super::INPUT_CRLF_TIMEOUT_MS;
 const INPUT_BATCH_TIMEOUT_MS: u32 = 10;
 const INPUT_YIELD_INTERVAL: usize = 128;
+const TERMINAL_PROBE_TIMEOUT_MS: u32 = 200;
+const TERMINAL_PROBE_MAX_BYTES: usize = 128;
+const CURSOR_REPORT_CAPACITY: usize = 32;
+const MIN_COLUMNS: usize = 40;
+const MAX_COLUMNS: usize = 240;
+const MIN_ROWS: usize = 8;
+const MAX_ROWS: usize = 100;
 const INPUT_LOST_STATUS: &str = "INPUT LOST - save disabled; exit and reopen";
+
+#[derive(Clone, Copy)]
+struct ScreenSize {
+    columns: usize,
+    rows: usize,
+}
+
+#[derive(Clone, Copy)]
+struct UnsupportedScreenSize {
+    columns: u16,
+    rows: u16,
+}
+
+impl ScreenSize {
+    const fn fallback() -> Self {
+        Self {
+            columns: crate::config::NANO_COLUMNS,
+            rows: crate::config::NANO_ROWS,
+        }
+    }
+
+    fn from_cursor_report(rows: u16, columns: u16) -> Result<Self, UnsupportedScreenSize> {
+        if !(MIN_ROWS..=MAX_ROWS).contains(&(rows as usize))
+            || !(MIN_COLUMNS..=MAX_COLUMNS).contains(&(columns as usize))
+        {
+            return Err(UnsupportedScreenSize { columns, rows });
+        }
+        Ok(Self {
+            columns: columns as usize,
+            rows: rows as usize,
+        })
+    }
+
+    const fn text_rows(self) -> usize {
+        self.rows - 3
+    }
+}
+
+enum CursorReport {
+    Incomplete,
+    NotReport,
+    InvalidReport,
+    Complete { rows: u16, columns: u16 },
+}
+
+fn parse_cursor_report(bytes: &[u8]) -> CursorReport {
+    let mut index = match bytes {
+        [0x1b] => return CursorReport::Incomplete,
+        [0x1b, b'[', ..] => 2,
+        [0x1b, ..] => return CursorReport::NotReport,
+        [0x9b, ..] => 1,
+        _ => return CursorReport::NotReport,
+    };
+    if index == bytes.len() {
+        return CursorReport::Incomplete;
+    }
+
+    let Some(final_index) = bytes[index..]
+        .iter()
+        .position(|byte| (0x40..=0x7e).contains(byte))
+        .map(|offset| index + offset)
+    else {
+        return CursorReport::Incomplete;
+    };
+    if final_index + 1 != bytes.len() || bytes[final_index] != b'R' {
+        return CursorReport::NotReport;
+    }
+
+    if bytes[index] == b'?' {
+        index += 1;
+    }
+
+    let mut rows = 0u16;
+    let mut row_digits = 0;
+    while index < final_index && bytes[index].is_ascii_digit() {
+        let Some(value) = rows
+            .checked_mul(10)
+            .and_then(|value| value.checked_add((bytes[index] - b'0') as u16))
+        else {
+            return CursorReport::InvalidReport;
+        };
+        rows = value;
+        row_digits += 1;
+        index += 1;
+    }
+    if row_digits == 0 || bytes[index] != b';' {
+        return CursorReport::InvalidReport;
+    }
+    index += 1;
+
+    let mut columns = 0u16;
+    let mut column_digits = 0;
+    while index < final_index && bytes[index].is_ascii_digit() {
+        let Some(value) = columns
+            .checked_mul(10)
+            .and_then(|value| value.checked_add((bytes[index] - b'0') as u16))
+        else {
+            return CursorReport::InvalidReport;
+        };
+        columns = value;
+        column_digits += 1;
+        index += 1;
+    }
+    if column_digits == 0 || index != final_index {
+        return CursorReport::InvalidReport;
+    }
+    CursorReport::Complete { rows, columns }
+}
 
 pub(super) fn run(state: &mut ShellState, name: &str) {
     if state.filesystem.is_none() {
@@ -36,12 +148,28 @@ pub(super) fn run(state: &mut ShellState, name: &str) {
         }
     };
 
-    let initial_pending = state.pending_rx.take();
-    let mut editor = Editor::new(name, buffer, exists, max_bytes);
+    let mut input = core::mem::replace(&mut state.pending_rx, PendingRx::new());
     let uart = crate::board::BoardResources::get().console();
-    editor.input_lost = uart_input_lost(uart);
+    let mut input_lost = uart_input_lost(uart);
     let terminal = TerminalGuard::enter();
-    let mut keys = KeyReader::new(initial_pending);
+    let (screen, probe_input_lost) = detect_screen_size(uart, &mut input);
+    input_lost |= probe_input_lost || uart_input_lost(uart);
+    let screen = match screen {
+        Ok(screen) => screen,
+        Err(size) => {
+            state.pending_rx = input;
+            drop(terminal);
+            println!(
+                "nano: 终端尺寸 {}x{} 超出支持范围 ({}..{} 列, {}..{} 行)",
+                size.columns, size.rows, MIN_COLUMNS, MAX_COLUMNS, MIN_ROWS, MAX_ROWS
+            );
+            return;
+        }
+    };
+
+    let mut editor = Editor::new(name, buffer, exists, max_bytes, screen);
+    editor.input_lost = input_lost;
+    let mut keys = KeyReader::new(input);
 
     let outcome = 'editor: loop {
         editor.ensure_visible();
@@ -102,6 +230,115 @@ fn uart_input_lost<const U: u8>(uart: &crate::uart::Uart<U>) -> bool {
     let dropped = uart.rx_dropped_count();
     let (parity, framing, overrun) = uart.rx_error_counts();
     dropped != 0 || parity != 0 || framing != 0 || overrun != 0
+}
+
+fn replay_bytes(input: &mut PendingRx, bytes: &[u8]) -> bool {
+    let mut lost = false;
+    for &byte in bytes {
+        if !input.push_back(byte) {
+            lost = true;
+        }
+    }
+    lost
+}
+
+fn detect_screen_size<const U: u8>(
+    uart: &crate::uart::Uart<U>,
+    input: &mut PendingRx,
+) -> (Result<ScreenSize, UnsupportedScreenSize>, bool) {
+    let mut input_lost = false;
+    while !input.is_full() {
+        let Some(byte) = uart.read_rx() else {
+            break;
+        };
+        let queued = input.push_back(byte);
+        debug_assert!(queued);
+    }
+    if input.remaining_capacity() < CURSOR_REPORT_CAPACITY {
+        return (Ok(ScreenSize::fallback()), false);
+    }
+
+    print!("\x1b[?25l\x1b[?6l\x1b[r\x1b[999;999H\x1b[6n");
+    uart.flush();
+
+    let started = crate::rtos::uptime_ms();
+    let mut candidate = [0u8; CURSOR_REPORT_CAPACITY];
+    let mut candidate_len = 0;
+    let mut detected = None;
+
+    for _ in 0..TERMINAL_PROBE_MAX_BYTES {
+        if candidate_len == candidate.len() {
+            input_lost = true;
+            input_lost |= replay_bytes(input, &candidate[..candidate_len]);
+            candidate_len = 0;
+            break;
+        }
+        if candidate_len == 0 && input.remaining_capacity() < CURSOR_REPORT_CAPACITY {
+            break;
+        }
+        let elapsed = crate::rtos::uptime_ms().wrapping_sub(started);
+        if elapsed >= TERMINAL_PROBE_TIMEOUT_MS {
+            break;
+        }
+        let Some(byte) = uart.read_rx_timeout_ms(TERMINAL_PROBE_TIMEOUT_MS - elapsed) else {
+            break;
+        };
+
+        if candidate_len == 0 {
+            if matches!(byte, 0x1b | 0x9b) {
+                candidate[0] = byte;
+                candidate_len = 1;
+            } else {
+                let queued = input.push_back(byte);
+                debug_assert!(queued);
+            }
+            continue;
+        }
+
+        candidate[candidate_len] = byte;
+        candidate_len += 1;
+
+        match parse_cursor_report(&candidate[..candidate_len]) {
+            CursorReport::Incomplete => {}
+            CursorReport::Complete { rows, columns } => {
+                detected = Some(ScreenSize::from_cursor_report(rows, columns));
+                candidate_len = 0;
+                break;
+            }
+            CursorReport::InvalidReport => {
+                detected = Some(Ok(ScreenSize::fallback()));
+                candidate_len = 0;
+                break;
+            }
+            CursorReport::NotReport => {
+                let restart = matches!(byte, 0x1b | 0x9b);
+                let replay_len = candidate_len - usize::from(restart);
+                input_lost |= replay_bytes(input, &candidate[..replay_len]);
+                if restart && input.remaining_capacity() >= CURSOR_REPORT_CAPACITY {
+                    candidate[0] = byte;
+                    candidate_len = 1;
+                } else {
+                    if restart {
+                        let queued = input.push_back(byte);
+                        debug_assert!(queued);
+                    }
+                    candidate_len = 0;
+                }
+            }
+        }
+    }
+
+    if candidate_len != 0 {
+        // Preserve the prefix so KeyReader can consume a late CPR tail, but
+        // prohibit saving because an indefinitely delayed tail is ambiguous.
+        input_lost = true;
+        input_lost |= replay_bytes(input, &candidate[..candidate_len]);
+    }
+    print!("\x1b[H");
+    (
+        detected.unwrap_or_else(|| Ok(ScreenSize::fallback())),
+        input_lost,
+    )
 }
 
 enum LoadError {
@@ -329,12 +566,19 @@ struct Editor<'a> {
     exists: bool,
     input_lost: bool,
     max_bytes: usize,
+    screen: ScreenSize,
     status: Option<&'static str>,
     mode: Mode,
 }
 
 impl<'a> Editor<'a> {
-    fn new(name: &'a str, buffer: Vec<u8>, exists: bool, max_bytes: usize) -> Self {
+    fn new(
+        name: &'a str,
+        buffer: Vec<u8>,
+        exists: bool,
+        max_bytes: usize,
+        screen: ScreenSize,
+    ) -> Self {
         Self {
             name,
             buffer,
@@ -346,6 +590,7 @@ impl<'a> Editor<'a> {
             exists,
             input_lost: false,
             max_bytes,
+            screen,
             status: if exists {
                 Some("ASCII text mode")
             } else {
@@ -453,6 +698,7 @@ impl<'a> Editor<'a> {
                 self.status = None;
                 Action::None
             }
+            Key::CursorReport => Action::None,
             Key::Escape => {
                 self.status = Some("Escape");
                 Action::None
@@ -548,28 +794,29 @@ impl<'a> Editor<'a> {
     }
 
     fn page_up(&mut self) {
-        for _ in 0..TEXT_ROWS {
+        for _ in 0..self.screen.text_rows() {
             self.move_up();
         }
     }
 
     fn page_down(&mut self) {
-        for _ in 0..TEXT_ROWS {
+        for _ in 0..self.screen.text_rows() {
             self.move_down();
         }
     }
 
     fn ensure_visible(&mut self) {
         let (line, column) = cursor_position(&self.buffer, self.cursor);
+        let text_rows = self.screen.text_rows();
         if line < self.top_line {
             self.top_line = line;
-        } else if line >= self.top_line + TEXT_ROWS {
-            self.top_line = line - TEXT_ROWS + 1;
+        } else if line >= self.top_line + text_rows {
+            self.top_line = line - text_rows + 1;
         }
         if column < self.left_column {
             self.left_column = column;
-        } else if column >= self.left_column + COLUMNS {
-            self.left_column = column - COLUMNS + 1;
+        } else if column >= self.left_column + self.screen.columns {
+            self.left_column = column - self.screen.columns + 1;
         }
     }
 }
@@ -659,6 +906,9 @@ impl fmt::Display for Frame<'_, '_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let editor = self.editor;
         let (cursor_line, cursor_column) = cursor_position(&editor.buffer, editor.cursor);
+        let columns = editor.screen.columns;
+        let rows = editor.screen.rows;
+        let text_rows = editor.screen.text_rows();
 
         write!(formatter, "\x1b[?25l\x1b[1;1H\x1b[7m\x1b[2K")?;
         let prefix = " nano-rs  ";
@@ -670,12 +920,12 @@ impl fmt::Display for Frame<'_, '_> {
             ""
         };
         write!(formatter, "{}", prefix)?;
-        let name_width = COLUMNS.saturating_sub(prefix.len() + suffix.len());
+        let name_width = columns.saturating_sub(prefix.len() + suffix.len());
         write_ascii_clipped(formatter, editor.name, name_width)?;
         write!(formatter, "{}\x1b[0m", suffix)?;
 
         let mut current_line = line_offset(&editor.buffer, editor.top_line);
-        for screen_row in 0..TEXT_ROWS {
+        for screen_row in 0..text_rows {
             write!(formatter, "\x1b[{};1H\x1b[2K", screen_row + 2)?;
             let Some(start) = current_line else {
                 write!(formatter, "~")?;
@@ -689,7 +939,7 @@ impl fmt::Display for Frame<'_, '_> {
                 formatter,
                 &editor.buffer[start..end],
                 editor.left_column,
-                COLUMNS,
+                columns,
             )?;
             current_line = if end < editor.buffer.len() {
                 Some(end + 1)
@@ -698,21 +948,21 @@ impl fmt::Display for Frame<'_, '_> {
             };
         }
 
-        write!(formatter, "\x1b[{};1H\x1b[7m\x1b[2K", ROWS - 1)?;
+        write!(formatter, "\x1b[{};1H\x1b[7m\x1b[2K", rows - 1)?;
         if editor.mode == Mode::ConfirmExit {
             write_ascii_clipped(
                 formatter,
                 "Save modified buffer? Y Yes  N No  ^C Cancel",
-                COLUMNS,
+                columns,
             )?;
         } else if editor.input_lost {
-            write_ascii_clipped(formatter, INPUT_LOST_STATUS, COLUMNS)?;
+            write_ascii_clipped(formatter, INPUT_LOST_STATUS, columns)?;
         } else if let Some(status) = editor.status {
-            write_ascii_clipped(formatter, status, COLUMNS)?;
+            write_ascii_clipped(formatter, status, columns)?;
         } else {
             let mut clipped = ClippedWriter {
                 formatter,
-                remaining: COLUMNS,
+                remaining: columns,
             };
             write!(
                 clipped,
@@ -724,11 +974,11 @@ impl fmt::Display for Frame<'_, '_> {
                 cursor_column + 1
             )?;
         }
-        write!(formatter, "\x1b[0m\x1b[{};1H\x1b[2K", ROWS)?;
+        write!(formatter, "\x1b[0m\x1b[{};1H\x1b[2K", rows)?;
         write_ascii_clipped(
             formatter,
             "^G Help  ^O Write Out  ^X Exit  ^C Position  ^Y Prev  ^V Next",
-            COLUMNS,
+            columns,
         )?;
 
         let screen_row = cursor_line - editor.top_line + 2;
@@ -810,17 +1060,18 @@ enum Key {
     End,
     PageUp,
     PageDown,
+    CursorReport,
     Escape,
     Unknown,
 }
 
 struct KeyReader {
-    pending: Option<u8>,
+    input: PendingRx,
 }
 
 impl KeyReader {
-    const fn new(pending: Option<u8>) -> Self {
-        Self { pending }
+    const fn new(input: PendingRx) -> Self {
+        Self { input }
     }
 
     fn read(&mut self) -> Key {
@@ -833,8 +1084,8 @@ impl KeyReader {
         Some(self.decode(byte))
     }
 
-    fn into_pending(self) -> Option<u8> {
-        self.pending
+    fn into_pending(self) -> PendingRx {
+        self.input
     }
 
     fn decode(&mut self, byte: u8) -> Key {
@@ -843,7 +1094,8 @@ impl KeyReader {
                 if let Some(next) = self.read_byte_timeout(CRLF_TIMEOUT_MS)
                     && next != b'\n'
                 {
-                    self.pending = Some(next);
+                    let queued = self.input.push_front(next);
+                    debug_assert!(queued);
                 }
                 Key::Enter
             }
@@ -851,6 +1103,7 @@ impl KeyReader {
             b'\t' => Key::Tab,
             0x08 | 0x7f => Key::Backspace,
             0x1b => self.read_escape(),
+            0x9b => self.read_csi(),
             0x20..=0x7e => Key::Char(byte),
             0x00..=0x1f => Key::Ctrl(byte),
             _ => Key::Unknown,
@@ -873,49 +1126,91 @@ impl KeyReader {
                 _ => Key::Unknown,
             },
             byte => {
-                self.pending = Some(byte);
+                let queued = self.input.push_front(byte);
+                debug_assert!(queued);
                 Key::Escape
             }
         }
     }
 
     fn read_csi(&mut self) -> Key {
-        let mut number = 0u16;
-        let mut has_number = false;
-        for _ in 0..8 {
+        let mut parameters = [0u16; 3];
+        let mut present = [false; 3];
+        let mut parameter = 0usize;
+        let mut malformed = false;
+
+        for index in 0..16 {
             let Some(byte) = self.read_byte_timeout(ESCAPE_TIMEOUT_MS) else {
                 return Key::Unknown;
             };
-            match byte {
-                b'0'..=b'9' if number <= 999 => {
-                    number = number * 10 + (byte - b'0') as u16;
-                    has_number = true;
+            if (0x40..=0x7e).contains(&byte) {
+                if byte == b'R' {
+                    return Key::CursorReport;
                 }
-                b';' => {}
-                b'A' => return Key::Up,
-                b'B' => return Key::Down,
-                b'C' => return Key::Right,
-                b'D' => return Key::Left,
-                b'H' => return Key::Home,
-                b'F' => return Key::End,
-                b'~' if has_number => {
-                    return match number {
+                if malformed {
+                    return Key::Unknown;
+                }
+                return match byte {
+                    b'A' => Key::Up,
+                    b'B' => Key::Down,
+                    b'C' => Key::Right,
+                    b'D' => Key::Left,
+                    b'H' => Key::Home,
+                    b'F' => Key::End,
+                    b'~' if present[0] => match parameters[0] {
                         1 | 7 => Key::Home,
                         3 => Key::Delete,
                         4 | 8 => Key::End,
                         5 => Key::PageUp,
                         6 => Key::PageDown,
                         _ => Key::Unknown,
-                    };
+                    },
+                    _ => Key::Unknown,
+                };
+            }
+
+            match byte {
+                b'0'..=b'9' if !malformed => {
+                    let value = parameters[parameter]
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add((byte - b'0') as u16));
+                    if let Some(value) = value {
+                        parameters[parameter] = value;
+                        present[parameter] = true;
+                    } else {
+                        malformed = true;
+                    }
                 }
-                _ => return Key::Unknown,
+                b';' if !malformed => {
+                    if parameter + 1 < parameters.len() {
+                        parameter += 1;
+                    } else {
+                        malformed = true;
+                    }
+                }
+                b'?' if index == 0 => {}
+                _ => malformed = true,
             }
         }
-        Key::Unknown
+
+        match self.discard_csi_tail() {
+            Some(b'R') => Key::CursorReport,
+            _ => Key::Unknown,
+        }
+    }
+
+    fn discard_csi_tail(&mut self) -> Option<u8> {
+        for _ in 0..32 {
+            let byte = self.read_byte_timeout(ESCAPE_TIMEOUT_MS)?;
+            if (0x40..=0x7e).contains(&byte) {
+                return Some(byte);
+            }
+        }
+        None
     }
 
     fn read_byte(&mut self) -> u8 {
-        self.pending.take().unwrap_or_else(|| {
+        self.input.pop_front().unwrap_or_else(|| {
             crate::board::BoardResources::get()
                 .console()
                 .read_rx_blocking()
@@ -923,7 +1218,7 @@ impl KeyReader {
     }
 
     fn read_byte_timeout(&mut self, timeout_ms: u32) -> Option<u8> {
-        self.pending.take().or_else(|| {
+        self.input.pop_front().or_else(|| {
             crate::board::BoardResources::get()
                 .console()
                 .read_rx_timeout_ms(timeout_ms)

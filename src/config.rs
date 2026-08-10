@@ -359,7 +359,7 @@ pub const SHELL_PASSWORD: &str = env!("CFG_SHELL_PASSWORD");
 pub const SHELL_LOGIN_TRIES: u32 = parse_u32(env!("CFG_SHELL_LOGIN_TRIES"));
 /// 输入行缓冲区大小 (字节) (CFG_SHELL_LINE_BUF)
 pub const SHELL_LINE_BUF_SIZE: usize = parse_u32(env!("CFG_SHELL_LINE_BUF")) as usize;
-/// nano 风格编辑器使用的 ANSI 终端宽度与高度。
+/// nano 风格编辑器无法自动探测 ANSI 终端时使用的回退宽度与高度。
 pub const NANO_COLUMNS: usize = parse_u32(env!("CFG_NANO_COLUMNS")) as usize;
 pub const NANO_ROWS: usize = parse_u32(env!("CFG_NANO_ROWS")) as usize;
 /// 编辑器缓冲区上限。文件系统的实际剩余容量仍由写入预检决定。

@@ -34,7 +34,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 数据位 / 校验 / 停止位 / 过采样 / 流控 / 噪声滤波 / 缓冲 / 中断参数 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
-| `CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` / `CFG_NANO_MAX_BYTES` | nano 终端尺寸 / 单文件编辑上限 |
+| `CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` / `CFG_NANO_MAX_BYTES` | nano 终端探测回退尺寸 / 单文件编辑上限 |
 | `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
 | `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
 
@@ -236,10 +236,13 @@ Shell 输入上限默认 128B，超长命令会整行拒绝而不会截断写入
 `nano <文件>` 提供适合串口终端的精简全屏编辑：方向键、Home/End、翻页、
 插入、退格和 Delete 均可用；`Ctrl+O` 保存，`Ctrl+X` 退出，`Ctrl+G` 显示
 快捷键帮助。首版只编辑 ASCII 文本（允许 LF 和 TAB），遇到其他控制字节、
-UTF-8 或二进制内容会拒绝打开且不改原文件。默认按 80x24 终端显示，编辑
-上限为 16KiB，可通过 `CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` /
-`CFG_NANO_MAX_BYTES` 调整；界面会进一步扣除其他文件和记录开销，采用当前
-真实可写上限。编辑过程不自动写 Flash；仅显式保存会提交完整原子快照，
+UTF-8 或二进制内容会拒绝打开且不改原文件。进入编辑器时会通过 ANSI CPR
+自动探测窗口行列并铺满终端；不支持探测时回退到 80x24，可通过
+`CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` 调整回退值。受串口刷新时延约束，自动
+探测支持 40..240 列、8..100 行，超出范围会明确拒绝进入编辑器。编辑上限
+默认为 16KiB，由 `CFG_NANO_MAX_BYTES` 调整；界面会进一步扣除其他文件和
+记录开销，采用当前真实可写上限。编辑过程不自动写 Flash；仅显式保存会
+提交完整原子快照，
 成功返回时已同步并回读。若设备错误导致结果不确定，编辑器会重挂载并核对
 持久内容，同时保留 RAM 中的编辑缓冲供再次保存。若串口环溢出或出现
 PE/FE/ORE，编辑器会锁存 `INPUT LOST` 并禁止本会话保存，避免缺字内容覆盖
