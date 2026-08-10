@@ -31,10 +31,10 @@
 //! 输入缓冲区大小来自配置 (`CFG_SHELL_LINE_BUF`), 超长截断。
 
 use crate::config;
-use crate::gpio::{Gpio, PortC};
 use crate::heap;
 use crate::print; // #[macro_export] 宏需显式引入
 use crate::println;
+use crate::uart_rtos::UartRtosExt;
 
 /// 登录用户名 (.cargo/config.toml `CFG_SHELL_USERNAME`)
 const SHELL_USERNAME: &str = config::SHELL_USERNAME;
@@ -508,15 +508,13 @@ fn cmd_echo(rest: &str) -> CmdResult {
 
 /// LED 控制
 fn cmd_led(rest: &str) -> CmdResult {
-    let gpio = Gpio::take();
-    let led = gpio.pin::<PortC, { config::LED_PIN }>();
     match rest.trim() {
         "on" => {
-            led.set_high();
+            crate::board::BoardResources::get().set_led(true);
             println!("LED on");
         }
         "off" => {
-            led.set_low();
+            crate::board::BoardResources::get().set_led(false);
             println!("LED off");
         }
         _ => println!("用法: led on|off"),
@@ -551,12 +549,7 @@ fn cmd_whoami(_rest: &str) -> CmdResult {
 fn cmd_reboot(_rest: &str) -> CmdResult {
     println!("rebooting...");
     crate::rtos::thread_delay_ms(50);
-    unsafe {
-        core::ptr::write_volatile(0xE000_ED0C as *mut u32, 0x05FA_0004);
-    }
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+    crate::arch::system_reset()
 }
 
 /// 退出 shell (重新登录)
@@ -605,7 +598,7 @@ fn cmd_log(rest: &str) -> CmdResult {
 /// `masked` 为 true 时输入不回显 (密码模式)。
 /// 中断驱动: 挂起在数据到达信号量上, 由 RX ISR 唤醒, 无轮询。
 fn read_line(masked: bool, max: usize) -> alloc::string::String {
-    let uart = config::ConsoleUart::take();
+    let uart = crate::board::BoardResources::get().console();
     let mut line = alloc::string::String::new();
     loop {
         let b = uart.read_rx_blocking();

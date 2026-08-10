@@ -38,6 +38,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod context;
+pub(crate) mod hooks;
 pub(crate) mod idle;
 pub(crate) mod ipc;
 pub(crate) mod klist;
@@ -59,7 +60,7 @@ pub const IDLE_PRIORITY: u8 = crate::config::IDLE_PRIORITY;
 /// 全局节拍计数 (由 [`tick_increase`] 在时钟中断中累加)
 static TICK: AtomicU32 = AtomicU32::new(0);
 
-/// 当前节拍 (毫秒, 与 SysTick 频率一致)
+/// 当前内核节拍 (32 位回绕计数)
 pub fn tick() -> u32 {
     TICK.load(Ordering::Relaxed)
 }
@@ -72,9 +73,24 @@ pub(crate) fn scheduler_started() -> bool {
     !sched::current().is_null()
 }
 
-/// 运行时间 (ms)
+/// 运行时间 (ms, 32 位回绕计数)
+///
+/// 使用 64 位中间值避免 `tick * 1000` 溢出; 返回值保留原有 `u32`
+/// API, 超过 `u32::MAX` 毫秒后按模 2^32 回绕。
 pub fn uptime_ms() -> u32 {
-    tick()
+    ((tick() as u64 * 1000) / TICKS_PER_SEC as u64) as u32
+}
+
+/// Convert milliseconds to kernel ticks.
+///
+/// Zero remains zero. A nonzero duration is rounded up to at least one tick
+/// and clamped to the signed half-range used by the wrap-safe timer ordering.
+pub fn ticks_from_ms(ms: u32) -> u32 {
+    if ms == 0 {
+        return 0;
+    }
+    let ticks = (ms as u64 * TICKS_PER_SEC as u64).div_ceil(1000);
+    ticks.min(i32::MAX as u64) as u32
 }
 
 /// 初始化内核: 设置 PendSV/SysTick 中断优先级, 创建空闲线程。
@@ -87,20 +103,18 @@ pub fn init() {
 
 /// 启动调度器: 切换到最高优先级线程, **永不返回**。
 pub fn start() -> ! {
-    let first =
-        critical_section::with(|cs| unsafe { sched::highest_ready_thread(cs) })
-            .expect("rtos::start: 没有可运行的线程");
-    unsafe {
+    let first = critical_section::with(|cs| unsafe {
+        let first = sched::highest_ready_thread(cs).expect("rtos::start: 没有可运行的线程");
         sched::set_current(first);
-        // MPU 线程栈守卫: 首个线程的守卫区 (与 schedule() 一致)
-        if crate::config::MPU_ENABLE {
-            crate::mpu::set_thread_guard((*first).guard_addr);
-        }
+        hooks::run_context_switch_hook(first, cs);
+        first
+    });
+    unsafe {
         context::switch_to_first(&mut (*first).sp as *mut usize as usize);
     }
     // PendSV 即将执行首个切换; 此处永不返回
     loop {
-        unsafe { core::arch::asm!("wfi") };
+        crate::arch::wait_for_interrupt();
     }
 }
 
@@ -116,6 +130,10 @@ pub fn tick_increase() {
 }
 
 // 内核 API 全集, 部分供应用选用 (二进制 crate 中未使用项会告警)
+#[allow(unused_imports)]
+pub use hooks::{
+    ContextSwitchHook, ContextSwitchInfo, IdleHook, set_context_switch_hook, set_idle_hook,
+};
 #[allow(unused_imports)]
 pub use ipc::{Error, Event, EventOpt, Mailbox, MessageQueue, Mutex, MutexGuard, Semaphore, Timeout};
 #[allow(unused_imports)]

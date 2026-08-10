@@ -2,7 +2,8 @@
 //!
 //! 定时器按绝对超时时刻 (`timeout_tick`) 升序插入有序链表, 由时钟
 //! 中断调用 [`check`] 检查到期项并执行回调。回调运行在**中断上下文**,
-//! 期间临界区已退出, 允许高优先级中断抢占与内核 API 调用。
+//! 但执行时已退出 PRIMASK 临界区, 允许高优先级中断抢占与中断安全的
+//! 内核 API 调用。
 //!
 //! RT-Thread 以跳表组织定时链表; 本移植使用单层有序链表
 //! (跳表层数 `RT_TIMER_SKIP_LIST_LEVEL=1` 时二者等价)。
@@ -83,7 +84,29 @@ impl Timer {
         });
     }
 
-    /// 停止定时器 (回调将不再触发)
+    /// 启动毫秒定时器。
+    ///
+    /// 非零时长向上取整到至少一个 tick，并钳位到定时器回绕安全窗口；
+    /// `period_ms == 0` 表示一次性定时器。
+    pub fn start_ms(
+        &self,
+        delay_ms: u32,
+        period_ms: u32,
+        callback: extern "C" fn(usize),
+        param: usize,
+    ) {
+        self.start(
+            crate::rtos::ticks_from_ms(delay_ms),
+            crate::rtos::ticks_from_ms(period_ms),
+            callback,
+            param,
+        );
+    }
+
+    /// 停止定时器 (尚未到期的回调将不再触发)
+    ///
+    /// 若到期处理已经摘除本次定时器并提交回调, `stop` 只取消后续
+    /// 周期, 已提交的本次回调仍可能执行。
     pub fn stop(&self) {
         critical_section::with(|_| unsafe {
             self.stop_internal();
@@ -159,46 +182,43 @@ unsafe fn insert_sorted(t: &mut TimerInner, cs: CriticalSection<'_>) {
 
 /// 检查并触发到期定时器 (由时钟中断调用)
 ///
-/// "摘除 + 回调"在**同一个临界区内**原子完成: 若回调在临界区外执行,
-/// 线程删除路径 (stop_internal + 僵尸回收) 可能在其间释放回调参数
-/// 引用的对象 (如线程 TCB), 造成 use-after-free。回调须保持简短,
-/// 且不得在回调内阻塞 (临界区内不可挂起)。
+/// 临界区内只完成到期判定、摘链和状态迁移; 回调在退出 PRIMASK
+/// 临界区后执行。周期定时器在回调前预先重装, 因此回调中的 `stop` /
+/// `start` 会直接作用于下一周期, 回调返回后无需再次访问定时器对象。
+///
+/// 本函数仍运行在 SysTick 中断上下文, 回调不得调用阻塞式 API。
+/// 一旦本次回调已从链表摘除即视为已提交; 与 `stop`/线程删除竞态时,
+/// `stop` 可取消后续周期, 但不撤回已提交回调。线程 TCB 的实际释放由
+/// PendSV 返回后的空闲线程完成, 因而本 ISR 返回前回调参数仍然有效。
 pub(crate) fn check() {
     loop {
-        let done = critical_section::with(|cs| unsafe {
+        let callback = critical_section::with(|cs| unsafe {
             // 立即转裸指针: 之后 insert_sorted 需再次借用 TIMER_LIST,
             // &mut 引用不可重叠存活
             let head = TIMER_LIST.get(cs) as *mut ListHead;
-            let Some(node) = (*head).first() else {
-                return false;
-            };
+            let node = (*head).first()?;
             let t = timer_from_node(node);
             // tick 回绕安全判定: (now - timeout) 视为 i32 时非负即到期
             if (tick().wrapping_sub((*t).timeout_tick) as i32) >= 0 {
                 (*node).remove();
-                // 回调在临界区内执行: 与 delete/stop 互斥, 参数对象安全
-                // (回调须简短, 不得在回调内阻塞)
                 let cb = (*t).callback;
                 let param = (*t).param;
-                cb(param);
-                // 周期定时器重新入队 (回调内已 stop/重新 start 时跳过)
+
+                // 回调前完成状态迁移: 周期定时器预先重装, 一次性定时器
+                // 立即停用。回调可安全 stop/start, 返回后不再访问 t。
                 let t = &mut *t;
-                if t.period_ticks != 0 && !t.node.is_linked() {
-                    if t.started {
-                        t.timeout_tick = tick().wrapping_add(t.period_ticks);
-                        insert_sorted(t, cs);
-                    }
+                if t.period_ticks != 0 && t.started {
+                    t.timeout_tick = tick().wrapping_add(t.period_ticks);
+                    insert_sorted(t, cs);
                 } else {
-                    // 一次性定时器: 触发后清除 started (is_active 不再误报)
                     t.started = false;
                 }
-                true
+                Some((cb, param))
             } else {
-                false
+                None
             }
         });
-        if !done {
-            break;
-        }
+        let Some((cb, param)) = callback else { break };
+        cb(param);
     }
 }

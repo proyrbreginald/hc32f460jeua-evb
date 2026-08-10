@@ -503,8 +503,8 @@ impl<const U: u8> Uart<U> {
 /// 接收环形缓冲大小 (字节) (.cargo/config.toml `CFG_UART_RX_BUF_SIZE`)
 pub const RX_BUF_SIZE: usize = crate::config::UART_RX_BUF_SIZE;
 const _: () = assert!(
-    RX_BUF_SIZE.is_power_of_two(),
-    "CFG_UART_RX_BUF_SIZE 须为 2 的幂 (环形索引用掩码)"
+    RX_BUF_SIZE >= 2 && RX_BUF_SIZE.is_power_of_two(),
+    "CFG_UART_RX_BUF_SIZE 须为不小于 2 的 2 次幂 (环形索引用掩码)"
 );
 
 /// 无锁单生产者单消费者 (SPSC) 环形缓冲
@@ -513,12 +513,13 @@ const _: () = assert!(
 /// (head), 应用是唯一读者 (tail), 单写单读天然无竞争; 内存序
 /// `Release`/`Acquire` 保证"数据先于索引发布"。
 ///
-/// - `push` (ISR): 满时丢弃新字节 (与旧实现一致);
+/// - `push` (ISR): 满时丢弃最新字节并累计软件溢出计数;
 /// - `pop`/`count` (应用): 无临界区, 可安全用于中断接收模式。
 struct RxRing {
     buf: [core::sync::atomic::AtomicU8; RX_BUF_SIZE],
     head: core::sync::atomic::AtomicUsize, // 写索引 (仅 ISR 修改)
     tail: core::sync::atomic::AtomicUsize, // 读索引 (仅应用修改)
+    dropped: core::sync::atomic::AtomicU32, // 缓冲满时丢弃的最新字节数
 }
 
 impl RxRing {
@@ -527,18 +528,22 @@ impl RxRing {
             buf: [const { core::sync::atomic::AtomicU8::new(0) }; RX_BUF_SIZE],
             head: core::sync::atomic::AtomicUsize::new(0),
             tail: core::sync::atomic::AtomicUsize::new(0),
+            dropped: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
-    fn push(&self, byte: u8) {
+    /// 成功入队返回 true; 缓冲满时丢弃最新字节并返回 false。
+    fn push(&self, byte: u8) -> bool {
         use core::sync::atomic::Ordering;
         let h = self.head.load(Ordering::Relaxed);
         let next = (h + 1) & (RX_BUF_SIZE - 1);
         if next == self.tail.load(Ordering::Acquire) {
-            return; // 缓冲满: 丢弃新字节
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
         self.buf[h & (RX_BUF_SIZE - 1)].store(byte, Ordering::Relaxed);
         self.head.store(next, Ordering::Release);
+        true
     }
 
     fn pop(&self) -> Option<u8> {
@@ -558,6 +563,10 @@ impl RxRing {
         let t = self.tail.load(Ordering::Relaxed);
         h.wrapping_sub(t) & (RX_BUF_SIZE - 1)
     }
+
+    fn take_dropped(&self) -> u32 {
+        self.dropped.swap(0, core::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// 各 USART 单元的接收环形缓冲容器 (纯原子, 自动 Sync, 无 unsafe impl)
@@ -568,15 +577,42 @@ static RX_RINGS: [RxRing; 4] = [
     RxRing::new(),
 ];
 
-/// 各 USART 单元的"数据到达"信号量 (ISR 释放, 应用侧等待)
+/// 接收数据成功入队后的通知回调。
 ///
-/// 避免轮询 RX 缓冲: 应用线程在信号量上阻塞, ISR 每收到一个字节
-/// 释放一次 (计数截断, 缓冲满时语义退化为"有数据"提示)。
-static RX_SEMS: [crate::rtos::Semaphore; 4] = [
-    crate::rtos::Semaphore::new(0, 255),
-    crate::rtos::Semaphore::new(0, 255),
-    crate::rtos::Semaphore::new(0, 255),
-    crate::rtos::Semaphore::new(0, 255),
+/// 回调在 USART ISR 中执行, 必须有界、无阻塞且不得打印。底层 UART
+/// 不解释通知语义; RTOS/async/事件循环适配器可据此唤醒自己的等待者。
+pub(crate) type RxNotify = fn();
+
+/// 原子通知槽 (null = 未安装)。函数指针具有静态生命周期, ISR 并发读取安全。
+struct RxNotifySlot(core::sync::atomic::AtomicPtr<()>);
+
+impl RxNotifySlot {
+    const fn new() -> Self {
+        Self(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()))
+    }
+
+    fn store(&self, notify: RxNotify) {
+        self.0.store(
+            notify as *const () as *mut (),
+            core::sync::atomic::Ordering::Release,
+        );
+    }
+
+    fn call(&self) {
+        let ptr = self.0.load(core::sync::atomic::Ordering::Acquire);
+        if !ptr.is_null() {
+            // 槽位只接受 RxNotify, 存入的函数指针始终有效且与目标同宽。
+            let notify = unsafe { core::mem::transmute::<*mut (), RxNotify>(ptr) };
+            notify();
+        }
+    }
+}
+
+static RX_NOTIFIERS: [RxNotifySlot; 4] = [
+    RxNotifySlot::new(),
+    RxNotifySlot::new(),
+    RxNotifySlot::new(),
+    RxNotifySlot::new(),
 ];
 
 /// 接收错误计数 (ISR 累加, 诊断串口噪声/接线/对端波特率用)
@@ -608,7 +644,7 @@ static RX_ERRORS: [RxErrorCounts; 4] = [
 /// - 错误 (ORE/FE/PE): 读 RDR 丢弃出错字节, 写 CR1 清除位 (对齐
 ///   `USART_ClearStatus(USART_FLAG_PARITY_ERR|FRAME_ERR|OVERRUN)`)。
 ///
-/// 仅做缓冲写入, 不调用任何 RTOS/打印 API (中断上下文安全)。
+/// 仅做缓冲写入、错误计数和 OS 无关通知, 不直接调用 RTOS/打印 API。
 unsafe extern "C" fn rx_irq_handler<const U: u8>() {
     unsafe {
         let base = USART_BASES[U as usize - 1];
@@ -619,9 +655,11 @@ unsafe extern "C" fn rx_irq_handler<const U: u8>() {
             let ring = &RX_RINGS[U as usize - 1];
             let errors = &RX_ERRORS[U as usize - 1];
             if sr & SR_RXNE != 0 {
-                ring.push(byte);
-                // 通知等待线程 (信号量计数截断: 缓冲满时退化为"有数据"提示)
-                RX_SEMS[U as usize - 1].release();
+                // 先以 Release 发布 head, 再通知适配层。缓冲满时丢弃最新
+                // 字节且不通知, 避免没有新数据时产生虚假唤醒。
+                if ring.push(byte) {
+                    RX_NOTIFIERS[U as usize - 1].call();
+                }
             }
             // 错误计数 (诊断用, 读 RDR 后仍可通过 SR 判断)
             if sr & SR_PE != 0 {
@@ -665,17 +703,20 @@ impl<const U: u8> Uart<U> {
         )
     }
 
-    /// 阻塞等待一个接收字节 (中断驱动, 无需轮询)
+    /// 安装接收通知回调。
     ///
-    /// 挂起在数据到达信号量上, 由 RX ISR 唤醒; 收到字节即返回。
-    /// 仅可在线程上下文调用。
-    pub fn read_rx_blocking(&self) -> u8 {
-        loop {
-            if let Some(b) = self.read_rx() {
-                return b;
-            }
-            let _ = RX_SEMS[U as usize - 1].take(crate::rtos::Timeout::Forever);
-        }
+    /// 每个 USART 只有一个槽位, 后一次调用原子替换前一次回调。回调在
+    /// 字节成功进入接收环后由 ISR 调用, 必须有界且无阻塞。
+    pub(crate) fn set_rx_notify(&self, notify: RxNotify) {
+        RX_NOTIFIERS[U as usize - 1].store(notify);
+    }
+
+    /// 读取并清零软件接收环溢出计数。
+    ///
+    /// 接收环容量为 `RX_BUF_SIZE - 1`; 满时保留已有数据、丢弃最新字节。
+    /// 该计数与 USART 硬件 ORE 计数相互独立。
+    pub fn rx_dropped_count(&self) -> u32 {
+        RX_RINGS[U as usize - 1].take_dropped()
     }
 }
 

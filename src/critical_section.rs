@@ -1,11 +1,11 @@
-//! 临界区 (PRIMASK 关中断) 与临界区令牌
+//! 架构中断临界区与临界区令牌
 //!
 //! 供 gpio / heap / 内核 (rtos) 等模块复用 (此前各处重复实现)。
 //!
 //! # 嵌套安全
 //!
-//! 仅当进入前中断开启 (PRIMASK=0) 时才执行 `cpsid`/`cpsie`,
-//! 内层嵌套不会提前打开外层临界区的中断。
+//! CPU backend 捕获并恢复完整中断状态，内层嵌套不会提前打开外层
+//! 临界区的中断。
 //!
 //! # 临界区令牌 ([`CriticalSection`])
 //!
@@ -31,28 +31,14 @@ pub struct CriticalSection<'cs> {
 /// `f` 接收 [`CriticalSection`] 令牌, 供内核共享状态的类型安全访问
 /// 使用 (见 [`crate::rtos::klist::KCell::get`])。
 pub fn with<R>(f: impl FnOnce(CriticalSection<'_>) -> R) -> R {
-    let primask: u32;
-    unsafe {
-        core::arch::asm!("mrs {}, primask", out(reg) primask);
-    }
-
-    // 仅当此前中断开启时才进入临界区 (嵌套调用时保持外层状态)
-    if primask & 1 == 0 {
-        unsafe {
-            core::arch::asm!("cpsid i");
-        }
-    }
+    let interrupt_state = crate::arch::acquire_interrupt_lock();
 
     let result = f(CriticalSection {
         _lifetime: PhantomData,
     });
 
-    // 只有自己关闭了中断才重新开启
-    if primask & 1 == 0 {
-        unsafe {
-            core::arch::asm!("cpsie i");
-        }
-    }
+    // 始终恢复入口状态；即使闭包内部改动中断状态也不会泄漏到外层。
+    crate::arch::restore_interrupt_lock(interrupt_state);
     result
 }
 
@@ -64,9 +50,5 @@ pub fn with<R>(f: impl FnOnce(CriticalSection<'_>) -> R) -> R {
 /// 零运行时开销。
 #[inline]
 pub fn in_isr() -> bool {
-    let ipsr: u32;
-    unsafe {
-        core::arch::asm!("mrs {}, ipsr", out(reg) ipsr);
-    }
-    ipsr != 0
+    crate::arch::in_exception()
 }

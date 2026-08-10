@@ -79,7 +79,7 @@ const fn size_code(bytes: u32) -> u32 {
 }
 
 /// 线程栈守卫区大小 (32B, MPU 最小区域粒度)
-pub const STACK_GUARD_SIZE: usize = 32;
+pub const STACK_GUARD_SIZE: usize = crate::arch::STACK_GUARD_SIZE;
 
 fn write32(addr: usize, value: u32) {
     unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
@@ -92,7 +92,7 @@ fn read32(addr: usize) -> u32 {
 /// 配置一个 MPU 区域 (经 RNR 选择)
 fn set_region(rn: u8, base: usize, bytes: u32, ap: u32, xn: bool, tex: u32, cacheable: bool) {
     // SIZE 字段 = log2(bytes) - 1; base 必须按 bytes 对齐 (调用方保证)
-    debug_assert!(bytes.is_power_of_two() && (base as u32) % bytes == 0);
+    debug_assert!(bytes.is_power_of_two() && (base as u32).is_multiple_of(bytes));
     write32(MPU_RNR, rn as u32);
     write32(MPU_RBAR, (base as u32) & !0x1F); // VALID=0: 由 RNR 选择区域
     let mut rasr = RASR_ENABLE | (size_code(bytes) << RASR_SIZE_POS) | (ap << RASR_AP_POS)

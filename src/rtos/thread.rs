@@ -15,13 +15,13 @@ use alloc::sync::Arc;
 
 use crate::critical_section;
 use crate::critical_section::CriticalSection;
+use crate::rtos::PRIORITY_MAX;
 use crate::rtos::context;
 use crate::rtos::idle::defunct_push;
 use crate::rtos::ipc::{Error, EventOpt, MutexInner, mutex_release_all_held};
 use crate::rtos::klist::{KCell, ListHead};
 use crate::rtos::sched;
 use crate::rtos::timer::Timer;
-use crate::rtos::{PRIORITY_MAX, TICKS_PER_SEC};
 
 /// 线程状态
 pub(crate) const TS_INIT: u8 = 0;
@@ -37,13 +37,13 @@ pub(crate) const STACK_PATTERN: u32 = 0xA5A5_A5A5;
 /// 最先被破坏, 由空闲线程巡检 ([`check_stack_canaries`]) 检出。
 pub(crate) const CANARY_SIZE: usize = 4;
 
-/// MPU 栈守卫区大小: 位于栈区**下方** (线程自身分配内), 硬件
-/// 无访问区域 —— 栈溢出先触发 MemManage 故障 (见 mpu 模块)。
-/// 与 [`crate::mpu::STACK_GUARD_SIZE`] 一致。
-pub(crate) const GUARD_SIZE: usize = crate::mpu::STACK_GUARD_SIZE;
+/// CPU port 预留的栈守卫区: 位于栈区**下方** (线程自身分配内)。
+pub(crate) const GUARD_SIZE: usize = crate::arch::STACK_GUARD_SIZE;
+const GUARD_ALIGN: usize = crate::arch::STACK_GUARD_ALIGN;
+const _: () = assert!(GUARD_ALIGN.is_power_of_two(), "栈守卫对齐必须为 2 的幂");
 
-/// 栈分配额外开销: MPU 守卫 (32B) + 32B 对齐裕量 (守卫区须 32B 对齐)
-const STACK_ALLOC_EXTRA: usize = GUARD_SIZE + 32;
+/// 栈分配额外开销: CPU 守卫区 + 基址对齐裕量。
+const STACK_ALLOC_EXTRA: usize = GUARD_SIZE + GUARD_ALIGN;
 
 /// 睡眠队列 (线程延时挂起; 与 IPC 挂起队列共用 suspend_node)
 static SLEEP_LIST: KCell<ListHead> = KCell::new(ListHead::const_new());
@@ -75,7 +75,7 @@ pub struct Thread {
     pub(crate) stack_size: usize,
     /// 栈底 canary 字地址 (软件溢出检测, 见 [`check_stack_canaries`])
     pub(crate) canary_addr: usize,
-    /// MPU 栈守卫区基址 (32B 对齐, 硬件无访问区域, 见 mpu 模块)
+    /// CPU port 栈守卫区基址 (按 backend 要求对齐)
     pub(crate) guard_addr: usize,
     /// 堆分配基址 (含守卫区/对齐裕量, 回收时按此释放)
     pub(crate) alloc_addr: usize,
@@ -216,14 +216,14 @@ pub fn thread_create(
     assert!(priority < PRIORITY_MAX, "thread_create: 优先级超出范围");
     assert!(stack_size >= 256, "thread_create: 栈过小");
 
-    // 分配线程栈 (8 字节对齐): 分配 = [对齐裕量 | MPU 守卫 32B | 栈],
-    // 守卫区 32B 对齐 (MPU 区域要求)。栈向下溢出先撞守卫区 (硬件
+    // 分配线程栈 (8 字节对齐): 分配 = [对齐裕量 | CPU 守卫区 | 栈],
+    // 守卫区按 CPU port 要求对齐。栈向下溢出先撞守卫区 (硬件
     // MemManage 故障), 再撞软件 canary (MPU 关闭时的后备检测)。
     let layout = Layout::from_size_align(stack_size + STACK_ALLOC_EXTRA, 8).expect("栈布局无效");
     let stack = unsafe { alloc(layout) };
     assert!(!stack.is_null(), "thread_create: 栈分配失败");
     let alloc_addr = stack as usize;
-    let guard_addr = (alloc_addr + 31) & !31; // 守卫区 32B 对齐
+    let guard_addr = (alloc_addr + GUARD_ALIGN - 1) & !(GUARD_ALIGN - 1);
     let stack_addr = guard_addr + GUARD_SIZE;
     unsafe {
         core::ptr::write_volatile(stack_addr as *mut u32, STACK_PATTERN);
@@ -356,7 +356,7 @@ unsafe fn exit_and_schedule(t: *mut Thread) -> ! {
     sched::schedule();
     // PendSV 即将切换走, 此循环仅在切换前短暂执行
     loop {
-        unsafe { core::arch::asm!("wfi") };
+        crate::arch::wait_for_interrupt();
     }
 }
 
@@ -395,8 +395,11 @@ pub fn thread_delay(ticks: u32) {
 }
 
 /// 线程延时 (ms)
+///
+/// 非零时长向上取整到至少一个 tick; 使用 64 位中间值避免乘法溢出。
+/// 超出定时器回绕安全窗口的时长钳位到 `i32::MAX` tick。
 pub fn thread_delay_ms(ms: u32) {
-    thread_delay(ms.saturating_mul(TICKS_PER_SEC) / 1000);
+    thread_delay(crate::rtos::ticks_from_ms(ms));
 }
 
 /// 主动让出 CPU (同优先级轮转)

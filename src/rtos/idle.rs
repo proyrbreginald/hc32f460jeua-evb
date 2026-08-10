@@ -34,7 +34,7 @@ pub(crate) fn create_idle() {
     );
 }
 
-/// 空闲线程主循环: 栈溢出巡检 → 喂狗 → 回收僵尸线程 → 让出 CPU
+/// 空闲线程主循环: 栈溢出巡检 → idle hook → 回收僵尸线程 → 让出 CPU
 extern "C" fn idle_entry(_param: usize) {
     loop {
         // 栈溢出巡检: 任一线程栈底 canary 被破坏即 panic
@@ -46,14 +46,11 @@ extern "C" fn idle_entry(_param: usize) {
         if !crate::rtos::thread::check_main_stack_canary() {
             panic!("主栈 (MSP) 溢出: 中断/启动栈 canary 被破坏");
         }
-        // 看门狗喂狗 (CFG_WDT_ENABLE 编译期开关, false 时整段消除)
-        if crate::config::WDT_ENABLE {
-            crate::wdt::feed();
-        }
+        crate::rtos::hooks::run_idle_hook();
         defunct_execute();
         sched::schedule();
         // 无更紧急线程时进入低功耗等待 (SysTick 等中断唤醒)
-        unsafe { core::arch::asm!("wfi") };
+        crate::arch::wait_for_interrupt();
     }
 }
 

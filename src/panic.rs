@@ -41,7 +41,7 @@ pub unsafe extern "C" fn nmi_handler() {
         err
     ));
     loop {
-        unsafe { core::arch::asm!("wfi") };
+        crate::arch::wait_for_interrupt();
     }
 }
 
@@ -247,22 +247,12 @@ fn report_fault_registers() {
 
 /// 收尾: 按 [`STRATEGY`] 停机或软复位 (屏蔽中断, 防止被打断)
 fn terminate() -> ! {
-    unsafe {
-        core::arch::asm!("cpsid i");
-    }
+    crate::arch::disable_interrupts();
     match STRATEGY {
         PanicStrategy::Halt => loop {
-            unsafe {
-                core::arch::asm!("wfi");
-            }
+            crate::arch::wait_for_interrupt();
         },
-        PanicStrategy::Reset => unsafe {
-            // AIRCR: VECTKEY=0x05FA, SYSRESETREQ=1 → 软复位
-            core::ptr::write_volatile((SCB_BASE + 0x0C) as *mut u32, 0x05FA_0004);
-            loop {
-                core::arch::asm!("nop");
-            }
-        },
+        PanicStrategy::Reset => crate::arch::system_reset(),
     }
 }
 

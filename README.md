@@ -41,16 +41,20 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 - 数值均为字符串, 编译期解析 (支持 `_` 分隔), 溢出/非法字符/非法枚举
   (如 `CFG_UART_OVERSAMPLE` 非 8/16) 在编译期报错;
 - UART/LED 的**端口类型** (PortA/PortC) 由 Rust 类型系统编码, 固定在
-  `main.rs` 中, 引脚号/功能号等数值参数可在此配置; 引脚存在性仍由
+  `board.rs` 中, 引脚号/功能号等数值参数可在此配置; 引脚存在性仍由
   `Pin::new()` 编译期校验 (JEUA 封装引脚表);
 - `build.rs` 仅负责构建日期与 rustc 版本 (启动横幅显示用)。
 
 ## 目录结构
 
+可移植性分层、已完成改造和后续迁移顺序见 [`PORTING.md`](PORTING.md)。
+
 ```
 src/
-├── main.rs            # 应用入口: 硬件初始化 + 演示线程 (led/shell) + 定时器 + selftest 启动
+├── main.rs            # 应用入口: 线程/定时器创建与板级资源编排
 ├── config.rs          # 编译期配置入口 (.cargo/config.toml [env] → 类型化常量)
+├── board.rs           # BSP: 板载资源绑定与硬件初始化顺序
+├── arch/              # CPU 原语 backend (当前为 Cortex-M)
 ├── banner.rs          # 启动横幅 (应用层): 块字符大标题 + 内核信息面板
 ├── startup.rs         # 复位入口: SRAM 等待周期/FPU/.data/.bss → main
 ├── vector_table.rs    # 复位/异常/144 外设中断向量表 + INT000~007 中断分发
@@ -67,6 +71,7 @@ src/
 ├── gpio.rs            # GPIO: 寄存器→端口→引脚→接口四层, const 泛型校验
 ├── systick.rs         # SysTick 1kHz 节拍 (RTOS 时钟源)
 ├── uart.rs            # USART1~4 驱动 (波特率/过采样) + 中断接收环形缓冲
+├── uart_rtos.rs       # UART 非阻塞通知到 RTOS semaphore 的适配层
 ├── console.rs         # 控制台: 打印锁 (优先级继承) + 原子整行输出
 ├── log.rs             # 应用日志: 分级+彩色标签, 与内核打印分离 (可开关)
 ├── build.rs           # 构建元数据 (日期/rustc 版本, 供启动横幅使用)
@@ -78,6 +83,7 @@ src/
     ├── timer.rs       # 有序链表硬定时器 (tick 回绕安全)
     ├── ipc.rs         # 信号量/互斥量(优先级继承)/事件/邮箱/消息队列
     ├── idle.rs        # 空闲线程 (wfi) + 僵尸线程回收
+    ├── hooks.rs       # idle/context-switch 静态集成 hook
     └── context.rs     # Cortex-M4 PendSV 上下文切换汇编 (含 FPU)
 ```
 
@@ -211,8 +217,7 @@ reset_handler (startup.rs)
  ├─ SRAMC 等待周期 / FLASH 等待周期 / FPU 使能
  ├─ .data 拷贝 / .bss 清零
  └─ main
-     ├─ clk::init()                # 按配置选源 (默认 pll), 失败自动回退
-     ├─ GPIO (LED/串口引脚) / SysTick 1kHz / USART1 115200
+     ├─ Board::init()              # 时钟/MPU/GPIO/SysTick/UART/RTC
      ├─ rtos::init()               # PendSV/SysTick 优先级 + 空闲线程
      ├─ rtos::thread_create(...)   # 创建演示线程
      └─ rtos::start()              # 首次切换, 永不返回
@@ -242,11 +247,17 @@ rtos::thread_create("led", 2048, 2, 10, led_thread, 0); // 3. 创建线程
 rtos::start();                      // 4. 启动调度器 (永不返回)
 
 extern "C" fn led_thread(_p: usize) {
-    loop { LED.toggle(); rtos::thread_delay_ms(500); }
+    loop {
+        board::BoardResources::get().toggle_led();
+        rtos::thread_delay_ms(500);
+    }
 }
 ```
 
-- 优先级:0(最高)~ 31(最低,空闲线程);时间片单位 = 节拍 (1ms);
+- 优先级:0(最高)~ 31(最低,空闲线程);时间片单位 = 节拍,实际时长由
+  `CFG_TICKS_PER_SEC` 决定;
+- `thread_delay_ms` / `Timer::start_ms` 将非零毫秒向上取整到至少 1 tick;
+  `Timer::start` 等原始接口仍以 tick 为单位;
 - 线程栈由堆分配,打印线程建议 ≥2KB (debug 构建下格式化打印栈消耗较大),
   调度器在每次切换时检测栈溢出;
 - 阻塞 API:线程上下文使用;中断上下文仅可用非阻塞调用
@@ -365,7 +376,8 @@ continue
   `led on|off` / `log` / `selftest` / `clear` / `whoami` / `reboot` /
   `logout`(exit);
 - 输入: 回车提交, 退格删除, Ctrl+C 清行;
-- 输入采用中断驱动 (RX ISR 释放信号量, 线程阻塞等待, 无轮询)。
+- 输入采用中断驱动 (RX ISR 发出 OS 无关通知, `uart_rtos` 释放信号量,
+  线程阻塞等待, 无轮询)。
 
 ### 内核自检 (selftest)
 
@@ -401,7 +413,9 @@ continue
   `CR1.RIE` (对齐 DDL `INTC_IrqSignIn` / `USART_FuncCmd`);
 - 接收中断把字节写入环形缓冲 (大小 `CFG_UART_RX_BUF_SIZE`, 溢出丢弃
   新字节), 应用侧 `rx_count()` / `read_rx()` / `drain_rx()` 非阻塞读取,
-  `read_rx_blocking()` 阻塞等待;
+  `rx_dropped_count()` 读取软件丢包计数;
+- 裸 UART ISR 只发出 OS 无关通知; `uart_rtos::UartRtosExt` 通过容量为 1
+  的信号量提供 `read_rx_blocking()`, 重复通知可合并,接收环仍是数据真值;
 - 错误处理对齐 `USART_ClearStatus`: 读 RDR 清 RXNE, 写 CR1 的
   CPE/CFE/CORE 清 PE/FE/ORE; ISR 同时累加 PE/FE/ORE 计数,
   `rx_error_counts()` 读取并清零 (诊断波特率/接线/读取不及时);
@@ -479,8 +493,10 @@ python3 -m venv .venv && .venv/bin/pip install pyocd
 - `thread.rs` 提取公共辅助: `wakeup_thread` (唤醒统一路径) /
   `resched_needed` (优先级抢占判定) / `blocked_wait` (阻塞恢复判定),
   消除 `ipc.rs` 6 处重复的"调度 + 超时检查"模式与 3 处唤醒序列;
-- `timer::check` 的"摘除 + 回调"改为临界区原子 (消除线程删除与
-  定时器回调之间的 use-after-free 竞态);
+- `timer::check` 在临界区内完成摘链与状态迁移,退出临界区后执行 ISR
+  回调;回调返回后不再解引用定时器,兼顾对象生命周期与中断延迟;
+- RTOS 的 idle/context-switch 静态 hook 将 WDT/MPU 策略移到 BSP,
+  内核调度路径不再反向依赖具体设备;
 - `context.rs` 统一寄存器写入辅助; 全项目修复历史 clippy 警告,
   当前 0 警告 0 错误。
 
@@ -492,5 +508,5 @@ python3 -m venv .venv && .venv/bin/pip install pyocd
 - **静态链表写入被消除**: 静态对象的 `KCell` 链表写入 (thread_create
   的线程登记) 曾因"写后无读"被编译器判定为死存储而消除 (ps 列表为空),
   通过 `get_mut` + volatile 读屏障强制保留;
-- **RX 输入中断驱动化**: read_line 从 5ms 轮询改为信号量阻塞等待
-  (RX ISR 释放), 消除高频定时器操作对调度的扰动。
+- **RX 输入中断驱动化**: read_line 从 5ms 轮询改为信号量阻塞等待;
+  UART ISR 经 OS 无关 notifier 唤醒 RTOS adapter,消除裸驱动对内核的依赖。

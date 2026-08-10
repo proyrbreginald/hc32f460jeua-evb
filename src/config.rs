@@ -206,6 +206,7 @@ const _: () = assert_div(DIV_EXCLK);
 pub const SYSTICK_FREQ_HZ: u32 = parse_u32(env!("CFG_SYSTICK_HZ"));
 /// RTOS 节拍频率 (Hz) (CFG_TICKS_PER_SEC)
 pub const TICKS_PER_SEC: u32 = parse_u32(env!("CFG_TICKS_PER_SEC"));
+const _: () = assert!(TICKS_PER_SEC > 0, "CFG_TICKS_PER_SEC 必须大于 0");
 /// 两者必须一致 (编译期校验)
 const _: () = assert!(
     SYSTICK_FREQ_HZ == TICKS_PER_SEC,
@@ -213,10 +214,26 @@ const _: () = assert!(
 );
 /// 优先级数量 (0 = 最高) (CFG_PRIORITY_MAX)
 pub const PRIORITY_MAX: u8 = parse_u8(env!("CFG_PRIORITY_MAX"));
+const _: () = assert!(
+    PRIORITY_MAX >= 1 && PRIORITY_MAX <= 32,
+    "CFG_PRIORITY_MAX 必须在 1~32 范围内"
+);
 /// 空闲线程优先级 (最低) (CFG_IDLE_PRIORITY)
 pub const IDLE_PRIORITY: u8 = parse_u8(env!("CFG_IDLE_PRIORITY"));
+const _: () = assert!(
+    IDLE_PRIORITY as u16 + 1 == PRIORITY_MAX as u16,
+    "CFG_IDLE_PRIORITY 必须等于 CFG_PRIORITY_MAX - 1"
+);
 /// 空闲线程栈大小 (字节) (CFG_IDLE_STACK)
 pub const IDLE_STACK_SIZE: usize = parse_u32(env!("CFG_IDLE_STACK")) as usize;
+const _: () = assert!(
+    IDLE_STACK_SIZE >= 256,
+    "CFG_IDLE_STACK 不得小于线程最小栈 256 字节"
+);
+const _: () = assert!(
+    IDLE_STACK_SIZE.is_multiple_of(8),
+    "CFG_IDLE_STACK 必须按 8 字节对齐"
+);
 
 // ============================== [uart] ==============================
 
