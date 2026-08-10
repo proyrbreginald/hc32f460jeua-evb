@@ -79,6 +79,30 @@ fn no_space_is_preflight_and_does_not_poison_mount() {
 }
 
 #[test]
+fn max_write_size_accounts_for_records_and_namespace_limit() {
+    let mut fs = FileSystem::format(RamNor::new(256, 8)).unwrap();
+    let empty_capacity = fs.max_write_size("a").unwrap();
+    fs.write("other", &[0x41; 100]).unwrap();
+    assert!(fs.max_write_size("a").unwrap() < empty_capacity);
+    assert!(fs.max_write_size("other").unwrap() > fs.max_write_size("a").unwrap());
+
+    let replacement_capacity = fs.max_write_size("other").unwrap() as usize;
+    fs.write("other", &vec![0x42; replacement_capacity])
+        .unwrap();
+    assert_eq!(
+        fs.write("other", &vec![0x43; replacement_capacity + 1]),
+        Err(Error::NoSpace)
+    );
+
+    let mut full = FileSystem::format(RamNor::new(512, 8)).unwrap();
+    for index in 0..MAX_FILES {
+        full.write(&format!("f{index:02}"), b"").unwrap();
+    }
+    assert_eq!(full.max_write_size("overflow"), Err(Error::NoSpace));
+    assert!(full.max_write_size("f00").is_ok());
+}
+
+#[test]
 fn file_count_is_bounded_without_allocation() {
     let mut fs = FileSystem::format(RamNor::new(512, 8)).unwrap();
     for index in 0..MAX_FILES {

@@ -121,6 +121,33 @@ impl<D: BlockDevice> FileSystem<D> {
             .ok_or(Error::NotFound)
     }
 
+    /// Maximum data length that a whole-file write to `name` can currently fit.
+    ///
+    /// This is a read-only preflight. Replacing a file reclaims its current
+    /// record, while creating a file also accounts for the namespace limit.
+    pub fn max_write_size(&mut self, name: &str) -> Result<u32, Error<D::Error>> {
+        validate_name(name)?;
+        let existing = find_record(&mut self.device, &self.active, name)?;
+        if existing.is_none() && self.active.file_count >= MAX_FILES {
+            return Err(Error::NoSpace);
+        }
+
+        let replaced_len = existing.map_or(0, |record| record.record_len);
+        let retained_len = self
+            .active
+            .payload_len
+            .checked_sub(replaced_len)
+            .ok_or(Error::Corrupt)?;
+        let available = snapshot_capacity(self.geometry)
+            .ok_or(Error::InvalidGeometry)?
+            .checked_sub(retained_len)
+            .ok_or(Error::Corrupt)?;
+        let fixed_len = (RECORD_HEADER_SIZE as u32)
+            .checked_add(name.len() as u32)
+            .ok_or(Error::FileTooLarge)?;
+        available.checked_sub(fixed_len).ok_or(Error::NoSpace)
+    }
+
     /// Read up to `buffer.len()` bytes starting at `offset`.
     pub fn read(
         &mut self,

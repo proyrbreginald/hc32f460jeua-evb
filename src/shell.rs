@@ -22,7 +22,7 @@
 //! 开关) 仍由各自的 `CFG_*` 配置控制。
 //!
 //! 当前命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) /
-//! `echo` / `ls` / `cat` / `write`(put) / `rm` / `mv` / `stat` /
+//! `echo` / `ls` / `cat` / `write`(put) / `nano` / `rm` / `mv` / `stat` /
 //! `df`(fsinfo) / `fsck` / `mount` / `mkfs` / `led` / `log` / `selftest` /
 //! `clear` / `whoami` / `reboot` / `logout`(exit)。
 //!
@@ -30,6 +30,8 @@
 //!
 //! 回车提交命令, 退格 (BS/DEL) 删除字符, Ctrl+C 清空当前行;
 //! 输入缓冲区大小来自配置 (`CFG_SHELL_LINE_BUF`), 超长命令整行拒绝执行。
+
+mod editor;
 
 use crate::config;
 use crate::heap;
@@ -48,6 +50,8 @@ const HOSTNAME: &str = config::CHIP_MODEL;
 
 /// 输入行缓冲区大小 (.cargo/config.toml `CFG_SHELL_LINE_BUF`)
 const LINE_BUF: usize = config::SHELL_LINE_BUF_SIZE;
+/// CR 后等待可选 LF 的时间，同时兼容 CR-only 终端。
+const INPUT_CRLF_TIMEOUT_MS: u32 = 25;
 
 struct InputLine {
     text: alloc::string::String,
@@ -60,6 +64,7 @@ type FsError = littlefs::Error<crate::filesystem::FlashError>;
 struct ShellState {
     filesystem: Option<crate::filesystem::FileSystem>,
     last_mount_error: Option<FsError>,
+    pending_rx: Option<u8>,
 }
 
 impl ShellState {
@@ -75,6 +80,7 @@ impl ShellState {
                 Self {
                     filesystem: Some(filesystem),
                     last_mount_error: None,
+                    pending_rx: None,
                 }
             }
             Ok(crate::filesystem::Startup::Formatted(filesystem)) => {
@@ -82,6 +88,7 @@ impl ShellState {
                 Self {
                     filesystem: Some(filesystem),
                     last_mount_error: None,
+                    pending_rx: None,
                 }
             }
             Err(error) => {
@@ -94,6 +101,7 @@ impl ShellState {
                 Self {
                     filesystem: None,
                     last_mount_error: Some(error),
+                    pending_rx: None,
                 }
             }
         }
@@ -189,6 +197,7 @@ static COMMANDS: &[Command] = &[
         "原子创建/覆盖: write <文件> [文本]",
         cmd_write,
     ),
+    cmd("nano", &[], "全屏编辑: nano <文件>", cmd_nano),
     cmd("rm", &[], "删除文件: rm <文件>", cmd_rm),
     cmd("mv", &[], "重命名: mv <旧名> <新名>", cmd_mv),
     cmd("stat", &[], "文件信息: stat <文件>", cmd_stat),
@@ -209,25 +218,25 @@ static COMMANDS: &[Command] = &[
 pub extern "C" fn shell_entry(_param: usize) {
     let mut state = ShellState::start();
     loop {
-        login();
+        login(&mut state);
         command_loop(&mut state);
     }
 }
 
 /// 登录流程: 提示用户名/密码, 验证通过后进入 shell
-fn login() {
+fn login(state: &mut ShellState) {
     let mut tries = 0;
     loop {
         println!();
         print!("{} login: ", HOSTNAME);
-        let user = read_line(false, LINE_BUF);
+        let user = read_line(&mut state.pending_rx, false, LINE_BUF);
         println!();
         if user.overflowed || user.text.trim() != SHELL_USERNAME {
             tries += 1;
             println!("Login incorrect");
         } else {
             print!("Password: ");
-            let pass = read_line(true, LINE_BUF);
+            let pass = read_line(&mut state.pending_rx, true, LINE_BUF);
             println!();
             if !pass.overflowed && pass.text == SHELL_PASSWORD {
                 println!(
@@ -256,7 +265,7 @@ fn login() {
 fn command_loop(state: &mut ShellState) {
     loop {
         print!("{}@{}:~$ ", SHELL_USERNAME, HOSTNAME);
-        let line = read_line(false, LINE_BUF);
+        let line = read_line(&mut state.pending_rx, false, LINE_BUF);
         println!();
         if line.overflowed {
             println!("输入超过 {} B，命令未执行", LINE_BUF);
@@ -825,6 +834,15 @@ fn cmd_write(state: &mut ShellState, rest: &str) -> CmdResult {
     CmdResult::Ok
 }
 
+fn cmd_nano(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(name) = one_argument(rest) else {
+        println!("用法: nano <文件>");
+        return CmdResult::Ok;
+    };
+    editor::run(state, name);
+    CmdResult::Ok
+}
+
 fn cmd_rm(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(name) = one_argument(rest) else {
         println!("用法: rm <文件>");
@@ -1049,14 +1067,22 @@ fn cmd_log(_state: &mut ShellState, rest: &str) -> CmdResult {
 ///
 /// `masked` 为 true 时输入不回显 (密码模式)。
 /// 中断驱动: 挂起在数据到达信号量上, 由 RX ISR 唤醒, 无轮询。
-fn read_line(masked: bool, max: usize) -> InputLine {
+fn read_line(pending_rx: &mut Option<u8>, masked: bool, max: usize) -> InputLine {
     let uart = crate::board::BoardResources::get().console();
     let mut line = alloc::string::String::new();
     let mut overflow = 0usize;
     loop {
-        let b = uart.read_rx_blocking();
+        let b = pending_rx.take().unwrap_or_else(|| uart.read_rx_blocking());
         match b {
-            b'\r' | b'\n' => break,
+            b'\r' => {
+                if let Some(next) = uart.read_rx_timeout_ms(INPUT_CRLF_TIMEOUT_MS)
+                    && next != b'\n'
+                {
+                    *pending_rx = Some(next);
+                }
+                break;
+            }
+            b'\n' => break,
             0x08 | 0x7F => {
                 // 超出缓冲区的字符没有回显，先消费对应的退格。
                 if overflow > 0 {

@@ -13,7 +13,7 @@ a bounded flat namespace and complete immutable snapshots.
 ## Supported operations
 
 - atomic whole-file create or replace;
-- bounded reads, `stat`, and callback-based listing;
+- bounded reads, `stat`, write-size preflight, and callback-based listing;
 - atomic remove and rename;
 - format, mount, verification, and device recovery after an I/O error.
 
@@ -24,4 +24,3 @@ most 32 files.
 
 See [DESIGN.md](DESIGN.md) for the disk format, durability contract, and safety
 argument.
-

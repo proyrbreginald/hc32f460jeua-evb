@@ -34,6 +34,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 数据位 / 校验 / 停止位 / 过采样 / 流控 / 噪声滤波 / 缓冲 / 中断参数 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
+| `CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` / `CFG_NANO_MAX_BYTES` | nano 终端尺寸 / 单文件编辑上限 |
 | `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
 | `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
 
@@ -75,6 +76,9 @@ src/
 ├── uart_rtos.rs       # UART 非阻塞通知到 RTOS semaphore 的适配层
 ├── console.rs         # 控制台: 打印锁 (优先级继承) + 原子整行输出
 ├── log.rs             # 应用日志: 分级+彩色标签, 与内核打印分离 (可开关)
+├── shell.rs           # 登录、命令注册与文件系统命令
+├── shell/
+│   └── editor.rs      # nano 风格 ANSI 全屏文本编辑器
 ├── build.rs           # 构建元数据 (日期/rustc 版本, 供启动横幅使用)
 └── rtos/              # RTOS 内核 (RT-Thread 架构移植, 不依赖应用模块)
     ├── mod.rs         # 公共 API: init/start/tick/thread_create 等
@@ -176,7 +180,8 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
 metadata pair 追加日志、FCRC、orphan/move 状态机：
 
 - API：`format` / `mount` / 整文件 `write` / `read` / `stat` / `list` /
-  `remove` / `rename` / `clear` / `verify`；无堆分配、无 `unsafe`；
+  `max_write_size` / `remove` / `rename` / `clear` / `verify`；无堆分配、
+  无 `unsafe`；
 - 每次变更写到当前快照之后的不重叠扇区，完整 `sync` + 回读验证后，最后
   单独编程一个此前未写过的 4B commit word；挂载只接受 marker、header
   CRC、payload CRC、逐文件 CRC 和全部结构边界同时有效的版本；
@@ -213,6 +218,7 @@ cargo test --workspace --target x86_64-unknown-linux-gnu
 ```text
 ls                         # 列出文件
 write config mode=normal   # 原子创建或完整覆盖短文本文件 (别名 put)
+nano config                # ANSI 全屏编辑文件；不存在时新建
 cat config                 # 分块读取；不可打印字节显示为 \xNN
 stat config                # 文件大小与 CRC
 mv config settings         # 原子重命名
@@ -226,6 +232,18 @@ mkfs --force               # 显式清空全部文件
 Shell 输入上限默认 128B，超长命令会整行拒绝而不会截断写入；`write` 面向短
 单行文本，文件系统本身仍支持约 32KiB 快照。每个变更命令成功返回时已经
 完成同步和回读，无需额外 `sync` 命令。
+
+`nano <文件>` 提供适合串口终端的精简全屏编辑：方向键、Home/End、翻页、
+插入、退格和 Delete 均可用；`Ctrl+O` 保存，`Ctrl+X` 退出，`Ctrl+G` 显示
+快捷键帮助。首版只编辑 ASCII 文本（允许 LF 和 TAB），遇到其他控制字节、
+UTF-8 或二进制内容会拒绝打开且不改原文件。默认按 80x24 终端显示，编辑
+上限为 16KiB，可通过 `CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` /
+`CFG_NANO_MAX_BYTES` 调整；界面会进一步扣除其他文件和记录开销，采用当前
+真实可写上限。编辑过程不自动写 Flash；仅显式保存会提交完整原子快照，
+成功返回时已同步并回读。若设备错误导致结果不确定，编辑器会重挂载并核对
+持久内容，同时保留 RAM 中的编辑缓冲供再次保存。若串口环溢出或出现
+PE/FE/ORE，编辑器会锁存 `INPUT LOST` 并禁止本会话保存，避免缺字内容覆盖
+原文件；此时应退出并重新打开。
 
 ## 片内 SRAM (sram)
 
@@ -446,7 +464,8 @@ continue
 - **每个命令可单独启用/禁用**: `CFG_SHELL_COMMANDS` 为逗号分隔的命令名
   列表, 未列出的命令执行时提示 "未启用" 且不出现在 `help` 中;
 - 命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) / `echo` /
-  `ls` / `cat` / `write`(put) / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` /
+  `ls` / `cat` / `write`(put) / `nano` / `rm` / `mv` / `stat` / `df`(fsinfo) /
+  `fsck` /
   `mount` / `mkfs --force` / `led` / `log` / `selftest` / `clear` / `whoami` /
   `reboot` / `logout`(exit);
 - 输入: 回车提交, 退格删除, Ctrl+C 清行;

@@ -29,6 +29,9 @@ pub(crate) trait UartRtosExt {
     ///
     /// 仅可在线程上下文调用, 且同一 USART 接收环只允许一个消费者。
     fn read_rx_blocking(&self) -> u8;
+
+    /// 在限定时间内读取一个字节；超时返回 `None`。
+    fn read_rx_timeout_ms(&self, timeout_ms: u32) -> Option<u8>;
 }
 
 impl<const U: u8> UartRtosExt for Uart<U> {
@@ -42,6 +45,28 @@ impl<const U: u8> UartRtosExt for Uart<U> {
                 return byte;
             }
             let _ = RX_READY[U as usize - 1].take(Timeout::Forever);
+        }
+    }
+
+    fn read_rx_timeout_ms(&self, timeout_ms: u32) -> Option<u8> {
+        self.set_rx_notify(rx_notify::<U>);
+        let timeout = crate::rtos::ticks_from_ms(timeout_ms);
+        let started = crate::rtos::tick();
+
+        loop {
+            if let Some(byte) = self.read_rx() {
+                return Some(byte);
+            }
+            let elapsed = crate::rtos::tick().wrapping_sub(started);
+            if elapsed >= timeout {
+                return None;
+            }
+            if RX_READY[U as usize - 1]
+                .take(Timeout::Ticks(timeout - elapsed))
+                .is_err()
+            {
+                return self.read_rx();
+            }
         }
     }
 }
