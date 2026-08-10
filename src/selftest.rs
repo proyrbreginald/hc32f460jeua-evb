@@ -330,7 +330,7 @@ pub(crate) fn run() {
         );
     }
 
-    // Flash (EFM): 扇区擦除 + 多字编程 + 回读校验 (末扇区, 远离固件/swap 标记)
+    // Flash (EFM): 扇区擦除 + 多字编程 + 回读校验 (扇区 62, 远离固件/swap 标记)
     if !aborted.get() {
         const FLASH_TEST_ADDR: u32 = 0x0007_C000; // 扇区 62 (0x7C000)
         let data: [u8; 64] = [

@@ -211,12 +211,12 @@ pub fn init() -> Result<(), ClkError> {
         ClockSource::Mrc => Ok(()),
         ClockSource::Hrc => {
             hrc_cmd(true)?;
-            switch_to_hrc();
+            switch_to_hrc()?;
             Ok(())
         }
         ClockSource::Xtal => {
             xtal_init()?;
-            switch_to_xtal();
+            switch_to_xtal()?;
             Ok(())
         }
         ClockSource::Pll => {
@@ -228,13 +228,13 @@ pub fn init() -> Result<(), ClkError> {
             }
             set_bus_clock_div();
             if pll_init(pll).is_ok() {
-                switch_to_pll();
+                switch_to_pll()?;
             } else {
                 // PLL 锁定失败: 降级为 PLL 源直通 (总线分频在低频下无害)
                 match pll.src {
-                    0 => switch_to_xtal(),
-                    _ => switch_to_hrc(),
-                }
+                    0 => switch_to_xtal()?,
+                    _ => switch_to_hrc()?,
+                };
             }
             Ok(())
         }
@@ -245,12 +245,20 @@ pub fn init() -> Result<(), ClkError> {
 #[allow(clippy::enum_variant_names)] // 各振荡器同名超时, 语义清晰
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClkError {
+    /// EFM 当前不能修改等待周期或缓存状态。
+    Efm(crate::efm::EfmError),
     /// 晶振起振超时 (检查电路/引脚/稳定时间)
     XtalStableTimeout,
     /// HRC 起振超时
     HrcStableTimeout,
     /// MPLL 锁定超时 (检查倍频/分频参数与 VCO 范围)
     PllStableTimeout,
+}
+
+impl From<crate::efm::EfmError> for ClkError {
+    fn from(error: crate::efm::EfmError) -> Self {
+        Self::Efm(error)
+    }
 }
 
 /// 外部晶振状态 (由 [`xtal_init`] / [`switch_to_xtal`] 更新, [`xtal_status`] 查询)
@@ -377,11 +385,12 @@ pub fn xtal_stable() -> bool {
 /// (FCG0~3) 再恢复** —— 系统时钟源在 PLL 与其他源之间切换时, 外设
 /// 时钟必须在切换窗口内保持关闭 (硬件要求, 防止切换毛刺损坏外设
 /// 状态); 切换完成后使能 Flash 缓存 (对齐 BSP_CLK_Init)。
-pub fn switch_to_pll() {
+pub fn switch_to_pll() -> Result<(), ClkError> {
+    let mut efm = crate::efm::begin_configuration()?;
     // 目标频率 = 已配置 PLLCFGR 的实际输出 (运行时计算)
     let target = pll_hz();
 
-    crate::efm::set_wait_cycle(target);
+    efm.set_wait_cycle(target);
     crate::sram::set_wait_cycles(target);
     // 126~200MHz 输入采样需 3 个读等待周期 (对齐 BSP_CLK_Init)
     set_gpio_read_wait(GPIO_RD_WAIT_200MHZ);
@@ -396,11 +405,12 @@ pub fn switch_to_pll() {
     cmu_lock();
     fcg_restore(fcg);
     // 使能 Flash 缓存 (对齐 BSP_CLK_Init: CacheRamReset + CacheCmd)
-    crate::efm::enable_cache();
+    efm.enable_cache();
     // 仅当 PLL 源为 XTAL 时报告晶振激活 (HRC 源时 XTAL 未启动)
     if pll_src_is_xtal() {
         XTAL_STATUS.store(STATUS_ACTIVE, Ordering::Relaxed);
     }
+    Ok(())
 }
 
 /// 备份并关闭全部外设时钟 (FCG0~3), 返回备份值 (对齐 DDL `SetSysClockSrc`
@@ -651,8 +661,9 @@ pub fn xtal_cmd(enable: bool) -> Result<(), ClkError> {
 ///
 /// 从 PLL 切换回来时按 DDL `SetSysClockSrc` 要求关闭外设时钟
 /// (当前或目标源为 PLL 时, 切换窗口内 FCG 必须关闭)。
-pub fn switch_to_hrc() {
-    crate::efm::set_wait_cycle(hrc_hz());
+pub fn switch_to_hrc() -> Result<(), ClkError> {
+    let mut efm = crate::efm::begin_configuration()?;
+    efm.set_wait_cycle(hrc_hz());
     crate::sram::set_wait_cycles(hrc_hz());
     let fcg = if system_clk_is_pll() {
         Some(fcg_close())
@@ -666,6 +677,7 @@ pub fn switch_to_hrc() {
     if let Some(saved) = fcg {
         fcg_restore(saved);
     }
+    Ok(())
 }
 
 /// 切换系统时钟源到外部晶振
@@ -674,8 +686,9 @@ pub fn switch_to_hrc() {
 /// 高时钟下若等待周期不足, 切换瞬间取指/栈操作即出错, 顺序不可颠倒。
 ///
 /// 从 PLL 切换回来时按 DDL `SetSysClockSrc` 要求关闭外设时钟。
-pub fn switch_to_xtal() {
-    crate::efm::set_wait_cycle(XTAL_HZ);
+pub fn switch_to_xtal() -> Result<(), ClkError> {
+    let mut efm = crate::efm::begin_configuration()?;
+    efm.set_wait_cycle(XTAL_HZ);
     crate::sram::set_wait_cycles(XTAL_HZ);
     let fcg = if system_clk_is_pll() {
         Some(fcg_close())
@@ -692,6 +705,7 @@ pub fn switch_to_xtal() {
     }
     // 记录使用中状态
     XTAL_STATUS.store(STATUS_ACTIVE, Ordering::Relaxed);
+    Ok(())
 }
 
 /// 当前系统时钟频率 (Hz), 依据 CKSWR 实时查询

@@ -104,8 +104,11 @@ MPU 最小区域或栈增长方向。当前内核是单核 UP 设计，多核目
 
 ### P2：按设备语义抽象
 
-- Flash：唯一句柄、相对地址、分区边界和可恢复的写事务 guard；MPU/cache
-  切换留在平台策略。
+- Flash（首版已落地）：`littlefs` 内部定义硬件无关 `BlockDevice`/磁盘
+  codec，独占设备并实现可恢复快照事务；HC32 适配提供唯一句柄、
+  相对地址、链接期分区边界、对齐/擦除态检查与回读验证，MPU/cache 操作仍
+  留在 `efm` 平台后端。后续若引入其他写入者，仍需把 EFM 全局裸函数收紧到
+  `Peripherals` 所有权体系。
 - CAN：核心提供非阻塞收发，时钟 token 决定位时序；阻塞/timeout 放入
   RTOS adapter。
 - RTC：硬件层只负责 calendar/alarm，日志 elapsed 基准放到 time service；

@@ -167,10 +167,10 @@ pub fn guard_off() {
 ///
 /// HC32F460 的 EFM 以"写 Flash 地址"触发编程/擦除 (见 efm 模块),
 /// 与 R0 只读区域冲突 —— 擦写期间需把 R0 临时置为读写, 完成触发
-/// 写后立即恢复只读。窗口极小 (单次 store), 期间中断不写 Flash。
+/// 写后立即恢复只读。窗口极小 (单次 store), 并由调用方临界区保护。
 /// MPU 未使能 (CFG_MPU_ENABLE=false) 时为无操作。
 #[inline]
-pub fn flash_writable(enable: bool) {
+fn flash_writable(enable: bool) {
     if crate::config::MPU_ENABLE {
         let ap = if enable { AP_FULL } else { AP_RO };
         set_region(0, 0x0000_0000, 512 * 1024, ap, false, 0, true);
@@ -180,10 +180,14 @@ pub fn flash_writable(enable: bool) {
 /// 在 FLASH 可写窗口内执行 `f` (RAII 风格: 进入置读写, 退出恢复只读)
 ///
 /// 供 [`crate::efm`] 的触发写使用 (program/sector_erase/swap)。
+/// 当前固件与 ISR 均从主 Flash 执行；bus hold 已经使触发后的取指停顿，
+/// 因此跨越单次 store 的临界区不会增加原本可避免的中断延迟。
 #[inline]
-pub fn with_flash_writable<R>(f: impl FnOnce() -> R) -> R {
-    flash_writable(true);
-    let r = f();
-    flash_writable(false);
-    r
+pub(crate) fn with_flash_writable<R>(f: impl FnOnce() -> R) -> R {
+    crate::critical_section::with(|_| {
+        flash_writable(true);
+        let result = f();
+        flash_writable(false);
+        result
+    })
 }

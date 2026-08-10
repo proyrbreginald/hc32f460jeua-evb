@@ -1,6 +1,10 @@
 MEMORY
 {
-    FLASH       (rx)  : ORIGIN = 0x00000000, LENGTH = 512K
+    /* Sectors 54..61 are reserved for the power-safe filesystem.
+     * Sector 62 remains the destructive EFM self-test sector and sector 63
+     * contains the boot-swap flag/hardware-reserved words. */
+    FLASH       (rx)  : ORIGIN = 0x00000000, LENGTH = 432K
+    FILESYSTEM  (rw)  : ORIGIN = 0x0006C000, LENGTH = 64K
     OTP_DATA    (rw)  : ORIGIN = 0x03000C00, LENGTH = 960
     OTP_LOCK    (rw)  : ORIGIN = 0x03000FC0, LENGTH = 60
     RAM         (rwx) : ORIGIN = 0x1FFF8000, LENGTH = 188K
@@ -91,3 +95,7 @@ SECTIONS
 /* 堆上界 = RAM 顶 - 栈预留 - 主栈 canary 4B (空闲线程巡检, 见 thread.rs) */
 _heap_end = ORIGIN(RAM) + LENGTH(RAM) - STACK_SIZE - 4;
 ASSERT(_heap_end >= _heap_start, "RAM 空间不足以容纳堆和栈预留");
+ASSERT(ORIGIN(FILESYSTEM) == ORIGIN(FLASH) + LENGTH(FLASH),
+       "FLASH 与文件系统分区不连续");
+ASSERT(ORIGIN(FILESYSTEM) + LENGTH(FILESYSTEM) == 0x0007C000,
+       "文件系统分区侵入 Flash 自检扇区");

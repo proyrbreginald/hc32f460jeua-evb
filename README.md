@@ -63,6 +63,7 @@ src/
 ├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
 ├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
 ├── efm.rs             # 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
+├── filesystem.rs      # 精简断电安全文件系统的片内 Flash 分区适配
 ├── crc.rs             # CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
 ├── rtc.rs             # 实时时钟 (RTC): LRC 源/时间日期/闹钟, 日志时间戳
 ├── sram.rs            # 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
@@ -85,6 +86,12 @@ src/
     ├── idle.rs        # 空闲线程 (wfi) + 僵尸线程回收
     ├── hooks.rs       # idle/context-switch 静态集成 hook
     └── context.rs     # Cortex-M4 PendSV 上下文切换汇编 (含 FPU)
+```
+
+文件系统算法位于独立的 `no_std` workspace crate：
+
+```text
+crates/littlefs/  # 块设备/磁盘格式 + mount/format/read/write/remove/rename/list
 ```
 
 ## 时钟管理 (clk, CMU 模块)
@@ -150,13 +157,75 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
 - 流程对齐 DDL: FAPRT 解锁 → FWMC.PEMODE → 设 PEMOD 模式 → 写地址触发
   → 等 FSR.RDY+OPTEND → 恢复只读锁定; 操作结束检查 FSR 错误位
   (PEWERR/PEPRTERR/PGSZERR/PGMISMTCH/COLERR) 返回 `EfmError`;
-- **bus hold**: 擦写期间总线被占用, CPU stall 至完成 (从 Flash 运行安全);
+- 擦除/编程由非阻塞控制器 guard 串行化，RTOS 抢占竞争会返回 `Busy`，
+  ISR 调用会返回 `InterruptContext`，不会交错改写 FWMC/cache/保护状态；
+- **bus hold**: 每次进入擦写模式都显式保持 `BUSHLDCTL=0`, 擦写期间总线被
+  占用, CPU stall 至完成 (从 Flash 运行安全);
   全片擦除/序列编程需 RAM 运行, 模块不提供;
 - 读: `read_byte`/`read_word` (Flash 内存映射) / `uid()` (96 位唯一 ID);
-- **读等待周期**归属本模块: `set_wait_cycle`/`wait_cycle` (表 7-1),
-  `clk` 切换时钟时调用 (从原 clk 模块迁入);
-- 自检 (`selftest` 命令) 含 Flash 实测: 末扇区擦除/64B 混合数据编程/
+- **读等待周期**归属本模块: `ConfigurationGuard::set_wait_cycle` /
+  `wait_cycle` (表 7-1)，由 `clk` 在持有完整切换 guard 时调用;
+- 自检 (`selftest` 命令) 含 Flash 实测: 扇区 62 擦除/64B 混合数据编程/
   逐字节回读校验, 完成后还原擦除态。
+
+## 断电安全文件系统 (filesystem + crates/littlefs)
+
+首版不是 littlefs 2.x 的 Rust 翻译，也不兼容其磁盘格式。它保留 littlefs
+最关键的原则（新数据先落盘、CRC 校验、最后发布引用、旧版本在发布前不
+擦除），再用**有界单层命名空间 + 完整不可变快照**删除目录树、CTZ、
+metadata pair 追加日志、FCRC、orphan/move 状态机：
+
+- API：`format` / `mount` / 整文件 `write` / `read` / `stat` / `list` /
+  `remove` / `rename` / `clear` / `verify`；无堆分配、无 `unsafe`；
+- 每次变更写到当前快照之后的不重叠扇区，完整 `sync` + 回读验证后，最后
+  单独编程一个此前未写过的 4B commit word；挂载只接受 marker、header
+  CRC、payload CRC、逐文件 CRC 和全部结构边界同时有效的版本；
+- generation 使用回绕序列比较；快照起点按环形前移，擦除分布到整个分区，
+  不把固定 superblock 提前磨损；
+- 任一擦除、编程字节或同步点掉电后，只会挂载到完整旧版本或完整新版本；
+  写事务返回设备错误后必须 remount，防止继续使用不确定的内存 generation；
+- 文件名为 UTF-8，最长 63B，最多 32 个文件；不支持子目录、随机写、打开
+  句柄、属性、权限、时间戳、坏块迁移和静态磨损均衡；
+- 预留扇区 54~61 (`0x6C000..0x7BFFF`, 64KiB)，旧/新快照必须共存，
+  因而单个序列化快照最多占 4 个扇区，可用容量略小于 32KiB；完整快照会
+  放大写入，适合小型配置/状态文件，不适合高频大日志。
+
+磁盘格式、提交顺序与安全论证见
+[`crates/littlefs/DESIGN.md`](crates/littlefs/DESIGN.md)。主机模拟 NOR 会在
+4B 编程字内部按多种字节顺序制造部分 `1 -> 0`，并枚举 write/remove/rename/
+format 以及三扇区跨尾部快照的每个掉电边界：
+
+```bash
+cargo test --workspace --target x86_64-unknown-linux-gnu
+```
+
+真机适配 `filesystem::InternalFlash` 是唯一所有权 token，检查相对分区、
+4B 对齐、目标全擦除，并对每次 program/erase 做完整回读。它依赖已初始化的
+时钟、MPU 与 EFM，不能在 ISR 或硬实时路径调用（单扇区擦除最长约 20ms）。
+默认配置下 Shell 是最高优先级应用线程，上电首次运行时调用
+`filesystem::start`，并在该线程局部长期持有唯一实例：已有有效快照时只读
+挂载；整个 64KiB 分区全为擦除态时自动创建空文件系统；分区含数据但无有效
+快照时保留现场并保持未挂载，不会把损坏误判成首次使用。此时检查后可显式
+执行 `mkfs --force`。
+
+常用 Shell 命令：
+
+```text
+ls                         # 列出文件
+write config mode=normal   # 原子创建或完整覆盖短文本文件 (别名 put)
+cat config                 # 分块读取；不可打印字节显示为 \xNN
+stat config                # 文件大小与 CRC
+mv config settings         # 原子重命名
+rm settings                # 原子删除
+df                         # 容量/文件数/generation (别名 fsinfo)
+fsck                       # 只读校验当前快照
+mount                      # 丢弃内存状态并重新挂载
+mkfs --force               # 显式清空全部文件
+```
+
+Shell 输入上限默认 128B，超长命令会整行拒绝而不会截断写入；`write` 面向短
+单行文本，文件系统本身仍支持约 32KiB 快照。每个变更命令成功返回时已经
+完成同步和回读，无需额外 `sync` 命令。
 
 ## 片内 SRAM (sram)
 
@@ -219,8 +288,11 @@ reset_handler (startup.rs)
  └─ main
      ├─ Board::init()              # 时钟/MPU/GPIO/SysTick/UART/RTC
      ├─ rtos::init()               # PendSV/SysTick 优先级 + 空闲线程
-     ├─ rtos::thread_create(...)   # 创建演示线程
+     ├─ rtos::thread_create(...)   # 创建 LED / Shell 线程
      └─ rtos::start()              # 首次切换, 永不返回
+         └─ shell_entry
+             ├─ filesystem::start  # 挂载；仅全擦除的新分区自动格式化
+             └─ login / 命令循环
 ```
 
 ## RTOS 内核
@@ -302,7 +374,8 @@ MQ.send(b"hi", Timeout::Forever);    MQ.recv(&mut buf, Timeout::Forever);
 ## 构建 / 烧录 / 调试
 
 目标: `thumbv7em-none-eabihf`,自定义链接脚本 `link.ld`
-(FLASH 512K + RAM 188K,8K 主栈,`.heap` 段)。
+(固件 FLASH 432K + 文件系统 64K + 自检/交换保留 16K；RAM 188K、8K 主栈、
+`.heap` 段)。链接断言保证固件不会增长覆盖文件系统分区。
 
 ```bash
 cargo build                          # debug 构建
@@ -373,8 +446,9 @@ continue
 - **每个命令可单独启用/禁用**: `CFG_SHELL_COMMANDS` 为逗号分隔的命令名
   列表, 未列出的命令执行时提示 "未启用" 且不出现在 `help` 中;
 - 命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) / `echo` /
-  `led on|off` / `log` / `selftest` / `clear` / `whoami` / `reboot` /
-  `logout`(exit);
+  `ls` / `cat` / `write`(put) / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` /
+  `mount` / `mkfs --force` / `led` / `log` / `selftest` / `clear` / `whoami` /
+  `reboot` / `logout`(exit);
 - 输入: 回车提交, 退格删除, Ctrl+C 清行;
 - 输入采用中断驱动 (RX ISR 发出 OS 无关通知, `uart_rtos` 释放信号量,
   线程阻塞等待, 无轮询)。

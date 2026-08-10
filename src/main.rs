@@ -26,6 +26,7 @@ mod vector_table; // 复位/异常/144 外设中断向量表 (原子回调槽)
 // ---- 片内资源驱动 (寄存器级, 零依赖) ----
 mod crc; // CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
 mod efm; // 片内 Flash (EFM): 擦除/编程/读等待/缓存/引导交换
+mod filesystem; // 断电安全的精简文件系统 + 片内 Flash 分区适配
 mod icg; // ICG 硬件配置段 (flash 0x400, 复位时硬件载入)
 mod intc; // 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 mod mpu; // 内存保护单元: FLASH 只读 + SRAM/外设 XN + 线程栈守卫
@@ -80,9 +81,9 @@ pub(crate) fn main() -> ! {
     // RTOS 初始化: 中断优先级 + 空闲线程
     rtos::init();
 
-    // 创建演示线程 (栈/优先级/时间片来自 .cargo/config.toml)
-    // 注: selftest 不在此运行, 由 shell 命令 `selftest` 同步执行
-    // (见 selftest 模块, 受 CFG_APP_SELFTEST_ENABLE 控制)
+    // 创建应用线程 (栈/优先级/时间片来自 .cargo/config.toml)。默认配置下
+    // shell 优先级最高，首次运行时先启动并独占文件系统，再进入登录流程。
+    // selftest 不在此运行, 由 shell 命令 `selftest` 同步执行。
     rtos::thread_create(
         "led",
         config::APP_LED_STACK,

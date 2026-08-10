@@ -22,13 +22,14 @@
 //! 开关) 仍由各自的 `CFG_*` 配置控制。
 //!
 //! 当前命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) /
-//! `echo` / `led on|off` / `log` / `selftest` / `clear` / `whoami` /
-//! `reboot` / `logout`(exit)。
+//! `echo` / `ls` / `cat` / `write`(put) / `rm` / `mv` / `stat` /
+//! `df`(fsinfo) / `fsck` / `mount` / `mkfs` / `led` / `log` / `selftest` /
+//! `clear` / `whoami` / `reboot` / `logout`(exit)。
 //!
 //! # 输入处理
 //!
 //! 回车提交命令, 退格 (BS/DEL) 删除字符, Ctrl+C 清空当前行;
-//! 输入缓冲区大小来自配置 (`CFG_SHELL_LINE_BUF`), 超长截断。
+//! 输入缓冲区大小来自配置 (`CFG_SHELL_LINE_BUF`), 超长命令整行拒绝执行。
 
 use crate::config;
 use crate::heap;
@@ -47,6 +48,87 @@ const HOSTNAME: &str = config::CHIP_MODEL;
 
 /// 输入行缓冲区大小 (.cargo/config.toml `CFG_SHELL_LINE_BUF`)
 const LINE_BUF: usize = config::SHELL_LINE_BUF_SIZE;
+
+struct InputLine {
+    text: alloc::string::String,
+    overflowed: bool,
+}
+
+type FsError = littlefs::Error<crate::filesystem::FlashError>;
+
+/// Shell-owned filesystem state. The Flash token never leaves this thread.
+struct ShellState {
+    filesystem: Option<crate::filesystem::FileSystem>,
+    last_mount_error: Option<FsError>,
+}
+
+impl ShellState {
+    fn start() -> Self {
+        match crate::filesystem::start(crate::board::BoardResources::get()) {
+            Ok(crate::filesystem::Startup::Mounted(filesystem)) => {
+                let info = filesystem.info();
+                crate::log_info!(
+                    "文件系统已挂载: generation={}, 文件={} 个",
+                    info.generation,
+                    info.file_count
+                );
+                Self {
+                    filesystem: Some(filesystem),
+                    last_mount_error: None,
+                }
+            }
+            Ok(crate::filesystem::Startup::Formatted(filesystem)) => {
+                crate::log_info!("文件系统分区为空，已创建并挂载空文件系统");
+                Self {
+                    filesystem: Some(filesystem),
+                    last_mount_error: None,
+                }
+            }
+            Err(error) => {
+                match &error {
+                    littlefs::Error::NotFormatted => crate::log_warn!(
+                        "文件系统未挂载: 分区含数据但没有有效快照; 检查后可执行 mkfs --force"
+                    ),
+                    _ => crate::log_error!("文件系统挂载失败: {:?}", error),
+                }
+                Self {
+                    filesystem: None,
+                    last_mount_error: Some(error),
+                }
+            }
+        }
+    }
+
+    fn remount(&mut self) -> bool {
+        drop(self.filesystem.take());
+        match crate::filesystem::mount(crate::board::BoardResources::get()) {
+            Ok(filesystem) => {
+                self.filesystem = Some(filesystem);
+                self.last_mount_error = None;
+                true
+            }
+            Err(error) => {
+                self.last_mount_error = Some(error);
+                false
+            }
+        }
+    }
+
+    fn format_unmounted(&mut self) -> bool {
+        debug_assert!(self.filesystem.is_none());
+        match crate::filesystem::format(crate::board::BoardResources::get()) {
+            Ok(filesystem) => {
+                self.filesystem = Some(filesystem);
+                self.last_mount_error = None;
+                true
+            }
+            Err(error) => {
+                self.last_mount_error = Some(error);
+                false
+            }
+        }
+    }
+}
 
 // ============================== 命令系统 ==============================
 
@@ -67,8 +149,8 @@ struct Command {
     aliases: &'static [&'static str],
     /// 帮助文本 (一行说明, 不含命令名)
     help: &'static str,
-    /// 执行函数: 参数为命令名之后的剩余文本 (含前导空白)
-    handler: fn(&str) -> CmdResult,
+    /// 执行函数: Shell 状态 + 命令名之后的剩余文本 (含前导空白)
+    handler: fn(&mut ShellState, &str) -> CmdResult,
 }
 
 /// 命令表项构造器
@@ -76,7 +158,7 @@ const fn cmd(
     name: &'static str,
     aliases: &'static [&'static str],
     help: &'static str,
-    handler: fn(&str) -> CmdResult,
+    handler: fn(&mut ShellState, &str) -> CmdResult,
 ) -> Command {
     Command {
         name,
@@ -99,6 +181,21 @@ static COMMANDS: &[Command] = &[
     cmd("ps", &[], "线程列表", cmd_ps),
     cmd("free", &["mem"], "堆内存统计", cmd_free),
     cmd("echo", &[], "回显 <文本>", cmd_echo),
+    cmd("ls", &[], "列出文件", cmd_ls),
+    cmd("cat", &[], "读取文件: cat <文件>", cmd_cat),
+    cmd(
+        "write",
+        &["put"],
+        "原子创建/覆盖: write <文件> [文本]",
+        cmd_write,
+    ),
+    cmd("rm", &[], "删除文件: rm <文件>", cmd_rm),
+    cmd("mv", &[], "重命名: mv <旧名> <新名>", cmd_mv),
+    cmd("stat", &[], "文件信息: stat <文件>", cmd_stat),
+    cmd("df", &["fsinfo"], "文件系统容量与状态", cmd_df),
+    cmd("fsck", &[], "只读校验当前快照", cmd_fsck),
+    cmd("mount", &[], "重新挂载文件系统", cmd_mount),
+    cmd("mkfs", &[], "清空文件系统: mkfs --force", cmd_mkfs),
     cmd("led", &[], "板载 LED on|off", cmd_led),
     cmd("selftest", &[], "内核自检 (rtos 功能自检)", cmd_selftest),
     cmd("log", &[], "日志开关/级别 (on|off|level <级>)", cmd_log),
@@ -108,11 +205,12 @@ static COMMANDS: &[Command] = &[
     cmd("logout", &["exit"], "重新登录", cmd_logout),
 ];
 
-/// shell 线程入口: 登录 → 命令循环 (永不返回)
+/// shell 线程入口: 启动文件系统 → 登录 → 命令循环 (永不返回)
 pub extern "C" fn shell_entry(_param: usize) {
+    let mut state = ShellState::start();
     loop {
         login();
-        command_loop();
+        command_loop(&mut state);
     }
 }
 
@@ -124,14 +222,14 @@ fn login() {
         print!("{} login: ", HOSTNAME);
         let user = read_line(false, LINE_BUF);
         println!();
-        if user.trim() != SHELL_USERNAME {
+        if user.overflowed || user.text.trim() != SHELL_USERNAME {
             tries += 1;
             println!("Login incorrect");
         } else {
             print!("Password: ");
             let pass = read_line(true, LINE_BUF);
             println!();
-            if pass == SHELL_PASSWORD {
+            if !pass.overflowed && pass.text == SHELL_PASSWORD {
                 println!(
                     "Welcome to RT-RUST {} ({} kernel, {}).",
                     env!("CARGO_PKG_VERSION"),
@@ -155,16 +253,20 @@ fn login() {
 }
 
 /// 命令循环: 读取一行 → 解析 → 执行
-fn command_loop() {
+fn command_loop(state: &mut ShellState) {
     loop {
         print!("{}@{}:~$ ", SHELL_USERNAME, HOSTNAME);
         let line = read_line(false, LINE_BUF);
         println!();
-        let cmd = line.trim();
+        if line.overflowed {
+            println!("输入超过 {} B，命令未执行", LINE_BUF);
+            continue;
+        }
+        let cmd = line.text.trim();
         if cmd.is_empty() {
             continue;
         }
-        if !dispatch(cmd) {
+        if !dispatch(state, cmd) {
             return; // logout / exit
         }
     }
@@ -174,7 +276,7 @@ fn command_loop() {
 ///
 /// 在 [`COMMANDS`] 表中按主名/别名查找, 命中后检查 `CFG_SHELL_COMMANDS`
 /// 启用列表, 通过则调用执行函数 (参数 = 命令名之后的剩余文本)。
-fn dispatch(line: &str) -> bool {
+fn dispatch(state: &mut ShellState, line: &str) -> bool {
     let mut words = line.split_whitespace();
     let Some(name) = words.next() else {
         return true;
@@ -191,11 +293,11 @@ fn dispatch(line: &str) -> bool {
         println!("{}: 命令未启用 (CFG_SHELL_COMMANDS)", name);
         return true;
     }
-    (cmd.handler)(rest) == CmdResult::Ok
+    (cmd.handler)(state, rest) == CmdResult::Ok
 }
 
 /// 命令帮助: 仅列出 `CFG_SHELL_COMMANDS` 中启用的命令 (含别名)
-fn cmd_help(_rest: &str) -> CmdResult {
+fn cmd_help(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("可用命令 (CFG_SHELL_COMMANDS 控制启用):");
     for c in COMMANDS {
         if !config::cmd_enabled(c.name) {
@@ -210,7 +312,7 @@ fn cmd_help(_rest: &str) -> CmdResult {
 }
 
 /// 系统信息 (info/sysinfo): 运行状态 + 配置摘要
-fn cmd_sysinfo(_rest: &str) -> CmdResult {
+fn cmd_sysinfo(state: &mut ShellState, _rest: &str) -> CmdResult {
     println!(
         "{} v{} — RT-Thread 架构的 Rust RTOS",
         env!("CARGO_PKG_NAME"),
@@ -276,6 +378,29 @@ fn cmd_sysinfo(_rest: &str) -> CmdResult {
             env!("RTOS_RUSTC")
         ),
     );
+    match state.filesystem.as_ref() {
+        Some(filesystem) => {
+            let info = filesystem.info();
+            sysinfo_line(
+                "文件系统",
+                format_args!(
+                    "已挂载, generation {}, {} 个文件, {}/{} B",
+                    info.generation, info.file_count, info.serialized_bytes, info.capacity_bytes
+                ),
+            );
+        }
+        None => sysinfo_line(
+            "文件系统",
+            format_args!(
+                "未挂载 ({})",
+                state
+                    .last_mount_error
+                    .as_ref()
+                    .map(fs_error_summary)
+                    .unwrap_or("未知状态")
+            ),
+        ),
+    }
 
     // ---- 配置 (编译期常量, 来源 .cargo/config.toml) ----
     sysinfo_section("配置 (config)");
@@ -451,7 +576,7 @@ fn sysinfo_line(label: &str, args: core::fmt::Arguments<'_>) {
 }
 
 /// 运行时间 (仿 uptime)
-fn cmd_uptime(_rest: &str) -> CmdResult {
+fn cmd_uptime(_state: &mut ShellState, _rest: &str) -> CmdResult {
     let ms = crate::rtos::uptime_ms();
     let (h, m, s) = (ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60);
     println!(
@@ -467,9 +592,12 @@ fn cmd_uptime(_rest: &str) -> CmdResult {
 }
 
 /// 线程列表 (仿 ps)
-fn cmd_ps(_rest: &str) -> CmdResult {
+fn cmd_ps(_state: &mut ShellState, _rest: &str) -> CmdResult {
     let list = crate::rtos::thread_info_list();
-    println!("NAME                 PRIO  STATE    STACK (used/total)  (count={})", list.len());
+    println!(
+        "NAME                 PRIO  STATE    STACK (used/total)  (count={})",
+        list.len()
+    );
     for t in list {
         println!(
             "{:<20} {:>4}  {:<8} {:>6}/{:<6}",
@@ -484,7 +612,7 @@ fn cmd_ps(_rest: &str) -> CmdResult {
 }
 
 /// 堆内存统计 (仿 free)
-fn cmd_free(_rest: &str) -> CmdResult {
+fn cmd_free(_state: &mut ShellState, _rest: &str) -> CmdResult {
     let total = heap::capacity();
     let used = heap::used();
     // 整数百分比 (避免浮点格式化在 no_std 下的问题)
@@ -501,13 +629,337 @@ fn cmd_free(_rest: &str) -> CmdResult {
 }
 
 /// 回显剩余参数
-fn cmd_echo(rest: &str) -> CmdResult {
+fn cmd_echo(_state: &mut ShellState, rest: &str) -> CmdResult {
     println!("{}", rest.trim());
     CmdResult::Ok
 }
 
+fn one_argument(rest: &str) -> Option<&str> {
+    let mut words = rest.split_whitespace();
+    let argument = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    Some(argument)
+}
+
+fn two_arguments(rest: &str) -> Option<(&str, &str)> {
+    let mut words = rest.split_whitespace();
+    let first = words.next()?;
+    let second = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    Some((first, second))
+}
+
+fn name_and_text(rest: &str) -> Option<(&str, &str)> {
+    let trimmed = rest.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.find(char::is_whitespace) {
+        Some(index) => Some((&trimmed[..index], trimmed[index..].trim_start())),
+        None => Some((trimmed, "")),
+    }
+}
+
+fn fs_error_summary(error: &FsError) -> &'static str {
+    match error {
+        littlefs::Error::Device(_) => "Flash 设备错误",
+        littlefs::Error::DeviceBusy => "Flash 分区正被占用",
+        littlefs::Error::InvalidGeometry => "分区几何参数无效",
+        littlefs::Error::NotFormatted => "无有效文件系统快照",
+        littlefs::Error::Corrupt => "文件系统数据损坏",
+        littlefs::Error::InvalidName => "文件名无效",
+        littlefs::Error::NotFound => "文件不存在",
+        littlefs::Error::AlreadyExists => "目标文件已存在",
+        littlefs::Error::NoSpace => "文件系统空间不足",
+        littlefs::Error::FileTooLarge => "文件过大",
+        littlefs::Error::RecoveryRequired => "写入结果不确定，需要重新挂载",
+    }
+}
+
+fn print_fs_error(operation: &str, error: &FsError) {
+    match error {
+        littlefs::Error::Device(error) => {
+            println!("{}: Flash 设备错误: {:?}", operation, error)
+        }
+        _ => println!("{}: {}", operation, fs_error_summary(error)),
+    }
+}
+
+fn print_mount_error(state: &ShellState, operation: &str) {
+    match state.last_mount_error.as_ref() {
+        Some(error) => print_fs_error(operation, error),
+        None => println!("{}: 文件系统未挂载", operation),
+    }
+}
+
+fn mounted_filesystem(state: &mut ShellState) -> Option<&mut crate::filesystem::FileSystem> {
+    if state.filesystem.is_none() {
+        print_mount_error(state, "文件系统");
+        return None;
+    }
+    state.filesystem.as_mut()
+}
+
+fn report_mutation_error(state: &mut ShellState, operation: &str, error: FsError) {
+    print_fs_error(operation, &error);
+    let recovery_required = state
+        .filesystem
+        .as_ref()
+        .is_some_and(littlefs::FileSystem::recovery_required);
+    if !recovery_required {
+        return;
+    }
+
+    println!("写入结果不确定，正在重新挂载...");
+    if state.remount() {
+        println!("文件系统已恢复挂载");
+    } else {
+        print_mount_error(state, "重新挂载");
+    }
+}
+
+/// 列出平坦命名空间中的全部文件。
+fn cmd_ls(state: &mut ShellState, rest: &str) -> CmdResult {
+    if !rest.trim().is_empty() {
+        println!("用法: ls");
+        return CmdResult::Ok;
+    }
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    let file_count = filesystem.info().file_count;
+    println!("      SIZE  CRC32     NAME");
+    match filesystem.list(|name, info| {
+        println!("{:>10}  {:08X}  {}", info.size, info.crc32, name);
+    }) {
+        Ok(()) if file_count == 0 => println!("(空)"),
+        Ok(()) => {}
+        Err(error) => print_fs_error("ls", &error),
+    }
+    CmdResult::Ok
+}
+
+fn print_file_bytes(bytes: &[u8]) {
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if matches!(byte, b'\n' | b'\t' | 0x20..=0x7e) {
+            continue;
+        }
+        if let Ok(text) = core::str::from_utf8(&bytes[start..index]) {
+            print!("{}", text);
+        }
+        print!("\\x{:02X}", byte);
+        start = index + 1;
+    }
+    if let Ok(text) = core::str::from_utf8(&bytes[start..]) {
+        print!("{}", text);
+    }
+}
+
+/// 分块读取文件；不可打印字节以 `\xNN` 显示。
+fn cmd_cat(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(name) = one_argument(rest) else {
+        println!("用法: cat <文件>");
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    if let Err(error) = filesystem.verify() {
+        print_fs_error("cat", &error);
+        return CmdResult::Ok;
+    }
+    let info = match filesystem.stat(name) {
+        Ok(info) => info,
+        Err(error) => {
+            print_fs_error("cat", &error);
+            return CmdResult::Ok;
+        }
+    };
+
+    let mut buffer = [0u8; 128];
+    let mut offset = 0;
+    let mut ends_with_newline = false;
+    while offset < info.size {
+        let read = match filesystem.read(name, offset, &mut buffer) {
+            Ok(0) => {
+                println!();
+                println!("cat: 文件提前结束");
+                return CmdResult::Ok;
+            }
+            Ok(read) => read,
+            Err(error) => {
+                println!();
+                print_fs_error("cat", &error);
+                return CmdResult::Ok;
+            }
+        };
+        print_file_bytes(&buffer[..read]);
+        ends_with_newline = buffer[read - 1] == b'\n';
+        offset += read as u32;
+    }
+    if info.size == 0 || !ends_with_newline {
+        println!();
+    }
+    CmdResult::Ok
+}
+
+/// 原子创建或完整覆盖一个短文本文件。
+fn cmd_write(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some((name, text)) = name_and_text(rest) else {
+        println!("用法: write <文件> [文本]");
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    let result = filesystem.write(name, text.as_bytes());
+    match result {
+        Ok(()) => println!("{}: 已持久化 {} B", name, text.len()),
+        Err(error) => report_mutation_error(state, "write", error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_rm(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(name) = one_argument(rest) else {
+        println!("用法: rm <文件>");
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    let result = filesystem.remove(name);
+    match result {
+        Ok(()) => println!("{}: 已删除", name),
+        Err(error) => report_mutation_error(state, "rm", error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_mv(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some((old_name, new_name)) = two_arguments(rest) else {
+        println!("用法: mv <旧名> <新名>");
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    let result = filesystem.rename(old_name, new_name);
+    match result {
+        Ok(()) => println!("{} -> {}", old_name, new_name),
+        Err(error) => report_mutation_error(state, "mv", error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_stat(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(name) = one_argument(rest) else {
+        println!("用法: stat <文件>");
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    match filesystem.stat(name) {
+        Ok(info) => {
+            println!("文件 : {}", name);
+            println!("大小 : {} B", info.size);
+            println!("CRC32: {:08X}", info.crc32);
+        }
+        Err(error) => print_fs_error("stat", &error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_df(state: &mut ShellState, rest: &str) -> CmdResult {
+    if !rest.trim().is_empty() {
+        println!("用法: df");
+        return CmdResult::Ok;
+    }
+    let Some(filesystem) = state.filesystem.as_ref() else {
+        print_mount_error(state, "df");
+        return CmdResult::Ok;
+    };
+    let info = filesystem.info();
+    let usage = info
+        .serialized_bytes
+        .saturating_mul(100)
+        .checked_div(info.capacity_bytes)
+        .unwrap_or(0);
+    println!("Filesystem       Size      Used  Use%  Files  Gen  Blocks");
+    println!(
+        "internal-flash  {:>6} B  {:>6} B  {:>3}%  {:>5}  {:>3}  {}/{}",
+        info.capacity_bytes,
+        info.serialized_bytes,
+        usage,
+        info.file_count,
+        info.generation,
+        info.active_blocks,
+        crate::filesystem::BLOCK_COUNT
+    );
+    CmdResult::Ok
+}
+
+fn cmd_fsck(state: &mut ShellState, rest: &str) -> CmdResult {
+    if !rest.trim().is_empty() {
+        println!("用法: fsck");
+        return CmdResult::Ok;
+    }
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    match filesystem.verify() {
+        Ok(()) => println!("fsck: 当前快照完整"),
+        Err(error) => print_fs_error("fsck", &error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_mount(state: &mut ShellState, rest: &str) -> CmdResult {
+    if !rest.trim().is_empty() {
+        println!("用法: mount");
+        return CmdResult::Ok;
+    }
+    if state.remount() {
+        let info = state.filesystem.as_ref().unwrap().info();
+        println!(
+            "文件系统已挂载: generation={}, 文件={} 个",
+            info.generation, info.file_count
+        );
+    } else {
+        print_mount_error(state, "mount");
+    }
+    CmdResult::Ok
+}
+
+fn cmd_mkfs(state: &mut ShellState, rest: &str) -> CmdResult {
+    if rest.trim() != "--force" {
+        println!("用法: mkfs --force");
+        println!("警告: 该命令会清空全部文件");
+        return CmdResult::Ok;
+    }
+
+    if let Some(filesystem) = state.filesystem.as_mut() {
+        let result = filesystem.clear();
+        match result {
+            Ok(()) => println!("空文件系统已提交并持久化"),
+            Err(error) => report_mutation_error(state, "mkfs", error),
+        }
+    } else if state.format_unmounted() {
+        println!("文件系统已格式化并挂载");
+    } else {
+        print_mount_error(state, "mkfs");
+    }
+    CmdResult::Ok
+}
+
 /// LED 控制
-fn cmd_led(rest: &str) -> CmdResult {
+fn cmd_led(_state: &mut ShellState, rest: &str) -> CmdResult {
     match rest.trim() {
         "on" => {
             crate::board::BoardResources::get().set_led(true);
@@ -524,7 +976,7 @@ fn cmd_led(rest: &str) -> CmdResult {
 
 /// 内核自检: **同步执行** (完成后才出下一提示符, 可按 ESC 中断)
 /// (受 CFG_APP_SELFTEST_ENABLE 控制)
-fn cmd_selftest(_rest: &str) -> CmdResult {
+fn cmd_selftest(_state: &mut ShellState, _rest: &str) -> CmdResult {
     if config::APP_SELFTEST_ENABLE {
         crate::selftest::run();
     } else {
@@ -534,26 +986,26 @@ fn cmd_selftest(_rest: &str) -> CmdResult {
 }
 
 /// 清屏 (ANSI)
-fn cmd_clear(_rest: &str) -> CmdResult {
+fn cmd_clear(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("\x1b[2J\x1b[H");
     CmdResult::Ok
 }
 
 /// 当前用户
-fn cmd_whoami(_rest: &str) -> CmdResult {
+fn cmd_whoami(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("{}", SHELL_USERNAME);
     CmdResult::Ok
 }
 
 /// 软复位 (AIRCR.SYSRESETREQ)
-fn cmd_reboot(_rest: &str) -> CmdResult {
+fn cmd_reboot(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("rebooting...");
     crate::rtos::thread_delay_ms(50);
     crate::arch::system_reset()
 }
 
 /// 退出 shell (重新登录)
-fn cmd_logout(_rest: &str) -> CmdResult {
+fn cmd_logout(_state: &mut ShellState, _rest: &str) -> CmdResult {
     CmdResult::Logout
 }
 
@@ -561,7 +1013,7 @@ fn cmd_logout(_rest: &str) -> CmdResult {
 ///
 /// 仅影响应用日志 (`log::*`), 内核打印 (横幅/shell 输出等) 不受影响;
 /// 重启后恢复配置默认值 (`CFG_LOG_ENABLE` / `CFG_LOG_LEVEL`)。
-fn cmd_log(rest: &str) -> CmdResult {
+fn cmd_log(_state: &mut ShellState, rest: &str) -> CmdResult {
     let mut words = rest.split_whitespace();
     match words.next() {
         None => println!(
@@ -597,35 +1049,46 @@ fn cmd_log(rest: &str) -> CmdResult {
 ///
 /// `masked` 为 true 时输入不回显 (密码模式)。
 /// 中断驱动: 挂起在数据到达信号量上, 由 RX ISR 唤醒, 无轮询。
-fn read_line(masked: bool, max: usize) -> alloc::string::String {
+fn read_line(masked: bool, max: usize) -> InputLine {
     let uart = crate::board::BoardResources::get().console();
     let mut line = alloc::string::String::new();
+    let mut overflow = 0usize;
     loop {
         let b = uart.read_rx_blocking();
         match b {
             b'\r' | b'\n' => break,
             0x08 | 0x7F => {
-                // 退格: 删除最后一个字符
-                if line.pop().is_some() {
+                // 超出缓冲区的字符没有回显，先消费对应的退格。
+                if overflow > 0 {
+                    overflow -= 1;
+                } else if line.pop().is_some() {
                     print!("\x08 \x08");
                 }
             }
             0x03 => {
                 // Ctrl+C: 清空当前行
+                overflow = 0;
                 while line.pop().is_some() {
                     print!("\x08 \x08");
                 }
             }
-            0x20..=0x7E if line.len() < max => {
-                line.push(b as char);
-                if masked {
-                    print!("*");
+            0x20..=0x7E => {
+                if line.len() < max && overflow == 0 {
+                    line.push(b as char);
+                    if masked {
+                        print!("*");
+                    } else {
+                        print!("{}", b as char);
+                    }
                 } else {
-                    print!("{}", b as char);
+                    overflow = overflow.saturating_add(1);
                 }
             }
             _ => {}
         }
     }
-    line
+    InputLine {
+        text: line,
+        overflowed: overflow != 0,
+    }
 }
