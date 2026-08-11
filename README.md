@@ -7,7 +7,8 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 ## 特性
 
 - 零依赖裸机 Rust (edition 2024, `thumbv7em-none-eabihf`),无 PAC/HAL crate;
-- 寄存器级外设驱动:时钟 (XTAL+MPLL→200MHz,失败自动回退)、GPIO、SysTick、USART;
+- 寄存器级外设驱动:时钟 (XTAL+MPLL→200MHz,失败自动回退)、GPIO、SysTick、
+  USART、经典 CAN 2.0B;
 - 全局堆分配器 (边界标记 + 首次适配,中断安全),完整支持 `Layout` 的任意
   2 的幂对齐，并以 checked 算术拒绝越界布局，支持 `Vec`/`Box`/`String`;
 - **RTOS 内核**:32 级位图调度 + 时间片轮转、优先级继承互斥量、硬定时器、
@@ -33,6 +34,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_SYSTICK_HZ` / `CFG_TICKS_PER_SEC` | 节拍频率 (两者必须一致, 编译期校验) |
 | `CFG_PRIORITY_MAX` / `CFG_IDLE_*` | RTOS 优先级与空闲线程 |
 | `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 数据位 / 校验 / 停止位 / 过采样 / 流控 / 噪声滤波 / 缓冲 / 中断参数 |
+| `CFG_CAN_*` | CAN 启用 / selftest / 引脚 / 位速率·采样点·SJW·误差 / 模式 / PTB·STB / RX / 过滤器 / 超时 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
 | `CFG_SHELL_HISTORY_SIZE` | RAM 中保留的历史命令条数 (1~16，默认 8，复位后清空) |
@@ -46,7 +48,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 约束:
 - 数值均为字符串, 编译期解析 (支持 `_` 分隔), 溢出/非法字符/非法枚举
   (如 `CFG_UART_OVERSAMPLE` 非 8/16) 在编译期报错;
-- UART/LED 的**端口类型** (PortA/PortC) 由 Rust 类型系统编码, 固定在
+- UART/CAN/LED 的**端口类型** (PortA/PortB/PortC) 由 Rust 类型系统编码, 固定在
   `board.rs` 中, 引脚号/功能号等数值参数可在此配置; 引脚存在性仍由
   `Pin::new()` 编译期校验 (JEUA 封装引脚表);
 - `build.rs` 仅负责构建日期与 rustc 版本 (启动横幅显示用)；设置
@@ -82,6 +84,8 @@ src/
 ├── systick.rs         # SysTick 1kHz 节拍 (RTOS 时钟源)
 ├── uart.rs            # USART1~4 驱动 (波特率/过采样) + 中断接收环形缓冲
 ├── uart_rtos.rs       # UART 非阻塞通知到 RTOS semaphore 的适配层
+├── can.rs             # 经典 CAN 2.0B: 过滤器、PTB/STB、RX FIFO、状态/IRQ
+├── can_timing.rs      # CAN 位时序搜索与 SBT 编码 (可在主机测试)
 ├── console.rs         # 控制台: 打印锁 (优先级继承) + 原子整行输出
 ├── log.rs             # 应用日志: 分级+彩色标签, 与内核打印分离 (可开关)
 ├── shell.rs           # 登录、命令注册与文件系统命令
@@ -116,7 +120,9 @@ crates/littlefs/  # 块设备/磁盘格式 + 文件/目录/原子快照操作
 
 硬件无关的布局规划位于 `src/heap_layout.rs`，主机测试覆盖 1B 到 4096B
 的代表性二次幂对齐、高对齐 padding、空间不足/整数溢出以及零大小布局。
-它验证的是布局算法，不替代目标板上对完整链表分配器和临界区的测试：
+`src/can_timing.rs` 的主机测试覆盖常用位速率、DDL 边界、SBT 编码、误差
+上限及溢出输入。它们验证纯算法，不替代目标板上的寄存器路径、总线电气
+连接、完整链表分配器和临界区测试：
 
 ```bash
 cargo test --workspace --target x86_64-unknown-linux-gnu
@@ -576,23 +582,58 @@ continue
 - 输入采用中断驱动 (RX ISR 发出 OS 无关通知, `uart_rtos` 释放信号量,
   线程阻塞等待, 无轮询)。
 
-### 内核自检 (selftest)
+### 自检 (selftest)
 
 - 不再开机自动运行: 由 `CFG_APP_SELFTEST_ENABLE` 控制启用 (默认 `true`),
-  shell 中输入 `selftest` **同步执行** —— 完成后才输出下一命令提示符;
+  shell 中输入 `selftest` 或 `selftest all` **同步执行**全量项目；
+  `selftest can` 只执行 CAN 内部回环，完成后才输出下一命令提示符;
 - **ESC 中断**: 执行期间按 ESC 立即停止剩余项 (终端输入在自检期间
   一律丢弃, ESC 除外), 汇总提示 `被中断 (ESC): 已完成 N 项`;
 - 测试对象 (信号量/互斥量/事件/邮箱/队列) 每次运行**全新创建** (局部
   变量), 多次执行结果确定; 自检在 shell 线程内同步运行, shell 线程
   栈因此配置为 8KB (`CFG_APP_SHELL_STACK`);
-- `CFG_APP_SELFTEST_ENABLE = false` 时命令提示 "未启用";
-- 自检依次验证信号量 / 互斥量 (递归) / 事件 (AND/OR/清除) / 邮箱 (含紧急
+- `CFG_APP_SELFTEST_ENABLE = false` 时命令提示 "未启用"；
+  `CFG_CAN_SELFTEST_ENABLE = false` 时 CAN 项显示为跳过;
+- 全量自检依次验证信号量 / 互斥量 (非递归) / 事件 (AND/OR/清除) / 邮箱 (含紧急
   插队) / 消息队列 (含二进制) / 线程延时 / 线程删除 (delete) / 线程自然
-  退出 (defunct 回收);
+  退出 (defunct 回收) / Flash / CRC / CAN;
+- CAN 项使用内部回环，不驱动 TX 引脚且由控制器自动 ACK；覆盖过滤器 mask
+  与标准/扩展类型隔离、PTB 标准数据帧、STB 扩展数据帧与远程帧、RX FIFO
+  顺序、状态和错误计数。测试会进入本地复位并清空硬件收发队列，因此
+  `CFG_CAN_ENABLE=true` 时明确 **SKIP**，不会接管业务 CAN；默认关闭应用 CAN
+  时若仍有通过驱动注册的 IRQ consumer 也会 **SKIP**。测试结束会关闭 CAN
+  外设时钟，并恢复测试前的 XTAL 启停状态;
 - 逐项结果 (`[PASS]`/`[FAIL]`/进度) 走**应用日志** (info/debug 级, 可经
   `log` 命令控制); `log level trace` 可输出**每项执行细节** (实际返回值/
   耗时/参数, 用于故障定位); **汇总始终打印** (不受日志开关影响):
   `[selftest] 完成: N 通过, 0 失败`。
+
+### CAN 驱动
+
+- 实现 HC32F460 单路**经典 CAN 2.0B**；TTCAN 扩展暂未配置。板级持有唯一
+  `Can` 句柄，裸驱动 API 提供 PTB 非阻塞发送、4 槽 STB 入队/单帧或全部
+  启动/中止，以及 10 槽 RX FIFO 非阻塞读取;
+- 支持 11 位标准 ID、29 位扩展 ID、数据帧和 RTR，最多 8 个验收过滤器；
+  同时提供 DDL 布局的状态快照、W1C 标志清除、仲裁丢失/错误类型、REC/TEC
+  计数和 CAN 聚合中断注册/注销;
+- CAN 通信时钟固定来自 `XTAL`。初始化按 RM Rev1.71 校验
+  `EXCLK >= 1.5 * CANCLK`；纯 Rust 位时序搜索遵循 DDL 寄存器边界，并排除
+  RM 不建议使用的实际预分频 1。默认 8MHz / 500kbps / 75% / SJW=2 对应
+  `PRESC=2, SEG1=6, SEG2=2`，SBT 为 `0x01010104`;
+- `.cargo/config.toml` 的 `CFG_CAN_*` 控制启用、PortB 引脚复用、位速率、采样点、
+  SJW、最大误差、工作模式、single-shot、STB 优先级、RX 阈值/溢出策略、
+  self-ACK、启动过滤器和 selftest 超时；非法枚举、范围、ID 或不可实现的
+  位时序在编译期失败。TX/RX 必须分别使用支持 Func_Grp2 的不同 PortB 引脚
+  及 Func50/51；默认是 JP2 上的 PB7/PB6。驱动 API 本身支持 8 个过滤器，
+  启动配置提供 1 个;
+- **本板没有板载 CAN PHY**：PB7(TX)/PB6(RX) 仅引到 JP2。正常模式和外部
+  回环必须外接匹配电平的 CAN 收发器，并按总线拓扑配置终端电阻；不能将
+  MCU 引脚直接接到 CANH/CANL。默认 `CFG_CAN_ENABLE=false`，内部回环
+  selftest 不依赖 PHY;
+- 多数 `RTIF` 标志只有对应中断使能位打开后才会置位。默认配置打开全部经典
+  CAN 事件以支持轮询状态；调用方可注册聚合 IRQ，或按需修改 `Interrupts`。
+  轮询与 ISR 不应同时消费同一 RX FIFO/完成标志；`init`/`deinit` 会进入本地
+  复位并清 FIFO，调用前必须由应用层停止业务收发和 IRQ consumer。
 
 ### UART 驱动 (USART1~4)
 
@@ -673,13 +714,18 @@ python3 -m venv .venv && .venv/bin/pip install pyocd
 
 ## 验证记录
 
+以下真机记录来自新增 CAN 驱动之前，不覆盖本次 CAN 变更：
+
 - debug 与 release 构建均已在真机烧录验证:0 panic,稳定运行 60s+;
-- 内核自检 (selftest) 连续 5 次复位全部 22 项通过;
+- 当时版本的内核自检连续 5 次复位全部 22 项通过;
 - RX 中断接收:ASCII/二进制/混合数据完整回显, 90 秒后系统仍正常响应;
 - 大包高速输入 (超 512B 缓冲) 按设计丢弃新字节, 不崩溃;
 - 已知现象:115200 无流控下 PC 端读取不及时 (如 `cat`) 会丢字节
   (表现为行尾截断, 非打印设计缺陷), 建议使用交互式终端查看;
   启动横幅经 `screen` 捕获验证零丢失。
+
+本次 CAN 变更已通过主机单测、目标 debug/release 构建和严格 Clippy；CAN
+内部回环及外接收发器总线通信仍需在目标板执行，不能由主机测试替代。
 
 ## 代码整理与设计优化记录
 

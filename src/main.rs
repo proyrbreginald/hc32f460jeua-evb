@@ -10,6 +10,7 @@
 extern crate alloc;
 
 // ---- 编译期配置 (.cargo/config.toml [env] → env!) ----
+mod can_timing; // CAN 位时序纯算法 (与主机单测共享)
 mod config;
 
 // ---- 板级支持 (HC32F460JEUA-EVB 资源与初始化编排) ----

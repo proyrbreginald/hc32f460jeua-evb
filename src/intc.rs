@@ -231,6 +231,10 @@ pub mod src {
     pub const ADC2_EOCA: u32 = 452;
     pub const ADC2_EOCB: u32 = 453;
     pub const TRNG_END: u32 = 456;
+
+    // ---- CAN ----
+    /// CAN 聚合中断源 (接收、发送和错误事件共用一个源)。
+    pub const CAN_INT: u32 = 486;
 }
 
 // ============================== INTC (SEL 路由) ==============================

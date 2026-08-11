@@ -35,7 +35,7 @@ SoC drivers                  RTOS core
 2. RTOS 增加无分配的 idle/context-switch hook。MPU 栈守卫由 `board`
    注册 context-switch hook；WDT 由 `board` 创建最高优先级 supervisor
    周期喂狗。内核不直接调用芯片模块；守卫大小与对齐来自 CPU backend。
-3. `board::Board` 集中时钟、MPU、GPIO、SysTick、UART、RTC 初始化及板载
+3. `board::Board` 集中时钟、MPU、GPIO、SysTick、UART、CAN、RTC 初始化及板载
    资源绑定，并用一次性获取与 ready 状态检查约束启动顺序。
 4. UART 裸驱动只维护寄存器、ISR、SPSC 接收环和非阻塞 API；
    `uart_rtos` 用容量为 1 的 semaphore 实现阻塞读取。
@@ -65,6 +65,9 @@ SoC drivers                  RTOS core
 13. 异步强制删除线程会跳过 Rust 栈析构，因此只保留为
     `unsafe Thread::force_delete`；可移植应用应使用协作式停止并让线程入口
     正常返回。有限 timeout 与 `Forever` 分离，超时排序限制在 tick 半周期。
+14. 经典 CAN 核心已收敛为板级唯一句柄和非阻塞寄存器 API，覆盖位时序、
+    验收过滤器、PTB/STB、RX FIFO、错误状态与聚合 IRQ；RTOS 仅在 selftest
+    中提供 timeout 策略，驱动本身不依赖调度器。
 
 这些改动仍保持静态函数指针分发、零堆分配的 ISR 通知和既有寄存器实现，
 没有引入 trait object 或运行时设备树。
@@ -109,8 +112,8 @@ MPU 最小区域或栈增长方向。当前内核是单核 UP 设计，多核目
 ### P0：所有权与时钟能力
 
 1. 引入唯一 `Peripherals::take() -> Option<Peripherals>`，由 `Board` 消费并
-   拆分资源；收紧 `Uart::take()`、`Gpio::take()`、`Pin::new()`、
-   `Can::take()` 等可重复构造入口。
+   拆分资源；把当前板级持有的 CAN 句柄纳入统一所有权，并收紧
+   `Uart::take()`、`Gpio::take()`、`Pin::new()` 等可重复构造入口。
 2. 将时钟配置改为 `ClockController::freeze(config) -> Clocks`。`Clocks`
    是初始化成功后的频率 token；驱动接收对应 bus clock，不再查询全局
    `clk::*_hz()` 或读取工程配置。
@@ -135,8 +138,8 @@ MPU 最小区域或栈增长方向。当前内核是单核 UP 设计，多核目
   相对地址、链接期分区边界、对齐/擦除态检查与回读验证，MPU/cache 操作仍
   留在 `efm` 平台后端。后续若引入其他写入者，仍需把 EFM 全局裸函数收紧到
   `Peripherals` 所有权体系。
-- CAN：核心提供非阻塞收发，时钟 token 决定位时序；阻塞/timeout 放入
-  RTOS adapter。
+- CAN（非阻塞核心已落地）：后续以时钟 token 决定位时序，并把业务级
+  阻塞/timeout 放入 RTOS adapter。
 - RTC：硬件层只负责 calendar/alarm，日志 elapsed 基准放到 time service；
   状态切换超时返回 `Result`。
 - WDT：公共配置表达 timeout/window/sleep/action，后端根据 PCLK token

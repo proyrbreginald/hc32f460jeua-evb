@@ -371,7 +371,7 @@ static COMMANDS: &[Command] = &[
     cmd("mount", &[], "重新挂载文件系统", cmd_mount),
     cmd("mkfs", &[], "清空文件系统: mkfs --force", cmd_mkfs),
     cmd("led", &[], "板载 LED on|off", cmd_led),
-    cmd("selftest", &[], "内核自检 (rtos 功能自检)", cmd_selftest),
+    cmd("selftest", &[], "自检: selftest [all|can]", cmd_selftest),
     cmd("log", &[], "日志开关/级别 (on|off|level <级>)", cmd_log),
     cmd("clear", &[], "清屏", cmd_clear),
     cmd("whoami", &[], "当前用户", cmd_whoami),
@@ -1360,9 +1360,13 @@ fn cmd_led(_state: &mut ShellState, rest: &str) -> CmdResult {
 
 /// 内核自检: **同步执行** (完成后才出下一提示符, 可按 ESC 中断)
 /// (受 CFG_APP_SELFTEST_ENABLE 控制)
-fn cmd_selftest(_state: &mut ShellState, _rest: &str) -> CmdResult {
+fn cmd_selftest(_state: &mut ShellState, rest: &str) -> CmdResult {
     if config::APP_SELFTEST_ENABLE {
-        crate::selftest::run();
+        match rest.trim() {
+            "" | "all" => crate::selftest::run(),
+            "can" => crate::selftest::run_can(),
+            _ => println!("用法: selftest [all|can]"),
+        }
     } else {
         println!("selftest 未启用 (CFG_APP_SELFTEST_ENABLE=false)");
     }

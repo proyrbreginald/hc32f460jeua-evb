@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::gpio::{Config, Drive, Gpio, Mode, Pin, PortA, PortC};
+use crate::gpio::{Config, Drive, Gpio, Mode, Pin, PortA, PortB, PortC};
 use crate::uart::UartConfig;
 
 /// 板载 LED: PC13，引脚号保留现有编译期配置校验。
@@ -21,11 +21,13 @@ pub struct Board {
 pub struct BoardResources {
     led: BoardLed,
     console: crate::config::ConsoleUart,
+    can: crate::can::Can,
 }
 
 static RESOURCES: BoardResources = BoardResources {
     led: BoardLed::new(),
     console: crate::config::ConsoleUart::take(),
+    can: crate::can::Can::new(),
 };
 static BOARD_TAKEN: AtomicBool = AtomicBool::new(false);
 static BOARD_READY: AtomicBool = AtomicBool::new(false);
@@ -41,7 +43,7 @@ impl Board {
 
     /// 初始化开发板并返回静态板级资源。
     ///
-    /// 顺序保持为：时钟 -> MPU -> GPIO -> SysTick -> UART -> RTC。
+    /// 顺序保持为：时钟 -> MPU -> GPIO -> SysTick -> UART -> CAN -> RTC。
     pub fn init(self) -> &'static BoardResources {
         // 振荡器/PLL 失败时硬件仍保持或回退到可用源。先保存结果，等
         // UART 就绪后报告，后续外设一律按实际时钟计算分频。
@@ -65,6 +67,12 @@ impl Board {
             .set_func(crate::config::UART_TX_FSEL);
         gpio.pin::<PortA, { crate::config::UART_RX_PIN }>()
             .set_func(crate::config::UART_RX_FSEL);
+        if crate::config::CAN_ENABLE {
+            gpio.pin::<PortB, { crate::config::CAN_TX_PIN }>()
+                .set_func(crate::config::CAN_TX_FSEL);
+            gpio.pin::<PortB, { crate::config::CAN_RX_PIN }>()
+                .set_func(crate::config::CAN_RX_FSEL);
+        }
 
         crate::systick::init(crate::config::SYSTICK_FREQ_HZ).expect("SysTick 配置失败!");
         crate::log_debug!("SysTick: {} Hz", crate::config::SYSTICK_FREQ_HZ);
@@ -117,6 +125,30 @@ impl Board {
             crate::config::UART_OVERSAMPLE,
             crate::config::UART_CLOCK_DIV
         );
+
+        if crate::config::CAN_ENABLE {
+            let timing = RESOURCES
+                .can
+                .init(crate::config::CAN_CONFIG)
+                .expect("CAN 初始化失败");
+            assert_eq!(
+                timing,
+                crate::config::CAN_BIT_TIMING,
+                "CAN 运行时与编译期位时序不一致"
+            );
+            crate::log_debug!(
+                "CAN: {} bps (实际 {} bps, 误差 {}ppm, 采样点 {}‰, {}TQ, PRESC={}, SEG1={}, SEG2={}, SJW={})",
+                crate::config::CAN_BITRATE,
+                timing.actual_bitrate(crate::clk::XTAL_HZ),
+                timing.error_ppm(crate::clk::XTAL_HZ, crate::config::CAN_BITRATE),
+                timing.sample_point_permille(),
+                timing.total_time_quanta(),
+                timing.prescaler,
+                timing.time_seg1,
+                timing.time_seg2,
+                timing.sjw
+            );
+        }
 
         if crate::config::RTC_ENABLE {
             crate::rtc::init(crate::rtc::Config {
@@ -182,6 +214,11 @@ impl BoardResources {
     /// 已初始化的控制台 UART。
     pub(crate) fn console(&self) -> &crate::config::ConsoleUart {
         &self.console
+    }
+
+    /// 板级唯一 CAN 控制器句柄。
+    pub(crate) fn can(&self) -> &crate::can::Can {
+        &self.can
     }
 
     /// 注册并使能控制台 UART 接收中断。

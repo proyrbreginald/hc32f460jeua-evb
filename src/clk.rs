@@ -387,6 +387,11 @@ pub fn xtal_stable() -> bool {
     read8(CMU_BASE + CMU_OSCSTBSR) & OSCSTBSR_XTALSTBF != 0
 }
 
+/// Whether the external crystal oscillator is commanded on (XTALSTP=0).
+pub fn xtal_enabled() -> bool {
+    read8(CMU_BASE + CMU_XTALCR) & 1 == 0
+}
+
 /// 切换系统时钟源到 MPLL (200MHz)
 ///
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1)、
