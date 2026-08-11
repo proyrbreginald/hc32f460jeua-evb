@@ -8,19 +8,21 @@
 // 内核模块: unsafe 契约由临界区与模块文档统一说明, 函数体内不再逐段包裹
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use core::cell::UnsafeCell;
 use core::ptr;
 
 use alloc::alloc::{Layout, alloc, dealloc};
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use crate::critical_section;
+use crate::critical_section::CriticalSection;
+use crate::rtos::PRIORITY_MAX;
 use crate::rtos::context;
 use crate::rtos::idle::defunct_push;
-use crate::rtos::ipc::{Error, EventOpt, MutexInner, mutex_release_all_held};
+use crate::rtos::ipc::{Error, EventOpt, MutexInner, mutex_release_all_held, mutex_waiter_removed};
 use crate::rtos::klist::{KCell, ListHead};
 use crate::rtos::sched;
 use crate::rtos::timer::Timer;
-use crate::rtos::{PRIORITY_MAX, TICKS_PER_SEC};
 
 /// 线程状态
 pub(crate) const TS_INIT: u8 = 0;
@@ -32,22 +34,67 @@ pub(crate) const TS_CLOSE: u8 = 4;
 /// 线程栈填充魔数 (溢出检测)
 pub(crate) const STACK_PATTERN: u32 = 0xA5A5_A5A5;
 
+/// 栈底 canary 字大小 (字节): 位于栈区最下端, 栈向下溢出时
+/// 最先被破坏, 由空闲线程巡检 ([`check_stack_canaries`]) 检出。
+pub(crate) const CANARY_SIZE: usize = 4;
+
+/// CPU port 预留的栈守卫区: 位于栈区**下方** (线程自身分配内)。
+pub(crate) const GUARD_SIZE: usize = crate::arch::STACK_GUARD_SIZE;
+const GUARD_ALIGN: usize = crate::arch::STACK_GUARD_ALIGN;
+const _: () = assert!(GUARD_ALIGN.is_power_of_two(), "栈守卫对齐必须为 2 的幂");
+
+/// 构造线程栈分配布局。分配器直接满足 MPU 守卫的 32 字节对齐，布局为
+/// `[guard | stack]`，不再需要手工预留并丢弃对齐裕量。
+fn stack_layout(stack_size: usize) -> Layout {
+    let allocation_size = stack_size
+        .checked_add(GUARD_SIZE)
+        .expect("thread_create: 栈布局大小溢出");
+    Layout::from_size_align(allocation_size, GUARD_ALIGN).expect("thread_create: 栈布局无效")
+}
+
 /// 睡眠队列 (线程延时挂起; 与 IPC 挂起队列共用 suspend_node)
 static SLEEP_LIST: KCell<ListHead> = KCell::new(ListHead::const_new());
 
 /// 全部已创建线程链表 (供 `ps` 等诊断遍历)
 static ALL_THREADS: KCell<ListHead> = KCell::new(ListHead::const_new());
 
-/// 线程控制块 (TCB) — RT-Thread `struct rt_thread` 的 Rust 移植
+/// 公开线程句柄的 Arc 内部对象。
 ///
-/// 由内核分配并持有 (僵尸回收), 应用持有 `&'static Thread` 句柄。
-/// 除 [`Thread::name`] 外, 字段仅在临界区 (关中断) 内访问。
+/// 外壳本身不可变，所有内核可变状态都位于 [`UnsafeCell<ThreadInner>`]。
+/// 这使 `Arc<Thread>` 的共享引用与内核原地更新同时满足 Rust 的内部
+/// 可变性规则；关中断临界区负责运行时同步。
 pub struct Thread {
+    inner: UnsafeCell<ThreadInner>,
+}
+
+/// 线程控制块 (TCB) — RT-Thread `struct rt_thread` 的 Rust 移植。
+///
+/// 由内核以 `Arc` 管理：[`thread_create`] 返回 [`Arc<Thread>`] 句柄，
+/// **句柄在线程资源回收后仍可使用 (不悬垂)**。TCB 的存活由用户句柄
+/// 与内核侧强引用共同维持：
+///
+/// - 线程退出/删除后, 空闲线程回收**栈**并释放内核侧强引用;
+///   只要仍有用户句柄, TCB 本身保持存活;
+/// - 全部用户句柄释放后, TCB 才被释放。
+///
+/// 所有字段仅通过 `Thread::inner` 的 [`UnsafeCell`] 在临界区内访问。
+pub(crate) struct ThreadInner {
+    /// 内核侧强引用 (与用户句柄构成 TCB 的存活集合)
+    ///
+    /// 线程创建时写入; 回收 (空闲线程) 时取出并释放 —— 若用户仍持有
+    /// [`Arc<Thread>`] 句柄, TCB 由句柄维持, 杜绝 use-after-free。
+    pub(crate) kernel_self: Option<Arc<Thread>>,
     /// 保存的线程栈指针 (PSP, 由 PendSV 汇编读写)
     pub(crate) sp: usize,
-    /// 栈基址 / 大小
+    /// 栈基址 (守卫区上方) / 大小
     pub(crate) stack_addr: usize,
     pub(crate) stack_size: usize,
+    /// 栈底 canary 字地址 (软件溢出检测, 见 [`check_stack_canaries`])
+    pub(crate) canary_addr: usize,
+    /// CPU port 栈守卫区基址 (按 backend 要求对齐)
+    pub(crate) guard_addr: usize,
+    /// 堆分配基址 (含守卫区/对齐裕量, 回收时按此释放)
+    pub(crate) alloc_addr: usize,
     /// 入口参数 (诊断用, 当前版本仅用于初始栈帧)
     #[allow(dead_code)]
     pub(crate) parameter: usize,
@@ -90,44 +137,62 @@ unsafe impl Send for Thread {}
 unsafe impl Sync for Thread {}
 
 impl Thread {
+    #[inline]
+    pub(crate) fn ptr(&self) -> *mut ThreadInner {
+        self.inner.get()
+    }
+
     /// 线程名
     pub fn name(&self) -> &'static str {
-        self.name
+        critical_section::with(|_| unsafe { (*self.ptr()).name })
     }
 
     /// 当前优先级
     pub fn priority(&self) -> u8 {
-        critical_section::with(|| self.current_priority)
+        critical_section::with(|_| unsafe { (*self.ptr()).current_priority })
     }
 
-    /// 删除线程: 进入僵尸队列, 由空闲线程回收资源
+    /// 强制删除线程: 进入僵尸队列, 由空闲线程回收内核资源。
     ///
-    /// 对当前线程调用时**永不返回** (删除自身)。
-    pub fn delete(&self) {
-        let t = self as *const Thread as *mut Thread;
+    /// 在线程上下文对当前线程调用时**永不返回** (删除自身)。中断上下文
+    /// 不能删除 `current`：它可能是被打断线程，也可能是 PendSV 正在恢复
+    /// 的目标线程，此时修改切换请求会破坏上下文保存关系。
+    ///
+    /// # Safety
+    ///
+    /// 强制删除不会展开目标线程的 Rust 栈，因此不会运行局部变量的
+    /// `Drop`。调用方必须保证目标线程没有仍需析构的值、活动借用/守卫，
+    /// 也不处于必须完成才能恢复共享不变量的操作中。通常应让线程通过
+    /// 协作式停止标志自行从入口返回；本接口只用于已证明可取消的线程。
+    pub unsafe fn force_delete(&self) -> Result<(), Error> {
+        let t = self.ptr();
         if t == sched::current() {
+            if crate::critical_section::in_isr() {
+                return Err(Error::InterruptContext);
+            }
             unsafe { exit_and_schedule(t) };
         }
-        critical_section::with(|| unsafe { delete_bookkeeping(t) });
+        critical_section::with(|cs| unsafe { delete_bookkeeping(t, cs) });
         sched::schedule();
+        Ok(())
     }
 
     /// 挂起线程 (仅可就绪线程挂起, 不可挂起自身)
     ///
     /// 挂起的线程只能通过 [`Thread::resume`] 恢复。
     pub fn suspend(&self) -> Result<(), Error> {
-        let t = self as *const Thread as *mut Thread;
+        let t = self.ptr();
         if t == sched::current() {
             return Err(Error::Invalid);
         }
         let mut ok = false;
         let mut need = false;
-        critical_section::with(|| unsafe {
+        critical_section::with(|cs| unsafe {
             if (*t).state == TS_READY || (*t).state == TS_RUNNING {
-                sched::ready_remove(t);
+                sched::ready_remove(t, cs);
                 (*t).state = TS_SUSPEND;
                 ok = true;
-                need = (*t).current_priority < (*sched::current()).current_priority;
+                need = resched_needed(t);
             }
         });
         if !ok {
@@ -139,20 +204,19 @@ impl Thread {
         Ok(())
     }
 
-    /// 恢复挂起的线程 (含延时/IPC 等待中的线程)
+    /// 恢复由 [`Thread::suspend`] 显式挂起的线程。
     ///
-    /// 注意: 对挂在**信号量/互斥量**等待队列上的线程恢复属于未定义语义
-    /// (唤醒即"获得"是 release/unlock 的职责), 本 API 仅应在延时/显式
-    /// 挂起场景使用; 邮箱/消息队列等待者被恢复后经重查条件自洽。
+    /// 延时或 IPC 等待中的线程挂在内核等待队列上，必须由对应超时/唤醒
+    /// 路径恢复；本方法会返回 [`Error::Invalid`]。这防止绕过互斥量的
+    /// “唤醒即转移所有权”协议而构造两个并存的 [`MutexGuard`](crate::rtos::MutexGuard)。
     pub fn resume(&self) -> Result<(), Error> {
-        let t = self as *const Thread as *mut Thread;
+        let t = self.ptr();
         let mut need = false;
-        let ok = critical_section::with(|| unsafe {
-            if (*t).state != TS_SUSPEND {
+        let ok = critical_section::with(|cs| unsafe {
+            if (*t).state != TS_SUSPEND || (*t).suspend_node.is_linked() {
                 return false;
             }
-            (*t).suspend_node.remove();
-            wakeup_thread(t);
+            wakeup_thread(t, cs);
             need = resched_needed(t);
             true
         });
@@ -170,6 +234,10 @@ impl Thread {
 ///
 /// 参数: 名称 / 栈大小 (字节) / 优先级 (0 最高, 31 为最低/空闲) /
 /// 时间片 (tick, 0 = 不参与轮转) / 入口函数 (`extern "C" fn(usize)`) / 参数。
+///
+/// 返回 [`Arc<Thread>`] 用户句柄: 线程退出/删除后 TCB 由句柄维持存活
+/// (栈已被空闲线程回收), 句柄不会悬垂; 丢弃句柄不影响线程运行
+/// (内核侧强引用维持 TCB)。
 pub fn thread_create(
     name: &'static str,
     stack_size: usize,
@@ -177,70 +245,89 @@ pub fn thread_create(
     timeslice: u32,
     entry: extern "C" fn(usize),
     param: usize,
-) -> &'static Thread {
+) -> Arc<Thread> {
     assert!(priority < PRIORITY_MAX, "thread_create: 优先级超出范围");
     assert!(stack_size >= 256, "thread_create: 栈过小");
+    assert!(
+        stack_size.is_multiple_of(8),
+        "thread_create: 栈大小必须按 8 字节对齐"
+    );
 
-    // 分配线程栈 (8 字节对齐), 填充溢出检测魔数
-    let layout = Layout::from_size_align(stack_size, 8).expect("栈布局无效");
+    // 分配 = [CPU 守卫区 | 栈]，整个 allocation 直接按守卫粒度对齐。
+    // 栈向下溢出先撞守卫区 (硬件 MemManage 故障)，软件 canary 作为
+    // MPU 关闭时的后备检测。
+    let layout = stack_layout(stack_size);
     let stack = unsafe { alloc(layout) };
     assert!(!stack.is_null(), "thread_create: 栈分配失败");
+    let alloc_addr = stack as usize;
+    let guard_addr = alloc_addr;
+    let stack_addr = guard_addr + GUARD_SIZE;
     unsafe {
-        let words = stack as *mut u32;
+        core::ptr::write_volatile(stack_addr as *mut u32, STACK_PATTERN);
+        let words = stack_addr as *mut u32;
         for i in 0..stack_size / 4 {
             words.add(i).write_volatile(STACK_PATTERN);
         }
     }
 
-    // 分配 TCB
-    let t = Box::into_raw(Box::new(Thread {
-        sp: 0,
-        stack_addr: stack as usize,
-        stack_size,
-        parameter: param,
-        name,
-        init_priority: priority,
-        current_priority: priority,
-        init_tick: timeslice,
-        remaining_tick: timeslice,
-        state: TS_INIT,
-        yielded: false,
-        error: 0,
-        ready_node: ListHead::const_new(),
-        suspend_node: ListHead::const_new(),
-        defunct_node: ListHead::const_new(),
-        list_node: ListHead::const_new(),
-        thread_timer: Timer::new(),
-        taken_list: ListHead::const_new(),
-        pending_mutex: ptr::null_mut(),
-        event_wanted: 0,
-        event_opt: EventOpt::Or,
-        event_recv_bits: 0,
-    }));
+    // 不可变 Arc 外壳持有 UnsafeCell<TCB>：用户共享句柄不会与内核内部
+    // 可变访问形成非法别名。用户句柄 + kernel_self 各持一份引用计数。
+    let arc: Arc<Thread> = Arc::new(Thread {
+        inner: UnsafeCell::new(ThreadInner {
+            kernel_self: None,
+            sp: 0,
+            stack_addr,
+            stack_size,
+            canary_addr: stack_addr,
+            guard_addr,
+            alloc_addr,
+            parameter: param,
+            name,
+            init_priority: priority,
+            current_priority: priority,
+            init_tick: timeslice,
+            remaining_tick: timeslice,
+            state: TS_INIT,
+            yielded: false,
+            error: 0,
+            ready_node: ListHead::const_new(),
+            suspend_node: ListHead::const_new(),
+            defunct_node: ListHead::const_new(),
+            list_node: ListHead::const_new(),
+            thread_timer: Timer::new(),
+            taken_list: ListHead::const_new(),
+            pending_mutex: ptr::null_mut(),
+            event_wanted: 0,
+            event_opt: EventOpt::Or,
+            event_recv_bits: 0,
+        }),
+    });
+    let kernel_arc = Arc::clone(&arc);
+    let t = arc.ptr();
 
     // 构造初始栈帧: 入口返回后硬件跳入 thread_exit
+    // (栈区从 canary 上方开始, 避免初始帧压到 canary 字)
     unsafe {
         (*t).sp = context::init_stack(
-            stack,
+            stack_addr as *mut u8,
             stack_size,
             entry as usize,
             param,
             thread_exit as *const () as usize,
         );
+        // 登记内核侧强引用：之后 TCB 由 kernel_self 与用户 arc 共同维持。
+        (*t).kernel_self = Some(kernel_arc);
     }
 
     // 启动: 加入就绪队列 + 全局线程链表
-    critical_section::with(|| unsafe {
+    critical_section::with(|cs| unsafe {
         (*t).state = TS_READY;
-        sched::ready_insert(t);
-        // volatile 读屏障: 防止"写后无读"将链表写入判定为死存储而消除
-        let head = ALL_THREADS.get();
-        let _ = core::ptr::read_volatile(head);
-        (*ALL_THREADS.get_mut()).push_back(&mut (*t).list_node);
-        let _ = core::ptr::read_volatile(head);
+        sched::ready_insert(t, cs);
+        let all_threads = ALL_THREADS.get(cs);
+        all_threads.push_back(&mut (*t).list_node);
     });
 
-    unsafe { &mut *t }
+    arc
 }
 
 /// 线程状态 → 名称 (诊断显示)
@@ -264,20 +351,26 @@ pub struct ThreadInfo {
     pub priority: u8,
     /// 线程状态 (见 [`thread_state_name`])
     pub state: u8,
+    /// 栈已用字节数 (高水位, 由填充魔数扫描得到)
+    pub stack_used: usize,
+    /// 栈总大小 (字节)
+    pub stack_size: usize,
 }
 
 /// 全部已创建线程的快照列表 (按创建顺序, 供诊断命令使用)
 pub fn thread_info_list() -> alloc::vec::Vec<ThreadInfo> {
     let mut list = alloc::vec::Vec::new();
-    critical_section::with(|| unsafe {
-        let head = ALL_THREADS.get();
+    critical_section::with(|cs| unsafe {
+        let head = ALL_THREADS.get(cs) as *const ListHead as *mut ListHead;
         let mut node = (*head).next_node();
         while !node.is_null() && node != head {
-            let t = crate::rtos::klist::container_of!(node, Thread, list_node);
+            let t = crate::rtos::klist::container_of!(node, ThreadInner, list_node);
             list.push(ThreadInfo {
                 name: (*t).name,
                 priority: (*t).current_priority,
                 state: (*t).state,
+                stack_used: stack_watermark(t),
+                stack_size: (*t).stack_size,
             });
             node = (*node).next_node();
         }
@@ -291,81 +384,95 @@ unsafe extern "C" fn thread_exit() -> ! {
 }
 
 /// 退出清理 + 触发切换 (当前线程调用, 永不返回)
-unsafe fn exit_and_schedule(t: *mut Thread) -> ! {
-    critical_section::with(|| unsafe { delete_bookkeeping(t) });
+unsafe fn exit_and_schedule(t: *mut ThreadInner) -> ! {
+    critical_section::with(|cs| unsafe { delete_bookkeeping(t, cs) });
     sched::schedule();
     // PendSV 即将切换走, 此循环仅在切换前短暂执行
     loop {
-        unsafe { core::arch::asm!("wfi") };
+        crate::arch::wait_for_interrupt();
     }
 }
 
-/// 临界区内: 线程删除/退出公共清理
-unsafe fn delete_bookkeeping(t: *mut Thread) {
+/// 临界区内: 线程删除/退出公共清理 (须持有临界区令牌)
+unsafe fn delete_bookkeeping(t: *mut ThreadInner, cs: CriticalSection<'_>) {
     // 已回收 (TS_CLOSE, 僵尸队列中): 拒绝重复删除, 防二次释放
     if (*t).state == TS_CLOSE {
         return;
     }
     // 释放持有的互斥量 (所有权转移给等待者)
-    mutex_release_all_held(t);
+    mutex_release_all_held(t, cs);
     // 停止线程定时器 (防止超时回调唤醒已删除线程)
-    (*t).thread_timer.stop_internal();
+    (*t).thread_timer.stop_internal(cs);
     // 从就绪/挂起队列移除
     if (*t).ready_node.is_linked() {
-        sched::ready_remove(t);
+        sched::ready_remove(t, cs);
     }
     (*t).suspend_node.remove();
+    mutex_waiter_removed(t, cs);
     // 置关闭状态, 进入僵尸队列 (由空闲线程回收)
     (*t).state = TS_CLOSE;
-    defunct_push(t);
+    defunct_push(t, cs);
 }
 
-/// 线程延时 (tick); 0 时等价于让出 CPU
-pub fn thread_delay(ticks: u32) {
+/// 线程延时 (tick); 0 时等价于让出 CPU。
+///
+/// 在 ISR 或调度器启动前调用会返回类型化错误，所有构建配置均不会
+/// 挂起被中断执行流或解引用空的 current thread。
+pub fn thread_delay(ticks: u32) -> Result<(), Error> {
+    if !crate::rtos::scheduler_started() {
+        return Err(Error::KernelNotStarted);
+    }
+    if crate::critical_section::in_isr() {
+        return Err(Error::InterruptContext);
+    }
     if ticks == 0 {
         unsafe { sched::yield_thread() };
-        return;
+        return Ok(());
     }
-    critical_section::with(|| unsafe { delay_suspend(sched::current(), ticks) });
+    critical_section::with(|cs| unsafe { delay_suspend(sched::current(), ticks, cs) });
     sched::schedule();
+    Ok(())
 }
 
 /// 线程延时 (ms)
-pub fn thread_delay_ms(ms: u32) {
-    thread_delay(ms.saturating_mul(TICKS_PER_SEC) / 1000);
+///
+/// 非零时长向上取整到至少一个 tick; 使用 64 位中间值避免乘法溢出。
+/// 超出定时器回绕安全窗口的时长钳位到 `i32::MAX` tick。
+pub fn thread_delay_ms(ms: u32) -> Result<(), Error> {
+    thread_delay(crate::rtos::ticks_from_ms(ms))
 }
 
 /// 主动让出 CPU (同优先级轮转)
-pub fn yield_now() {
-    unsafe { sched::yield_thread() };
+pub fn yield_now() -> Result<(), Error> {
+    thread_delay(0)
 }
 
 /// 临界区内: 当前线程挂起 `ticks` tick (进入睡眠队列)
-unsafe fn delay_suspend(cur: *mut Thread, ticks: u32) {
+unsafe fn delay_suspend(cur: *mut ThreadInner, ticks: u32, cs: CriticalSection<'_>) {
     (*cur).error = 0;
     (*cur).suspend_node.remove();
     (*cur)
         .thread_timer
-        .start_internal(ticks, 0, thread_timer_cb, cur as usize);
-    (*SLEEP_LIST.get_mut()).push_back(&mut (*cur).suspend_node);
+        .start_internal(ticks, 0, thread_timer_cb, cur as usize, cs);
+    (*SLEEP_LIST.get(cs)).push_back(&mut (*cur).suspend_node);
     (*cur).state = TS_SUSPEND;
-    sched::ready_remove(cur);
+    sched::ready_remove(cur, cs);
 }
 
 /// 线程定时器超时回调: 唤醒挂起的线程 (延时超时 / IPC 超时)
 ///
 /// 与显式唤醒的竞争由状态检查消解: 仅当线程仍处于挂起态时才唤醒。
 pub(crate) extern "C" fn thread_timer_cb(param: usize) {
-    let t = param as *mut Thread;
+    let t = param as *mut ThreadInner;
     let mut need = false;
-    critical_section::with(|| unsafe {
+    critical_section::with(|cs| unsafe {
         if (*t).state != TS_SUSPEND {
             return;
         }
         (*t).error = -1; // -RT_ETIMEDOUT
-        (*t).pending_mutex = core::ptr::null_mut(); // 超时: 清理继承链残留
         (*t).suspend_node.remove();
-        wakeup_thread(t);
+        mutex_waiter_removed(t, cs);
+        wakeup_thread(t, cs);
         need = resched_needed(t);
     });
     if need {
@@ -374,27 +481,27 @@ pub(crate) extern "C" fn thread_timer_cb(param: usize) {
 }
 
 /// 挂起节点 → 线程
-pub(crate) unsafe fn thread_from_suspend(node: *mut ListHead) -> *mut Thread {
-    crate::rtos::klist::container_of!(node, Thread, suspend_node)
+pub(crate) unsafe fn thread_from_suspend(node: *mut ListHead) -> *mut ThreadInner {
+    crate::rtos::klist::container_of!(node, ThreadInner, suspend_node)
 }
 
 /// 就绪节点 → 线程
-pub(crate) unsafe fn thread_from_ready(node: *mut ListHead) -> *mut Thread {
-    crate::rtos::klist::container_of!(node, Thread, ready_node)
+pub(crate) unsafe fn thread_from_ready(node: *mut ListHead) -> *mut ThreadInner {
+    crate::rtos::klist::container_of!(node, ThreadInner, ready_node)
 }
 
 /// 临界区内: 唤醒挂起线程 (对齐 RT-Thread `rt_thread_resume` 的核心步骤)
 ///
 /// 停止线程定时器 → 状态就绪 → 入就绪队列。调用方须保证线程处于
 /// 挂起态 (状态检查由各调用路径完成, 超时回调与显式唤醒互斥)。
-pub(crate) unsafe fn wakeup_thread(t: *mut Thread) {
-    (*t).thread_timer.stop_internal();
+pub(crate) unsafe fn wakeup_thread(t: *mut ThreadInner, cs: CriticalSection<'_>) {
+    (*t).thread_timer.stop_internal(cs);
     (*t).state = TS_READY;
-    sched::ready_insert(t);
+    sched::ready_insert(t, cs);
 }
 
 /// 被唤醒线程是否比当前线程更紧急 (需要重新调度)
-pub(crate) fn resched_needed(w: *mut Thread) -> bool {
+pub(crate) fn resched_needed(w: *mut ThreadInner) -> bool {
     let cur = sched::current();
     !cur.is_null() && unsafe { (*w).current_priority < (*cur).current_priority }
 }
@@ -408,10 +515,80 @@ pub(crate) fn blocked_wait() -> bool {
     (unsafe { (*sched::current()).error }) != 0
 }
 
-/// 释放线程栈与 TCB (由空闲线程的僵尸回收调用)
-pub(crate) unsafe fn free_thread(t: *mut Thread) {
-    (*t).list_node.remove();
-    let layout = Layout::from_size_align((*t).stack_size, 8).expect("内存布局无效");
-    unsafe { dealloc((*t).stack_addr as *mut u8, layout) };
-    drop(Box::from_raw(t));
+/// 释放线程栈与内核侧强引用 (由空闲线程的僵尸回收调用)
+///
+/// 线程已退出/被删除且已切换离开, 栈不再被使用, 立即释放;
+/// TCB 由内核侧强引用维持 (本函数取出并释放), 若用户仍持有
+/// [`Arc<Thread>`] 句柄, TCB 继续存活 —— 句柄不会悬垂。
+pub(crate) unsafe fn free_thread(t: *mut ThreadInner) {
+    // `list_node` 已由 idle 在持有临界区时摘除，避免与 `ps` 遍历竞争。
+    // 释放必须复用创建时的 `[guard | stack]` 布局与原始分配基址。
+    let layout = stack_layout((*t).stack_size);
+    unsafe { dealloc((*t).alloc_addr as *mut u8, layout) };
+    // 释放内核侧强引用; 若用户句柄仍存活, 此处仅递减引用计数,
+    // TCB 在最后一个句柄释放时才被回收
+    unsafe { (*t).kernel_self.take() };
+}
+
+// ============================== 栈溢出检测 ==============================
+
+/// 检查全部线程栈的底部 canary, 返回第一个被破坏的线程名
+///
+/// 由空闲线程周期性调用 (见 `idle` 模块): 栈向下溢出时 canary 字
+/// 被覆写, 立即检出并交由调用方处理 (panic/复位)。调用方须在
+/// 线程上下文 (canary 巡检在临界区内进行, 期间被检线程不会运行,
+/// 单字读取无撕裂)。
+pub(crate) fn check_stack_canaries() -> Option<&'static str> {
+    critical_section::with(|cs| unsafe {
+        let head = ALL_THREADS.get(cs) as *const ListHead as *mut ListHead;
+        let mut node = (*head).next_node();
+        while !node.is_null() && node != head {
+            let t = crate::rtos::klist::container_of!(node, ThreadInner, list_node);
+            if core::ptr::read_volatile((*t).canary_addr as *const u32) != STACK_PATTERN {
+                return Some((*t).name);
+            }
+            node = (*node).next_node();
+        }
+        None
+    })
+}
+
+/// 主栈 (MSP: 启动/中断栈) canary 地址: 堆上界 `_heap_end`
+/// (link.ld 预留 4 字节, 见 startup.rs 初始化)
+fn main_stack_canary_addr() -> usize {
+    unsafe extern "C" {
+        static _heap_end: u8;
+    }
+    core::ptr::addr_of!(_heap_end) as usize
+}
+
+/// 检查主栈 (MSP) canary 是否被破坏 (主栈向下溢出首先写坏该字)
+///
+/// 由空闲线程巡检 (线程模式运行, MSP 空闲可安全读取); 与线程栈
+/// canary 互补 —— 线程栈有 MPU 守卫 + canary, 主栈是启动/中断
+/// 专用栈, 此为唯一的溢出检测点。
+pub(crate) fn check_main_stack_canary() -> bool {
+    unsafe { core::ptr::read_volatile(main_stack_canary_addr() as *const u32) == STACK_PATTERN }
+}
+
+/// 线程栈已使用字节数 (高水位, 从栈底向上扫描未破坏的填充区)
+///
+/// 填充魔数区 = 从未被触及的栈区; 首个非魔数字以下为使用区。
+/// 供 `ps` 等诊断显示栈余量 (仅对非运行线程有意义 —— 巡检运行
+/// 于空闲线程, 被检线程此刻必然未运行)。
+pub(crate) fn stack_watermark(t: *mut ThreadInner) -> usize {
+    let base = unsafe { (*t).stack_addr };
+    let size = unsafe { (*t).stack_size };
+    let words = size / 4;
+    let mut unused_words = words;
+    unsafe {
+        for i in 0..words {
+            let v = core::ptr::read_volatile((base + i * 4) as *const u32);
+            if v != STACK_PATTERN {
+                unused_words = i;
+                break;
+            }
+        }
+    }
+    size - unused_words * 4
 }

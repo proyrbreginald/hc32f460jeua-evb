@@ -13,9 +13,13 @@
 //! - **BUSHLDCTL=0 (bus hold)**: 擦写期间总线被占用, CPU 取指/中断响应
 //!   自动 stall, 直到操作完成 —— 从 Flash 运行也可安全执行扇区擦除/
 //!   单字编程 (执行代码所在扇区未被擦除);
+//! - **缓存**: 擦/写操作自动保存并关闭 CACHE (对齐 DDL), 完成后恢复;
+//!   200MHz 运行时建议经 [`enable_cache`] 开启缓存 (由 clk 模块在
+//!   切换到 PLL 后调用, 对齐 BSP_CLK_Init);
 //! - **全片擦除/序列编程会擦除执行代码所在 Flash, 必须从 RAM 运行**
 //!   (DDL 标记 `__RAM_FUNC`), 本模块不提供, 需要时请自建 RAM 函数;
-//! - 操作不关中断: bus hold 期间中断挂起, 操作结束后按优先级响应。
+//! - MPU 写权限切换与触发 store 在临界区内完成, `wait_end` 在临界区外;
+//!   bus hold 期间主 Flash 取指本身会暂停, 操作结束后中断按优先级响应。
 //!
 //! # 使用
 //!
@@ -24,7 +28,7 @@
 //! efm::sector_erase(0x0007_C000)?;
 //! efm::program(0x0007_C000, b"hello")?;
 //! // 读回校验 (Flash 内存映射, 任意字节可读)
-//! assert_eq!(efm::read_byte(0x0007_C000), b'h');
+//! assert_eq!(efm::read_byte(0x0007_C000)?, b'h');
 //! ```
 //!
 //! 注意: 写保护/安全 (level1/2)、窗口写保护、swap、OTP 锁、序列编程、
@@ -32,6 +36,8 @@
 //!
 //! 常量与 API 供应用按需选用, 忽略未使用项的死代码警告。
 #![allow(dead_code)]
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// 主 Flash 大小 (512KB)
 pub const FLASH_SIZE: u32 = 0x0008_0000;
@@ -46,12 +52,18 @@ const EFM_BASE: usize = 0x4001_0400;
 // ---- 寄存器偏移 (SVD/DDL 逐项核对) ----
 const FAPRT: usize = 0x00; // 写保护键 (0x0123→0x3210 解锁, 读回 1 = 已解锁; 0x0000 锁定)
 const FSTP: usize = 0x04; // Flash 停止 (bit0, 1=停止)
-const FRMC: usize = 0x08; // FLWT[7:4] 读等待, CACHE[16]
+const FRMC: usize = 0x08; // FLWT[7:4] 读等待, CACHE[16] 数据/指令缓存, CRST[24] 缓存 RAM 复位
 const FWMC: usize = 0x0C; // PEMODE[0] 寄存器可写, PEMOD[6:4] 操作模式, BUSHLDCTL[8]
 const FSR: usize = 0x10; // 状态
 const FSCLR: usize = 0x14; // 状态清除 (写 1)
 const FSWP: usize = 0x1C; // swap 状态
 const UQID0: usize = 0x50; // 唯一 ID (3 × 32bit)
+
+// ---- FRMC ----
+const FRMC_CACHE: u32 = 1 << 16; // 数据/指令缓存使能 (对齐 EFM_FRMC_CACHE)
+const FRMC_CRST: u32 = 1 << 24; // 缓存 RAM 复位 (写 1 复位, 对齐 EFM_FRMC_CRST)
+/// 缓存相关位 (对齐 DDL `EFM_CACHE_ALL` = CRST | CACHE)
+const FRMC_CACHE_ALL: u32 = FRMC_CACHE | FRMC_CRST;
 
 // ---- FSR 位 ----
 const FSR_PEWERR: u32 = 1 << 0; // 编程/擦除错误
@@ -69,6 +81,9 @@ const FSR_ERRORS: u32 = FSR_PEWERR | FSR_PEPRTERR | FSR_PGSZERR | FSR_PGMISMTCH 
 const FWMC_PEMODE: u32 = 1 << 0;
 const FWMC_PEMOD_POS: u32 = 4;
 const FWMC_BUSHLDCTL: u32 = 1 << 8;
+
+/// 串行化唯一的 EFM 命令状态机。
+static OPERATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// 操作模式 (FWMC.PEMOD, 与 DDL `EFM_MD_*` 一致)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,6 +105,10 @@ pub enum OpMode {
 /// 操作失败原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EfmError {
+    /// 另一线程正在使用 EFM 命令状态机。
+    Busy,
+    /// 禁止在中断上下文执行擦写或运行期配置。
+    InterruptContext,
     /// 等待就绪/操作结束超时
     Timeout,
     /// 编程/擦除错误 (FSR.PEWERR)
@@ -104,6 +123,52 @@ pub enum EfmError {
     ReadCollision,
     /// 地址非法 (非字对齐或超出 Flash 范围)
     InvalidAddr,
+}
+
+struct OperationGuard;
+
+impl OperationGuard {
+    fn acquire() -> Result<Self, EfmError> {
+        if crate::critical_section::in_isr() {
+            return Err(EfmError::InterruptContext);
+        }
+        OPERATION_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| EfmError::Busy)
+    }
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        OPERATION_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+/// 切换系统时钟期间独占 EFM 配置状态机。
+pub(crate) struct ConfigurationGuard {
+    _operation: OperationGuard,
+}
+
+impl ConfigurationGuard {
+    pub(crate) fn set_wait_cycle(&mut self, hclk_hz: u32) -> Result<(), EfmError> {
+        if set_wait_cycle_unlocked(hclk_hz) {
+            Ok(())
+        } else {
+            Err(EfmError::Timeout)
+        }
+    }
+
+    pub(crate) fn enable_cache(&mut self) {
+        enable_cache_unlocked();
+    }
+}
+
+/// 防止完整时钟切换期间启动 program/erase。
+pub(crate) fn begin_configuration() -> Result<ConfigurationGuard, EfmError> {
+    Ok(ConfigurationGuard {
+        _operation: OperationGuard::acquire()?,
+    })
 }
 
 /// 由 FSR 错误位映射错误 (无错误返回 None)
@@ -129,7 +194,7 @@ pub fn status() -> u32 {
 }
 
 /// 清除状态标志 (写 FSCLR, 对齐 DDL `EFM_ClearStatus`)
-pub fn clear_status(flags: u32) {
+fn clear_status(flags: u32) {
     unsafe { core::ptr::write_volatile((EFM_BASE + FSCLR) as *mut u32, flags) };
 }
 
@@ -152,7 +217,7 @@ pub fn wait_ready() -> bool {
 }
 
 /// 解锁 EFM 寄存器写保护 (FAPRT 键 0x0123→0x3210, 对齐 DDL `EFM_REG_Unlock`)
-pub fn unlock() {
+fn unlock() {
     unsafe {
         core::ptr::write_volatile(EFM_BASE as *mut u32, 0x0123);
         core::ptr::write_volatile(EFM_BASE as *mut u32, 0x3210);
@@ -160,20 +225,25 @@ pub fn unlock() {
 }
 
 /// 锁定 EFM 寄存器写保护 (FAPRT=0, 对齐 DDL `EFM_REG_Lock`)
-pub fn lock() {
+fn lock() {
     unsafe { core::ptr::write_volatile(EFM_BASE as *mut u32, 0x0000) };
 }
 
 /// 使能擦写模式 (FWMC.PEMODE=1, 对齐 DDL `EFM_FWMC_Cmd(ENABLE)`)
-pub fn enable_program_mode() {
+fn enable_program_mode() {
     unsafe {
         let v = core::ptr::read_volatile((EFM_BASE + FWMC) as *const u32);
-        core::ptr::write_volatile((EFM_BASE + FWMC) as *mut u32, v | FWMC_PEMODE);
+        // This firmware executes from main Flash, so keep bus-hold enabled
+        // (BUSHLDCTL=0) during every program/erase operation.
+        core::ptr::write_volatile(
+            (EFM_BASE + FWMC) as *mut u32,
+            (v | FWMC_PEMODE) & !FWMC_BUSHLDCTL,
+        );
     }
 }
 
 /// 退出擦写模式 (FWMC.PEMODE=0)
-pub fn disable_program_mode() {
+fn disable_program_mode() {
     unsafe {
         let v = core::ptr::read_volatile((EFM_BASE + FWMC) as *const u32);
         core::ptr::write_volatile((EFM_BASE + FWMC) as *mut u32, v & !FWMC_PEMODE);
@@ -187,6 +257,55 @@ fn set_op_mode(mode: OpMode) {
         let v = (v & !(0x7 << FWMC_PEMOD_POS)) | ((mode as u32) << FWMC_PEMOD_POS);
         core::ptr::write_volatile((EFM_BASE + FWMC) as *mut u32, v);
     }
+}
+
+/// 关闭缓存并返回原缓存位状态 (对齐 DDL 擦/写前的 CACHE 处理)
+///
+/// 擦写期间必须关闭数据/指令缓存: 缓存可能命中旧数据, 且缓存 RAM
+/// 内容在编程后失效。返回值为 FRMC 的 CRST|CACHE 原值, 供
+/// [`restore_cache`] 恢复。
+fn disable_cache() -> u32 {
+    unsafe {
+        let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, v & !FRMC_CACHE_ALL);
+        v & FRMC_CACHE_ALL
+    }
+}
+
+/// 恢复缓存位 (写回 [`disable_cache`] 的返回值, 对齐 DDL 擦/写后的恢复)
+fn restore_cache(saved: u32) {
+    unsafe {
+        let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, (v & !FRMC_CACHE_ALL) | saved);
+    }
+}
+
+/// 使能 Flash 数据/指令缓存 (调用方持有 [`ConfigurationGuard`])。
+fn enable_cache_unlocked() {
+    unlock();
+    unsafe {
+        // 复位缓存 RAM (置位后清除, 对齐 EFM_CacheRamReset(ENABLE/DISABLE))
+        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, frmc | FRMC_CRST);
+        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, frmc & !FRMC_CRST);
+        // 使能缓存
+        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, frmc | FRMC_CACHE);
+    }
+    lock();
+}
+
+/// 失能 Flash 数据/指令缓存 (FRMC.CACHE 清位, 对齐 DDL `EFM_CacheCmd`)
+pub fn disable_cache_cmd() -> Result<(), EfmError> {
+    let _operation = OperationGuard::acquire()?;
+    unlock();
+    unsafe {
+        let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, v & !FRMC_CACHE);
+    }
+    lock();
+    Ok(())
 }
 
 /// 等待操作结束: RDY 置位 → OPTEND 置位并清除 (对齐 DDL `EFM_WaitEnd`)
@@ -213,16 +332,78 @@ fn check_addr(addr: u32) -> Result<(), EfmError> {
     Ok(())
 }
 
-// ============================== 读 ==============================
+// ============================== 引导交换 (Boot Swap) ==============================
+//
+// 参考手册 Rev1.71 章节 7.8 (引导交换), 仅 512KB 产品支持 (JEUA 为 512KB)。
+//
+// # 机制
+//
+// 扇区 0 (0x0000_0000~0x1FFF) 与扇区 1 (0x0000_2000~0x3FFF) 是 8KB 引导扇区:
+// 对 0x0007_FFDC (扇区 63 末字) 编程 0xFFFF_4321 后复位, 硬件把两个扇区的
+// **地址映射互换** (EFM_FSWP.FSWP=0), CPU 从物理扇区 1 (地址 0x0) 启动;
+// 该状态在每次复位时按 0x7FFDC 内容锁定, 擦除扇区 63 后恢复 (FSWP=1)。
+//
+// # 用途: 引导程序 (bootloader) 的自升级
+//
+// 标准流程 (对齐 RM 图 7-3/7-4, 每步都不可"砖"):
+//   1. 运行中的引导程序把新引导镜像写入扇区 1 (自身所在扇区 0 不动);
+//   2. [`swap_enable`] 编程 0x7FFDC = 0xFFFF_4321 (单字编程, 原子);
+//   3. 系统复位 → 新引导从物理扇区 1 启动 (旧引导仍完整保留);
+//   4. 新引导自检通过后, 擦除扇区 0 (此刻映射在 0x2000) 并把自身复制过去;
+//   5. [`swap_disable`] 擦除扇区 63 (清除交换标志) → 复位 → 回到正常启动。
+// 任一步掉电/复位都能从另一个扇区的旧镜像继续, 不会整片失效。
+//
+// # 注意事项
+//
+// - ICG 配置字 (0x400~0x41F) 在复位时按**地址**读取: 交换生效后读到的是
+//   物理扇区 1 的 0x400 —— 新引导镜像必须携带与扇区 0 相同的 ICG 字
+//   (本工程 `.icg` 段 8×32bit, 见 icg.rs);
+// - 交换标志只能写 1→0: 再次升级前必须先擦除扇区 63 (即 swap_disable);
+// - 应用代码应避开扇区 63 末字 0x7FFDC (可整段避开扇区 63)。
 
-/// 读取 Flash 字节 (Flash 内存映射, 任意字节地址)
-pub fn read_byte(addr: u32) -> u8 {
-    unsafe { core::ptr::read_volatile(addr as *const u8) }
+/// 交换标志地址 (扇区 63 末字)
+pub const SWAP_FLAG_ADDR: u32 = 0x0007_FFDC;
+/// 交换标志值 (对齐 DDL EFM_SWAP_DATA)
+pub const SWAP_FLAG_DATA: u32 = 0xFFFF_4321;
+
+/// 当前是否处于引导交换状态 (EFM_FSWP.FSWP: 0=已交换, 1=未交换;
+/// 对齐 DDL `EFM_GetSwapStatus`)
+pub fn swap_status() -> bool {
+    unsafe { core::ptr::read_volatile((EFM_BASE + FSWP) as *const u32) & 1 == 0 }
 }
 
-/// 读取 Flash 字 (4 字节, 需字对齐)
-pub fn read_word(addr: u32) -> u32 {
-    unsafe { core::ptr::read_volatile(addr as *const u32) }
+/// 使能引导交换: 编程 0x7FFDC = 0xFFFF_4321, 复位后从扇区 1 启动
+/// (对齐 DDL `EFM_SwapCmd(ENABLE)`: PGM_SINGLE + 写标志字)
+///
+/// 由 [`program_word`] 组合实现 (含缓存保存/恢复、解锁/锁定、bus hold),
+/// 单字编程原子完成, 掉电也不会损坏现有引导。
+pub fn swap_enable() -> Result<(), EfmError> {
+    program_word(SWAP_FLAG_ADDR, SWAP_FLAG_DATA)
+}
+
+/// 失能引导交换: 擦除扇区 63 清除标志 (对齐 DDL `EFM_SwapCmd(DISABLE)`:
+/// ERASE_SECTOR + 触发写), 复位后恢复从扇区 0 启动
+///
+/// 由 [`sector_erase`] 组合实现; 注意会**擦除整个扇区 63** (8KB),
+/// 该扇区不应存放应用数据。
+pub fn swap_disable() -> Result<(), EfmError> {
+    sector_erase(SWAP_FLAG_ADDR)
+}
+
+// ============================== 读 ==============================
+
+/// 读取主 Flash 字节 (Flash 内存映射)。
+pub fn read_byte(addr: u32) -> Result<u8, EfmError> {
+    if addr >= FLASH_SIZE {
+        return Err(EfmError::InvalidAddr);
+    }
+    Ok(unsafe { core::ptr::read_volatile(addr as *const u8) })
+}
+
+/// 读取主 Flash 字 (4 字节，地址必须按字对齐)。
+pub fn read_word(addr: u32) -> Result<u32, EfmError> {
+    check_addr(addr)?;
+    Ok(unsafe { core::ptr::read_volatile(addr as *const u32) })
 }
 
 /// 读取唯一 ID (UQID0~2, 96 位)
@@ -244,22 +425,25 @@ pub fn uid() -> [u32; 3] {
 /// (bus hold), CPU stall 直至完成 (~ms 级); 结束后按错误位返回。
 pub fn sector_erase(addr: u32) -> Result<(), EfmError> {
     check_addr(addr)?;
+    let _operation = OperationGuard::acquire()?;
     if !wait_ready() {
         return Err(EfmError::Timeout);
     }
     unlock();
     enable_program_mode();
     clear_status(FSR_ERRORS | FSR_OPTEND);
+    // 关闭缓存 (对齐 DDL EFM_SectorErase: 擦除前保存并清除 CACHE)
+    let cache = disable_cache();
     set_op_mode(OpMode::SectorErase);
 
     // 触发: 向目标地址写 0 (擦除 = 全 1, 任意值均可, DDL 用 0)
-    let result = unsafe {
-        core::ptr::write_volatile(addr as *mut u32, 0);
-        // 扇区擦除 ~ms 级, 超时按 HCLK 折算 ~20ms (对齐 DDL EFM_ERASE_TIMEOUT)
-        wait_end(crate::clk::hclk_hz() / 50)
-    };
+    // MPU: FLASH 只读区域临时放开 (触发写是"写 Flash 地址")
+    crate::mpu::with_flash_writable(|| unsafe { core::ptr::write_volatile(addr as *mut u32, 0) });
+    // 扇区擦除 ~ms 级, 超时按 HCLK 折算 ~20ms (对齐 DDL EFM_ERASE_TIMEOUT)
+    let result = wait_end(crate::clk::hclk_hz() / 50);
 
     set_op_mode(OpMode::ReadOnly);
+    restore_cache(cache);
     disable_program_mode();
     lock();
     result?;
@@ -275,15 +459,22 @@ pub fn sector_erase(addr: u32) -> Result<(), EfmError> {
 /// - 只能把 1→0 (先擦后写); 操作期间 bus hold, CPU stall 至完成;
 /// - 逐字等待结束, 失败返回对应错误。
 pub fn program(addr: u32, data: &[u8]) -> Result<(), EfmError> {
-    if !addr.is_multiple_of(4) || addr + data.len() as u32 > FLASH_SIZE {
+    let length = u32::try_from(data.len()).map_err(|_| EfmError::InvalidAddr)?;
+    let Some(end) = addr.checked_add(length) else {
+        return Err(EfmError::InvalidAddr);
+    };
+    if !addr.is_multiple_of(4) || end > FLASH_SIZE {
         return Err(EfmError::InvalidAddr);
     }
+    let _operation = OperationGuard::acquire()?;
     if !wait_ready() {
         return Err(EfmError::Timeout);
     }
     unlock();
     enable_program_mode();
     clear_status(FSR_ERRORS | FSR_OPTEND);
+    // 关闭缓存 (对齐 DDL EFM_Program: 编程前保存并清除 CACHE)
+    let cache = disable_cache();
     set_op_mode(OpMode::Program);
 
     let mut result = Ok(());
@@ -294,9 +485,10 @@ pub fn program(addr: u32, data: &[u8]) -> Result<(), EfmError> {
             word &= !(0xFFu32 << (8 * j));
             word |= (b as u32) << (8 * j);
         }
-        unsafe {
-            core::ptr::write_volatile((addr + 4 * i as u32) as *mut u32, word);
-        }
+        // 触发写 (MPU: FLASH 只读区域临时放开, 见 mpu::with_flash_writable)
+        crate::mpu::with_flash_writable(|| unsafe {
+            core::ptr::write_volatile((addr + 4 * i as u32) as *mut u32, word)
+        });
         // 单字编程 ~µs 级, 超时按 HCLK 折算 ~53µs (对齐 DDL EFM_PGM_TIMEOUT)
         result = wait_end(crate::clk::hclk_hz() / 20_000);
         if result.is_err() {
@@ -305,6 +497,7 @@ pub fn program(addr: u32, data: &[u8]) -> Result<(), EfmError> {
     }
 
     set_op_mode(OpMode::ReadOnly);
+    restore_cache(cache);
     disable_program_mode();
     lock();
     result?;
@@ -320,7 +513,7 @@ pub fn program_word(addr: u32, word: u32) -> Result<(), EfmError> {
 
 /// 表 7-1: CPU 时钟频率 → FLASH 读等待周期 (普通读模式)
 ///
-/// 从 clk 模块迁入: 闪存控制器寄存器归本模块所有 (见 [`set_wait_cycle`])。
+/// 从 clk 模块迁入: 闪存控制器寄存器归本模块所有。
 pub const fn wait_cycle(hclk_hz: u32) -> u32 {
     if hclk_hz <= 33_000_000 {
         0
@@ -337,26 +530,39 @@ pub const fn wait_cycle(hclk_hz: u32) -> u32 {
     }
 }
 
-/// 配置 FLASH 读等待周期 (FRMC.FLWT, 对齐 DDL `EFM_SetWaitCycle`)
-///
-/// 由 [`crate::clk`] 在切换系统时钟前调用; 回读确认写入生效。
-pub fn set_wait_cycle(hclk_hz: u32) {
+fn set_wait_cycle_unlocked(hclk_hz: u32) -> bool {
     const FRMC_FLWT_MASK: u32 = 0x0000_00F0;
     let cycles = wait_cycle(hclk_hz) << 4;
 
     unlock();
-    unsafe {
+    let applied = unsafe {
         let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
         core::ptr::write_volatile(
             (EFM_BASE + FRMC) as *mut u32,
             (frmc & !FRMC_FLWT_MASK) | cycles,
         );
         // 回读确认配置生效 (带超时, 防解锁失败时永久自旋)
+        let mut applied = false;
         for _ in 0..10_000 {
-            if core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32) & FRMC_FLWT_MASK == cycles {
+            if core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32) & FRMC_FLWT_MASK == cycles
+            {
+                applied = true;
                 break;
             }
         }
-    }
+        applied
+    };
     lock();
+    applied
+}
+
+/// 复位入口在 `.data` / `.bss` 初始化前设置初始等待周期。
+///
+/// 此时普通静态原子变量尚不可读取，且调度器和中断尚未运行，所以该路径
+/// 有意不获取 [`OperationGuard`]。运行期时钟切换必须持有
+/// [`ConfigurationGuard`]。
+pub(crate) fn set_wait_cycle_early(hclk_hz: u32) {
+    // 复位源 MRC 8MHz 在 FLWT=0 下本就安全；这里尽力恢复期望值。
+    // 运行期升频路径会检查并传播回读失败。
+    let _ = set_wait_cycle_unlocked(hclk_hz);
 }

@@ -8,7 +8,7 @@
 //!
 //! # 命令提示符
 //!
-//! `root@hc32f460:~$` — 仿 Ubuntu PS1 风格 (主机名取编译期芯片型号)。
+//! `root@hc32f460:/$` — 仿 Linux PS1 风格，并显示当前工作路径。
 //!
 //! # 命令系统
 //!
@@ -22,19 +22,27 @@
 //! 开关) 仍由各自的 `CFG_*` 配置控制。
 //!
 //! 当前命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) /
-//! `echo` / `led on|off` / `log` / `selftest` / `clear` / `whoami` /
+//! `echo` / `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` /
+//! `write`(put) / `nano` / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` /
+//! `mount` / `mkfs` / `led` / `log` / `selftest` / `clear` / `whoami` /
 //! `reboot` / `logout`(exit)。
 //!
 //! # 输入处理
 //!
-//! 回车提交命令, 退格 (BS/DEL) 删除字符, Ctrl+C 清空当前行;
-//! 输入缓冲区大小来自配置 (`CFG_SHELL_LINE_BUF`), 超长截断。
+//! 命令输入仅接受 ASCII；回车提交, 退格 (BS/DEL) 删除字符, Ctrl+C 清空当前行,
+//! 上下键浏览历史。输入缓冲区大小来自配置 (`CFG_SHELL_LINE_BUF`), 非 ASCII
+//! 或超长命令整行拒绝执行。
+
+mod editor;
+mod path;
 
 use crate::config;
-use crate::gpio::{Gpio, PortC};
 use crate::heap;
 use crate::print; // #[macro_export] 宏需显式引入
 use crate::println;
+use crate::uart_rtos::UartRtosExt;
+
+use path::{PathError, ShellPath};
 
 /// 登录用户名 (.cargo/config.toml `CFG_SHELL_USERNAME`)
 const SHELL_USERNAME: &str = config::SHELL_USERNAME;
@@ -47,6 +55,248 @@ const HOSTNAME: &str = config::CHIP_MODEL;
 
 /// 输入行缓冲区大小 (.cargo/config.toml `CFG_SHELL_LINE_BUF`)
 const LINE_BUF: usize = config::SHELL_LINE_BUF_SIZE;
+/// 固定容量命令历史，仅保存在 RAM 中。
+const HISTORY_CAPACITY: usize = config::SHELL_HISTORY_SIZE;
+/// CR 后等待可选 LF 的时间，同时兼容 CR-only 终端。
+const INPUT_CRLF_TIMEOUT_MS: u32 = 25;
+/// 终端探测或转义序列预读期间需要按原顺序回放的输入容量。
+const PENDING_RX_CAPACITY: usize = 64;
+
+struct InputLine {
+    text: alloc::string::String,
+    overflowed: bool,
+    non_ascii: bool,
+    rx_corrupted: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HistoryEntry {
+    bytes: [u8; LINE_BUF],
+    len: usize,
+    number: u32,
+}
+
+impl HistoryEntry {
+    const fn empty() -> Self {
+        Self {
+            bytes: [0; LINE_BUF],
+            len: 0,
+            number: 0,
+        }
+    }
+
+    fn set(&mut self, text: &str, number: u32) {
+        debug_assert!(text.len() <= self.bytes.len());
+        self.bytes[..text.len()].copy_from_slice(text.as_bytes());
+        self.len = text.len();
+        self.number = number;
+    }
+
+    fn text(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+}
+
+struct CommandHistory {
+    entries: [HistoryEntry; HISTORY_CAPACITY],
+    start: usize,
+    len: usize,
+    next_number: u32,
+}
+
+impl CommandHistory {
+    const fn new() -> Self {
+        Self {
+            entries: [HistoryEntry::empty(); HISTORY_CAPACITY],
+            start: 0,
+            len: 0,
+            next_number: 1,
+        }
+    }
+
+    fn push(&mut self, command: &str) {
+        if command.is_empty() || self.newest(0).is_some_and(|entry| entry.text() == command) {
+            return;
+        }
+
+        let index = if self.len == HISTORY_CAPACITY {
+            let index = self.start;
+            self.start = (self.start + 1) % HISTORY_CAPACITY;
+            index
+        } else {
+            let index = (self.start + self.len) % HISTORY_CAPACITY;
+            self.len += 1;
+            index
+        };
+        self.entries[index].set(command, self.next_number);
+        self.next_number = self.next_number.wrapping_add(1).max(1);
+    }
+
+    fn newest(&self, offset: usize) -> Option<&HistoryEntry> {
+        if offset >= self.len {
+            return None;
+        }
+        let index = (self.start + self.len - 1 - offset) % HISTORY_CAPACITY;
+        Some(&self.entries[index])
+    }
+
+    fn clear(&mut self) {
+        self.start = 0;
+        self.len = 0;
+        self.next_number = 1;
+    }
+
+    fn print(&self) {
+        for offset in 0..self.len {
+            let entry = &self.entries[(self.start + offset) % HISTORY_CAPACITY];
+            println!("{:>5}  {}", entry.number, entry.text());
+        }
+    }
+}
+
+struct PendingRx {
+    bytes: [u8; PENDING_RX_CAPACITY],
+    head: usize,
+    len: usize,
+}
+
+impl PendingRx {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; PENDING_RX_CAPACITY],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let byte = self.bytes[self.head];
+        self.head = (self.head + 1) % PENDING_RX_CAPACITY;
+        self.len -= 1;
+        Some(byte)
+    }
+
+    fn push_front(&mut self, byte: u8) -> bool {
+        if self.len == PENDING_RX_CAPACITY {
+            return false;
+        }
+        self.head = (self.head + PENDING_RX_CAPACITY - 1) % PENDING_RX_CAPACITY;
+        self.bytes[self.head] = byte;
+        self.len += 1;
+        true
+    }
+
+    fn push_back(&mut self, byte: u8) -> bool {
+        if self.len == PENDING_RX_CAPACITY {
+            return false;
+        }
+        let tail = (self.head + self.len) % PENDING_RX_CAPACITY;
+        self.bytes[tail] = byte;
+        self.len += 1;
+        true
+    }
+
+    const fn is_full(&self) -> bool {
+        self.len == PENDING_RX_CAPACITY
+    }
+
+    const fn remaining_capacity(&self) -> usize {
+        PENDING_RX_CAPACITY - self.len
+    }
+}
+
+type FsError = littlefs::Error<crate::filesystem::FlashError>;
+
+/// Shell-owned filesystem state. The Flash token never leaves this thread.
+struct ShellState {
+    filesystem: Option<crate::filesystem::FileSystem>,
+    last_mount_error: Option<FsError>,
+    pending_rx: PendingRx,
+    history: CommandHistory,
+    cwd: ShellPath,
+}
+
+impl ShellState {
+    fn start() -> Self {
+        match crate::filesystem::start(crate::board::BoardResources::get()) {
+            Ok(crate::filesystem::Startup::Mounted(filesystem)) => {
+                let info = filesystem.info();
+                crate::log_info!(
+                    "文件系统已挂载: generation={}, 条目={} 个",
+                    info.generation,
+                    info.entry_count
+                );
+                Self {
+                    filesystem: Some(filesystem),
+                    last_mount_error: None,
+                    pending_rx: PendingRx::new(),
+                    history: CommandHistory::new(),
+                    cwd: ShellPath::root(),
+                }
+            }
+            Ok(crate::filesystem::Startup::Formatted(filesystem)) => {
+                crate::log_info!("文件系统分区为空，已创建并挂载空文件系统");
+                Self {
+                    filesystem: Some(filesystem),
+                    last_mount_error: None,
+                    pending_rx: PendingRx::new(),
+                    history: CommandHistory::new(),
+                    cwd: ShellPath::root(),
+                }
+            }
+            Err(error) => {
+                match &error {
+                    littlefs::Error::NotFormatted => crate::log_warn!(
+                        "文件系统未挂载: 分区含数据但没有有效快照; 检查后可执行 mkfs --force"
+                    ),
+                    _ => crate::log_error!("文件系统挂载失败: {:?}", error),
+                }
+                Self {
+                    filesystem: None,
+                    last_mount_error: Some(error),
+                    pending_rx: PendingRx::new(),
+                    history: CommandHistory::new(),
+                    cwd: ShellPath::root(),
+                }
+            }
+        }
+    }
+
+    fn remount(&mut self) -> bool {
+        drop(self.filesystem.take());
+        match crate::filesystem::mount(crate::board::BoardResources::get()) {
+            Ok(filesystem) => {
+                self.filesystem = Some(filesystem);
+                self.last_mount_error = None;
+                self.cwd = ShellPath::root();
+                true
+            }
+            Err(error) => {
+                self.last_mount_error = Some(error);
+                false
+            }
+        }
+    }
+
+    fn format_unmounted(&mut self) -> bool {
+        debug_assert!(self.filesystem.is_none());
+        match crate::filesystem::format(crate::board::BoardResources::get()) {
+            Ok(filesystem) => {
+                self.filesystem = Some(filesystem);
+                self.last_mount_error = None;
+                self.cwd = ShellPath::root();
+                true
+            }
+            Err(error) => {
+                self.last_mount_error = Some(error);
+                false
+            }
+        }
+    }
+}
 
 // ============================== 命令系统 ==============================
 
@@ -67,8 +317,8 @@ struct Command {
     aliases: &'static [&'static str],
     /// 帮助文本 (一行说明, 不含命令名)
     help: &'static str,
-    /// 执行函数: 参数为命令名之后的剩余文本 (含前导空白)
-    handler: fn(&str) -> CmdResult,
+    /// 执行函数: Shell 状态 + 命令名之后的剩余文本 (含前导空白)
+    handler: fn(&mut ShellState, &str) -> CmdResult,
 }
 
 /// 命令表项构造器
@@ -76,7 +326,7 @@ const fn cmd(
     name: &'static str,
     aliases: &'static [&'static str],
     help: &'static str,
-    handler: fn(&str) -> CmdResult,
+    handler: fn(&mut ShellState, &str) -> CmdResult,
 ) -> Command {
     Command {
         name,
@@ -99,6 +349,27 @@ static COMMANDS: &[Command] = &[
     cmd("ps", &[], "线程列表", cmd_ps),
     cmd("free", &["mem"], "堆内存统计", cmd_free),
     cmd("echo", &[], "回显 <文本>", cmd_echo),
+    cmd("history", &[], "查看历史命令; history -c 清空", cmd_history),
+    cmd("pwd", &[], "显示当前路径", cmd_pwd),
+    cmd("cd", &[], "切换路径: cd [目录]", cmd_cd),
+    cmd("ls", &[], "列出路径: ls [路径]", cmd_ls),
+    cmd("mkdir", &[], "创建目录: mkdir <目录>", cmd_mkdir),
+    cmd("rmdir", &[], "删除空目录: rmdir <目录>", cmd_rmdir),
+    cmd("cat", &[], "读取文件: cat <文件>", cmd_cat),
+    cmd(
+        "write",
+        &["put"],
+        "原子创建/覆盖: write <文件> [文本]",
+        cmd_write,
+    ),
+    cmd("nano", &[], "全屏编辑: nano <文件>", cmd_nano),
+    cmd("rm", &[], "删除文件: rm <文件>", cmd_rm),
+    cmd("mv", &[], "原子移动: mv <旧路径> <新路径>", cmd_mv),
+    cmd("stat", &[], "路径信息: stat <路径>", cmd_stat),
+    cmd("df", &["fsinfo"], "文件系统容量与状态", cmd_df),
+    cmd("fsck", &[], "只读校验当前快照", cmd_fsck),
+    cmd("mount", &[], "重新挂载文件系统", cmd_mount),
+    cmd("mkfs", &[], "清空文件系统: mkfs --force", cmd_mkfs),
     cmd("led", &[], "板载 LED on|off", cmd_led),
     cmd("selftest", &[], "内核自检 (rtos 功能自检)", cmd_selftest),
     cmd("log", &[], "日志开关/级别 (on|off|level <级>)", cmd_log),
@@ -108,30 +379,40 @@ static COMMANDS: &[Command] = &[
     cmd("logout", &["exit"], "重新登录", cmd_logout),
 ];
 
-/// shell 线程入口: 登录 → 命令循环 (永不返回)
+/// shell 线程入口: 启动文件系统 → 登录 → 命令循环 (永不返回)
 pub extern "C" fn shell_entry(_param: usize) {
+    let mut state = ShellState::start();
     loop {
-        login();
-        command_loop();
+        login(&mut state);
+        command_loop(&mut state);
     }
 }
 
 /// 登录流程: 提示用户名/密码, 验证通过后进入 shell
-fn login() {
+fn login(state: &mut ShellState) {
     let mut tries = 0;
     loop {
         println!();
         print!("{} login: ", HOSTNAME);
-        let user = read_line(false, LINE_BUF);
+        let user = read_line(&mut state.pending_rx, false, LINE_BUF, None);
         println!();
-        if user.trim() != SHELL_USERNAME {
+        if user.overflowed
+            || user.non_ascii
+            || user.rx_corrupted
+            || user.text.trim() != SHELL_USERNAME
+        {
             tries += 1;
             println!("Login incorrect");
         } else {
             print!("Password: ");
-            let pass = read_line(true, LINE_BUF);
+            let pass = read_line(&mut state.pending_rx, true, LINE_BUF, None);
             println!();
-            if pass == SHELL_PASSWORD {
+            if !pass.overflowed
+                && !pass.non_ascii
+                && !pass.rx_corrupted
+                && pass.text == SHELL_PASSWORD
+            {
+                state.cwd = ShellPath::root();
                 println!(
                     "Welcome to RT-RUST {} ({} kernel, {}).",
                     env!("CARGO_PKG_VERSION"),
@@ -148,23 +429,36 @@ fn login() {
         if tries >= SHELL_LOGIN_TRIES {
             println!();
             println!("Too many login failures; try again later.");
-            crate::rtos::thread_delay_ms(1000);
+            crate::rtos::thread_delay_ms(1000).expect("shell 延时必须在线程上下文");
             tries = 0;
         }
     }
 }
 
 /// 命令循环: 读取一行 → 解析 → 执行
-fn command_loop() {
+fn command_loop(state: &mut ShellState) {
     loop {
-        print!("{}@{}:~$ ", SHELL_USERNAME, HOSTNAME);
-        let line = read_line(false, LINE_BUF);
+        print!("{}@{}:{}$ ", SHELL_USERNAME, HOSTNAME, state.cwd);
+        let line = read_line(&mut state.pending_rx, false, LINE_BUF, Some(&state.history));
         println!();
-        let cmd = line.trim();
+        if line.overflowed {
+            println!("输入超过 {} B，命令未执行", LINE_BUF);
+            continue;
+        }
+        if line.non_ascii {
+            println!("输入包含非 ASCII 字节，命令未执行");
+            continue;
+        }
+        if line.rx_corrupted {
+            println!("串口接收期间发生丢字节或校验错误，命令未执行");
+            continue;
+        }
+        let cmd = line.text.trim();
         if cmd.is_empty() {
             continue;
         }
-        if !dispatch(cmd) {
+        state.history.push(cmd);
+        if !dispatch(state, cmd) {
             return; // logout / exit
         }
     }
@@ -174,7 +468,7 @@ fn command_loop() {
 ///
 /// 在 [`COMMANDS`] 表中按主名/别名查找, 命中后检查 `CFG_SHELL_COMMANDS`
 /// 启用列表, 通过则调用执行函数 (参数 = 命令名之后的剩余文本)。
-fn dispatch(line: &str) -> bool {
+fn dispatch(state: &mut ShellState, line: &str) -> bool {
     let mut words = line.split_whitespace();
     let Some(name) = words.next() else {
         return true;
@@ -191,11 +485,11 @@ fn dispatch(line: &str) -> bool {
         println!("{}: 命令未启用 (CFG_SHELL_COMMANDS)", name);
         return true;
     }
-    (cmd.handler)(rest) == CmdResult::Ok
+    (cmd.handler)(state, rest) == CmdResult::Ok
 }
 
 /// 命令帮助: 仅列出 `CFG_SHELL_COMMANDS` 中启用的命令 (含别名)
-fn cmd_help(_rest: &str) -> CmdResult {
+fn cmd_help(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("可用命令 (CFG_SHELL_COMMANDS 控制启用):");
     for c in COMMANDS {
         if !config::cmd_enabled(c.name) {
@@ -210,7 +504,7 @@ fn cmd_help(_rest: &str) -> CmdResult {
 }
 
 /// 系统信息 (info/sysinfo): 运行状态 + 配置摘要
-fn cmd_sysinfo(_rest: &str) -> CmdResult {
+fn cmd_sysinfo(state: &mut ShellState, _rest: &str) -> CmdResult {
     println!(
         "{} v{} — RT-Thread 架构的 Rust RTOS",
         env!("CARGO_PKG_NAME"),
@@ -276,6 +570,29 @@ fn cmd_sysinfo(_rest: &str) -> CmdResult {
             env!("RTOS_RUSTC")
         ),
     );
+    match state.filesystem.as_ref() {
+        Some(filesystem) => {
+            let info = filesystem.info();
+            sysinfo_line(
+                "文件系统",
+                format_args!(
+                    "已挂载, generation {}, {} 个条目, {}/{} B",
+                    info.generation, info.entry_count, info.serialized_bytes, info.capacity_bytes
+                ),
+            );
+        }
+        None => sysinfo_line(
+            "文件系统",
+            format_args!(
+                "未挂载 ({})",
+                state
+                    .last_mount_error
+                    .as_ref()
+                    .map(fs_error_summary)
+                    .unwrap_or("未知状态")
+            ),
+        ),
+    }
 
     // ---- 配置 (编译期常量, 来源 .cargo/config.toml) ----
     sysinfo_section("配置 (config)");
@@ -451,7 +768,7 @@ fn sysinfo_line(label: &str, args: core::fmt::Arguments<'_>) {
 }
 
 /// 运行时间 (仿 uptime)
-fn cmd_uptime(_rest: &str) -> CmdResult {
+fn cmd_uptime(_state: &mut ShellState, _rest: &str) -> CmdResult {
     let ms = crate::rtos::uptime_ms();
     let (h, m, s) = (ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60);
     println!(
@@ -467,22 +784,27 @@ fn cmd_uptime(_rest: &str) -> CmdResult {
 }
 
 /// 线程列表 (仿 ps)
-fn cmd_ps(_rest: &str) -> CmdResult {
+fn cmd_ps(_state: &mut ShellState, _rest: &str) -> CmdResult {
     let list = crate::rtos::thread_info_list();
-    println!("NAME                 PRIO  STATE   (count={})", list.len());
+    println!(
+        "NAME                 PRIO  STATE    STACK (used/total)  (count={})",
+        list.len()
+    );
     for t in list {
         println!(
-            "{:<20} {:>4}  {}",
+            "{:<20} {:>4}  {:<8} {:>6}/{:<6}",
             t.name,
             t.priority,
-            crate::rtos::thread_state_name(t.state)
+            crate::rtos::thread_state_name(t.state),
+            t.stack_used,
+            t.stack_size
         );
     }
     CmdResult::Ok
 }
 
 /// 堆内存统计 (仿 free)
-fn cmd_free(_rest: &str) -> CmdResult {
+fn cmd_free(_state: &mut ShellState, _rest: &str) -> CmdResult {
     let total = heap::capacity();
     let used = heap::used();
     // 整数百分比 (避免浮点格式化在 no_std 下的问题)
@@ -499,22 +821,536 @@ fn cmd_free(_rest: &str) -> CmdResult {
 }
 
 /// 回显剩余参数
-fn cmd_echo(rest: &str) -> CmdResult {
+fn cmd_echo(_state: &mut ShellState, rest: &str) -> CmdResult {
     println!("{}", rest.trim());
     CmdResult::Ok
 }
 
+fn cmd_history(state: &mut ShellState, rest: &str) -> CmdResult {
+    match rest.trim() {
+        "" => state.history.print(),
+        "-c" => state.history.clear(),
+        _ => println!("用法: history [-c]"),
+    }
+    CmdResult::Ok
+}
+
+fn resolve_path(state: &ShellState, operation: &str, input: &str) -> Option<ShellPath> {
+    match ShellPath::resolve(&state.cwd, input) {
+        Ok(path) => Some(path),
+        Err(PathError::Invalid) => {
+            println!("{}: 路径无效", operation);
+            None
+        }
+        Err(PathError::TooLong) => {
+            println!("{}: 路径超过 {} B 上限", operation, littlefs::MAX_NAME_LEN);
+            None
+        }
+    }
+}
+
+fn cmd_pwd(state: &mut ShellState, rest: &str) -> CmdResult {
+    if !rest.trim().is_empty() {
+        println!("用法: pwd");
+    } else {
+        println!("{}", state.cwd);
+    }
+    CmdResult::Ok
+}
+
+fn cmd_cd(state: &mut ShellState, rest: &str) -> CmdResult {
+    let input = if rest.trim().is_empty() {
+        "/"
+    } else {
+        let Some(input) = one_argument(rest) else {
+            println!("用法: cd [目录]");
+            return CmdResult::Ok;
+        };
+        input
+    };
+    let Some(path) = resolve_path(state, "cd", input) else {
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    match filesystem.stat(path.as_key()) {
+        Ok(info) if info.kind == littlefs::EntryKind::Directory => state.cwd = path,
+        Ok(_) => println!("cd: 不是目录: {}", path),
+        Err(error) => print_fs_error("cd", &error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_mkdir(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(input) = one_argument(rest) else {
+        println!("用法: mkdir <目录>");
+        return CmdResult::Ok;
+    };
+    let Some(path) = resolve_path(state, "mkdir", input) else {
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    match filesystem.mkdir(path.as_key()) {
+        Ok(()) => println!("{}: 目录已创建", path),
+        Err(error) => report_mutation_error(state, "mkdir", error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_rmdir(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(input) = one_argument(rest) else {
+        println!("用法: rmdir <目录>");
+        return CmdResult::Ok;
+    };
+    let Some(path) = resolve_path(state, "rmdir", input) else {
+        return CmdResult::Ok;
+    };
+    if path.is_ancestor_of(&state.cwd) {
+        println!("rmdir: 不能删除当前目录或其祖先: {}", path);
+        return CmdResult::Ok;
+    }
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    match filesystem.rmdir(path.as_key()) {
+        Ok(()) => println!("{}: 目录已删除", path),
+        Err(error) => report_mutation_error(state, "rmdir", error),
+    }
+    CmdResult::Ok
+}
+
+fn one_argument(rest: &str) -> Option<&str> {
+    let mut words = rest.split_whitespace();
+    let argument = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    Some(argument)
+}
+
+fn two_arguments(rest: &str) -> Option<(&str, &str)> {
+    let mut words = rest.split_whitespace();
+    let first = words.next()?;
+    let second = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    Some((first, second))
+}
+
+fn name_and_text(rest: &str) -> Option<(&str, &str)> {
+    let trimmed = rest.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.find(char::is_whitespace) {
+        Some(index) => Some((&trimmed[..index], trimmed[index..].trim_start())),
+        None => Some((trimmed, "")),
+    }
+}
+
+fn fs_error_summary(error: &FsError) -> &'static str {
+    match error {
+        littlefs::Error::Device(_) => "Flash 设备错误",
+        littlefs::Error::DeviceBusy => "Flash 分区正被占用",
+        littlefs::Error::InvalidGeometry => "分区几何参数无效",
+        littlefs::Error::NotFormatted => "无有效文件系统快照",
+        littlefs::Error::Corrupt => "文件系统数据损坏",
+        littlefs::Error::InvalidName => "路径无效",
+        littlefs::Error::NotFound => "路径不存在",
+        littlefs::Error::AlreadyExists => "目标路径已存在",
+        littlefs::Error::IsDirectory => "目标是目录",
+        littlefs::Error::NotDirectory => "路径组件不是目录",
+        littlefs::Error::DirectoryNotEmpty => "目录非空",
+        littlefs::Error::InvalidMove => "目录不能移动到自身或其子目录",
+        littlefs::Error::NoSpace => "文件系统空间不足",
+        littlefs::Error::FileTooLarge => "文件过大",
+        littlefs::Error::RecoveryRequired => "写入结果不确定，需要重新挂载",
+    }
+}
+
+fn print_fs_error(operation: &str, error: &FsError) {
+    match error {
+        littlefs::Error::Device(error) => {
+            println!("{}: Flash 设备错误: {:?}", operation, error)
+        }
+        _ => println!("{}: {}", operation, fs_error_summary(error)),
+    }
+}
+
+fn print_mount_error(state: &ShellState, operation: &str) {
+    match state.last_mount_error.as_ref() {
+        Some(error) => print_fs_error(operation, error),
+        None => println!("{}: 文件系统未挂载", operation),
+    }
+}
+
+fn mounted_filesystem(state: &mut ShellState) -> Option<&mut crate::filesystem::FileSystem> {
+    if state.filesystem.is_none() {
+        print_mount_error(state, "文件系统");
+        return None;
+    }
+    state.filesystem.as_mut()
+}
+
+fn report_mutation_error(state: &mut ShellState, operation: &str, error: FsError) {
+    print_fs_error(operation, &error);
+    let recovery_required = state
+        .filesystem
+        .as_ref()
+        .is_some_and(littlefs::FileSystem::recovery_required);
+    if !recovery_required {
+        return;
+    }
+
+    println!("写入结果不确定，正在重新挂载...");
+    if state.remount() {
+        println!("文件系统已恢复挂载");
+    } else {
+        print_mount_error(state, "重新挂载");
+    }
+}
+
+fn cmd_ls(state: &mut ShellState, rest: &str) -> CmdResult {
+    let input = if rest.trim().is_empty() {
+        "."
+    } else {
+        let Some(input) = one_argument(rest) else {
+            println!("用法: ls [路径]");
+            return CmdResult::Ok;
+        };
+        input
+    };
+    let Some(path) = resolve_path(state, "ls", input) else {
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    let info = match filesystem.stat(path.as_key()) {
+        Ok(info) => info,
+        Err(error) => {
+            print_fs_error("ls", &error);
+            return CmdResult::Ok;
+        }
+    };
+
+    println!("TYPE        SIZE  CRC32     NAME");
+    if info.kind == littlefs::EntryKind::File {
+        println!("FILE  {:>10}  {:08X}  {}", info.size, info.crc32, path);
+        return CmdResult::Ok;
+    }
+
+    let mut count = 0usize;
+    match filesystem.read_dir(path.as_key(), |name, info| {
+        count += 1;
+        match info.kind {
+            littlefs::EntryKind::File => {
+                println!("FILE  {:>10}  {:08X}  {}", info.size, info.crc32, name)
+            }
+            littlefs::EntryKind::Directory => {
+                println!("DIR   {:>10}  --------  {}/", "-", name)
+            }
+        }
+    }) {
+        Ok(()) if count == 0 => println!("(空)"),
+        Ok(()) => {}
+        Err(error) => print_fs_error("ls", &error),
+    }
+    CmdResult::Ok
+}
+
+fn print_file_bytes(bytes: &[u8]) {
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if matches!(byte, b'\n' | b'\t' | 0x20..=0x7e) {
+            continue;
+        }
+        if let Ok(text) = core::str::from_utf8(&bytes[start..index]) {
+            print!("{}", text);
+        }
+        print!("\\x{:02X}", byte);
+        start = index + 1;
+    }
+    if let Ok(text) = core::str::from_utf8(&bytes[start..]) {
+        print!("{}", text);
+    }
+}
+
+/// 分块读取文件；不可打印字节以 `\xNN` 显示。
+fn cmd_cat(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(input) = one_argument(rest) else {
+        println!("用法: cat <文件>");
+        return CmdResult::Ok;
+    };
+    let Some(path) = resolve_path(state, "cat", input) else {
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    if let Err(error) = filesystem.verify() {
+        print_fs_error("cat", &error);
+        return CmdResult::Ok;
+    }
+    let info = match filesystem.stat(path.as_key()) {
+        Ok(info) => info,
+        Err(error) => {
+            print_fs_error("cat", &error);
+            return CmdResult::Ok;
+        }
+    };
+    if info.kind == littlefs::EntryKind::Directory {
+        println!("cat: 是目录: {}", path);
+        return CmdResult::Ok;
+    }
+
+    let mut buffer = [0u8; 128];
+    let mut offset = 0;
+    let mut ends_with_newline = false;
+    while offset < info.size {
+        let read = match filesystem.read(path.as_key(), offset, &mut buffer) {
+            Ok(0) => {
+                println!();
+                println!("cat: 文件提前结束");
+                return CmdResult::Ok;
+            }
+            Ok(read) => read,
+            Err(error) => {
+                println!();
+                print_fs_error("cat", &error);
+                return CmdResult::Ok;
+            }
+        };
+        print_file_bytes(&buffer[..read]);
+        ends_with_newline = buffer[read - 1] == b'\n';
+        offset += read as u32;
+    }
+    if info.size == 0 || !ends_with_newline {
+        println!();
+    }
+    CmdResult::Ok
+}
+
+/// 原子创建或完整覆盖一个短文本文件。
+fn cmd_write(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some((input, text)) = name_and_text(rest) else {
+        println!("用法: write <文件> [文本]");
+        return CmdResult::Ok;
+    };
+    let Some(path) = resolve_path(state, "write", input) else {
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    let result = filesystem.write(path.as_key(), text.as_bytes());
+    match result {
+        Ok(()) => println!("{}: 已持久化 {} B", path, text.len()),
+        Err(error) => report_mutation_error(state, "write", error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_nano(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(input) = one_argument(rest) else {
+        println!("用法: nano <文件>");
+        return CmdResult::Ok;
+    };
+    let Some(path) = resolve_path(state, "nano", input) else {
+        return CmdResult::Ok;
+    };
+    editor::run(state, path.as_key());
+    CmdResult::Ok
+}
+
+fn cmd_rm(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(input) = one_argument(rest) else {
+        println!("用法: rm <文件>");
+        return CmdResult::Ok;
+    };
+    let Some(path) = resolve_path(state, "rm", input) else {
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    let result = filesystem.remove(path.as_key());
+    match result {
+        Ok(()) => println!("{}: 已删除", path),
+        Err(error) => report_mutation_error(state, "rm", error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_mv(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some((old_input, new_input)) = two_arguments(rest) else {
+        println!("用法: mv <旧路径> <新路径>");
+        return CmdResult::Ok;
+    };
+    let Some(old_path) = resolve_path(state, "mv", old_input) else {
+        return CmdResult::Ok;
+    };
+    let Some(new_path) = resolve_path(state, "mv", new_input) else {
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    let source_kind = match filesystem.stat(old_path.as_key()) {
+        Ok(info) => info.kind,
+        Err(error) => {
+            print_fs_error("mv", &error);
+            return CmdResult::Ok;
+        }
+    };
+    let result = filesystem.rename(old_path.as_key(), new_path.as_key());
+    match result {
+        Ok(()) => {
+            if source_kind == littlefs::EntryKind::Directory
+                && state.cwd.rebase(&old_path, &new_path).is_err()
+            {
+                state.cwd = ShellPath::root();
+            }
+            println!("{} -> {}", old_path, new_path);
+        }
+        Err(error) => report_mutation_error(state, "mv", error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_stat(state: &mut ShellState, rest: &str) -> CmdResult {
+    let Some(input) = one_argument(rest) else {
+        println!("用法: stat <路径>");
+        return CmdResult::Ok;
+    };
+    let Some(path) = resolve_path(state, "stat", input) else {
+        return CmdResult::Ok;
+    };
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    match filesystem.stat(path.as_key()) {
+        Ok(info) => {
+            println!("路径 : {}", path);
+            println!(
+                "类型 : {}",
+                match info.kind {
+                    littlefs::EntryKind::File => "文件",
+                    littlefs::EntryKind::Directory => "目录",
+                }
+            );
+            if info.kind == littlefs::EntryKind::File {
+                println!("大小 : {} B", info.size);
+                println!("CRC32: {:08X}", info.crc32);
+            }
+        }
+        Err(error) => print_fs_error("stat", &error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_df(state: &mut ShellState, rest: &str) -> CmdResult {
+    if !rest.trim().is_empty() {
+        println!("用法: df");
+        return CmdResult::Ok;
+    }
+    let Some(filesystem) = state.filesystem.as_ref() else {
+        print_mount_error(state, "df");
+        return CmdResult::Ok;
+    };
+    let info = filesystem.info();
+    let usage = info
+        .serialized_bytes
+        .saturating_mul(100)
+        .checked_div(info.capacity_bytes)
+        .unwrap_or(0);
+    println!(
+        "{:<14}  {:>7}  {:>7}  {:>4}  {:>7}  {:>10}  {}",
+        "Filesystem", "Size(B)", "Used(B)", "Use%", "Entries", "Gen", "Blocks"
+    );
+    println!(
+        "{:<14}  {:>7}  {:>7}  {:>3}%  {:>7}  {:>10}  {}/{}",
+        "internal-flash",
+        info.capacity_bytes,
+        info.serialized_bytes,
+        usage,
+        info.entry_count,
+        info.generation,
+        info.active_blocks,
+        crate::filesystem::BLOCK_COUNT
+    );
+    CmdResult::Ok
+}
+
+fn cmd_fsck(state: &mut ShellState, rest: &str) -> CmdResult {
+    if !rest.trim().is_empty() {
+        println!("用法: fsck");
+        return CmdResult::Ok;
+    }
+    let Some(filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    match filesystem.verify() {
+        Ok(()) => println!("fsck: 当前快照完整"),
+        Err(error) => print_fs_error("fsck", &error),
+    }
+    CmdResult::Ok
+}
+
+fn cmd_mount(state: &mut ShellState, rest: &str) -> CmdResult {
+    if !rest.trim().is_empty() {
+        println!("用法: mount");
+        return CmdResult::Ok;
+    }
+    if state.remount() {
+        let info = state.filesystem.as_ref().unwrap().info();
+        println!(
+            "文件系统已挂载: generation={}, 条目={} 个",
+            info.generation, info.entry_count
+        );
+    } else {
+        print_mount_error(state, "mount");
+    }
+    CmdResult::Ok
+}
+
+fn cmd_mkfs(state: &mut ShellState, rest: &str) -> CmdResult {
+    if rest.trim() != "--force" {
+        println!("用法: mkfs --force");
+        println!("警告: 该命令会清空全部文件");
+        return CmdResult::Ok;
+    }
+
+    if let Some(filesystem) = state.filesystem.as_mut() {
+        let result = filesystem.clear();
+        match result {
+            Ok(()) => {
+                state.cwd = ShellPath::root();
+                println!("空文件系统已提交并持久化");
+            }
+            Err(error) => report_mutation_error(state, "mkfs", error),
+        }
+    } else if state.format_unmounted() {
+        println!("文件系统已格式化并挂载");
+    } else {
+        print_mount_error(state, "mkfs");
+    }
+    CmdResult::Ok
+}
+
 /// LED 控制
-fn cmd_led(rest: &str) -> CmdResult {
-    let gpio = Gpio::take();
-    let led = gpio.pin::<PortC, { config::LED_PIN }>();
+fn cmd_led(_state: &mut ShellState, rest: &str) -> CmdResult {
     match rest.trim() {
         "on" => {
-            led.set_high();
+            crate::board::BoardResources::get().set_led(true);
             println!("LED on");
         }
         "off" => {
-            led.set_low();
+            crate::board::BoardResources::get().set_led(false);
             println!("LED off");
         }
         _ => println!("用法: led on|off"),
@@ -524,9 +1360,9 @@ fn cmd_led(rest: &str) -> CmdResult {
 
 /// 内核自检: **同步执行** (完成后才出下一提示符, 可按 ESC 中断)
 /// (受 CFG_APP_SELFTEST_ENABLE 控制)
-fn cmd_selftest(_rest: &str) -> CmdResult {
+fn cmd_selftest(_state: &mut ShellState, _rest: &str) -> CmdResult {
     if config::APP_SELFTEST_ENABLE {
-        crate::selftest_run();
+        crate::selftest::run();
     } else {
         println!("selftest 未启用 (CFG_APP_SELFTEST_ENABLE=false)");
     }
@@ -534,31 +1370,26 @@ fn cmd_selftest(_rest: &str) -> CmdResult {
 }
 
 /// 清屏 (ANSI)
-fn cmd_clear(_rest: &str) -> CmdResult {
+fn cmd_clear(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("\x1b[2J\x1b[H");
     CmdResult::Ok
 }
 
 /// 当前用户
-fn cmd_whoami(_rest: &str) -> CmdResult {
+fn cmd_whoami(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("{}", SHELL_USERNAME);
     CmdResult::Ok
 }
 
 /// 软复位 (AIRCR.SYSRESETREQ)
-fn cmd_reboot(_rest: &str) -> CmdResult {
+fn cmd_reboot(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("rebooting...");
-    crate::rtos::thread_delay_ms(50);
-    unsafe {
-        core::ptr::write_volatile(0xE000_ED0C as *mut u32, 0x05FA_0004);
-    }
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+    crate::rtos::thread_delay_ms(50).expect("shell 延时必须在线程上下文");
+    crate::arch::system_reset()
 }
 
 /// 退出 shell (重新登录)
-fn cmd_logout(_rest: &str) -> CmdResult {
+fn cmd_logout(_state: &mut ShellState, _rest: &str) -> CmdResult {
     CmdResult::Logout
 }
 
@@ -566,7 +1397,7 @@ fn cmd_logout(_rest: &str) -> CmdResult {
 ///
 /// 仅影响应用日志 (`log::*`), 内核打印 (横幅/shell 输出等) 不受影响;
 /// 重启后恢复配置默认值 (`CFG_LOG_ENABLE` / `CFG_LOG_LEVEL`)。
-fn cmd_log(rest: &str) -> CmdResult {
+fn cmd_log(_state: &mut ShellState, rest: &str) -> CmdResult {
     let mut words = rest.split_whitespace();
     match words.next() {
         None => println!(
@@ -598,39 +1429,205 @@ fn cmd_log(rest: &str) -> CmdResult {
     CmdResult::Ok
 }
 
+fn read_pending_timeout<const U: u8>(
+    pending_rx: &mut PendingRx,
+    uart: &crate::uart::Uart<U>,
+    timeout_ms: u32,
+) -> Option<u8> {
+    pending_rx
+        .pop_front()
+        .or_else(|| uart.read_rx_timeout_ms(timeout_ms))
+}
+
+#[derive(Clone, Copy)]
+enum HistoryMove {
+    Older,
+    Newer,
+}
+
+fn read_shell_csi<const U: u8>(
+    pending_rx: &mut PendingRx,
+    uart: &crate::uart::Uart<U>,
+) -> Option<HistoryMove> {
+    for _ in 0..48 {
+        let byte = read_pending_timeout(pending_rx, uart, INPUT_CRLF_TIMEOUT_MS)?;
+        if (0x40..=0x7e).contains(&byte) {
+            return match byte {
+                b'A' => Some(HistoryMove::Older),
+                b'B' => Some(HistoryMove::Newer),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn consume_shell_escape<const U: u8>(
+    pending_rx: &mut PendingRx,
+    uart: &crate::uart::Uart<U>,
+) -> Option<HistoryMove> {
+    let next = read_pending_timeout(pending_rx, uart, INPUT_CRLF_TIMEOUT_MS)?;
+    match next {
+        b'[' | b'O' | 0x9b => read_shell_csi(pending_rx, uart),
+        byte => {
+            let queued = pending_rx.push_front(byte);
+            debug_assert!(queued);
+            None
+        }
+    }
+}
+
+fn replace_input_line(line: &mut alloc::string::String, replacement: &str) {
+    while line.pop().is_some() {
+        print!("\x08 \x08");
+    }
+    line.push_str(replacement);
+    print!("{}", replacement);
+}
+
+fn browse_history(
+    movement: HistoryMove,
+    history: &CommandHistory,
+    offset: &mut Option<usize>,
+    draft: &mut HistoryEntry,
+    line: &mut alloc::string::String,
+) {
+    match movement {
+        HistoryMove::Older => {
+            let next = offset.map_or(0, |current| current + 1);
+            let Some(entry) = history.newest(next) else {
+                return;
+            };
+            if offset.is_none() {
+                draft.set(line, 0);
+            }
+            replace_input_line(line, entry.text());
+            *offset = Some(next);
+        }
+        HistoryMove::Newer => match *offset {
+            Some(0) => {
+                replace_input_line(line, draft.text());
+                *offset = None;
+            }
+            Some(current) => {
+                let next = current - 1;
+                if let Some(entry) = history.newest(next) {
+                    replace_input_line(line, entry.text());
+                    *offset = Some(next);
+                }
+            }
+            None => {}
+        },
+    }
+}
+
 /// 从 UART 读取一行 (阻塞, 支持退格/Ctrl+C)
 ///
 /// `masked` 为 true 时输入不回显 (密码模式)。
 /// 中断驱动: 挂起在数据到达信号量上, 由 RX ISR 唤醒, 无轮询。
-fn read_line(masked: bool, max: usize) -> alloc::string::String {
-    let uart = config::ConsoleUart::take();
+fn read_line(
+    pending_rx: &mut PendingRx,
+    masked: bool,
+    max: usize,
+    history: Option<&CommandHistory>,
+) -> InputLine {
+    let uart = crate::board::BoardResources::get().console();
+    // 错误统计窗口从上一行结束延续到本行结束。这样即使用户在上一条
+    // 命令执行期间提前输入，期间发生的硬件错误或软件环溢出也不会在
+    // 新提示符出现时被清掉；受影响的下一行会被完整拒绝。
     let mut line = alloc::string::String::new();
+    let mut overflow = 0usize;
+    let mut non_ascii = false;
+    let mut history_offset = None;
+    let mut draft = HistoryEntry::empty();
     loop {
-        let b = uart.read_rx_blocking();
+        let b = pending_rx
+            .pop_front()
+            .unwrap_or_else(|| uart.read_rx_blocking());
         match b {
-            b'\r' | b'\n' => break,
+            b'\r' => {
+                if let Some(next) = read_pending_timeout(pending_rx, uart, INPUT_CRLF_TIMEOUT_MS)
+                    && next != b'\n'
+                {
+                    let queued = pending_rx.push_front(next);
+                    debug_assert!(queued);
+                }
+                break;
+            }
+            b'\n' => break,
+            0x1b => {
+                let movement = consume_shell_escape(pending_rx, uart);
+                if !masked
+                    && overflow == 0
+                    && let (Some(history), Some(movement)) = (history, movement)
+                {
+                    browse_history(
+                        movement,
+                        history,
+                        &mut history_offset,
+                        &mut draft,
+                        &mut line,
+                    );
+                }
+            }
+            // A standalone C1 CSI is accepted for terminals configured in
+            // 8-bit mode. Once another high byte has appeared, 0x9B may be a
+            // UTF-8 continuation byte and must not consume the rest of a path.
+            0x9b if !non_ascii => {
+                let movement = read_shell_csi(pending_rx, uart);
+                if !masked
+                    && overflow == 0
+                    && let (Some(history), Some(movement)) = (history, movement)
+                {
+                    browse_history(
+                        movement,
+                        history,
+                        &mut history_offset,
+                        &mut draft,
+                        &mut line,
+                    );
+                }
+            }
             0x08 | 0x7F => {
-                // 退格: 删除最后一个字符
-                if line.pop().is_some() {
+                // 超出缓冲区的字符没有回显，先消费对应的退格。
+                if overflow > 0 {
+                    overflow -= 1;
+                } else if line.pop().is_some() {
                     print!("\x08 \x08");
                 }
             }
             0x03 => {
                 // Ctrl+C: 清空当前行
+                overflow = 0;
+                non_ascii = false;
+                history_offset = None;
+                draft = HistoryEntry::empty();
                 while line.pop().is_some() {
                     print!("\x08 \x08");
                 }
             }
-            0x20..=0x7E if line.len() < max => {
-                line.push(b as char);
-                if masked {
-                    print!("*");
+            0x20..=0x7E => {
+                if line.len() < max && overflow == 0 {
+                    line.push(b as char);
+                    if masked {
+                        print!("*");
+                    } else {
+                        print!("{}", b as char);
+                    }
                 } else {
-                    print!("{}", b as char);
+                    overflow = overflow.saturating_add(1);
                 }
             }
+            0x80..=0xFF => non_ascii = true,
             _ => {}
         }
     }
-    line
+    let dropped = uart.rx_dropped_count();
+    let (parity, framing, overrun) = uart.rx_error_counts();
+    InputLine {
+        text: line,
+        overflowed: overflow != 0,
+        non_ascii,
+        rx_corrupted: dropped != 0 || parity != 0 || framing != 0 || overrun != 0,
+    }
 }

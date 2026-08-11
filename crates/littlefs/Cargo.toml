@@ -1,0 +1,10 @@
+[package]
+name = "hc32-littlefs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A small power-loss-safe snapshot filesystem for NOR flash"
+
+[lib]
+name = "littlefs"
+path = "src/lib.rs"

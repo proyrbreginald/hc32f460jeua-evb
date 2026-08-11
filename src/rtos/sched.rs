@@ -25,22 +25,23 @@
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use crate::critical_section;
+use crate::critical_section::CriticalSection;
 use crate::rtos::PRIORITY_MAX;
 use crate::rtos::context;
 use crate::rtos::klist::{KCell, ListHead};
-use crate::rtos::thread::{STACK_PATTERN, Thread, thread_from_ready};
+use crate::rtos::thread::{STACK_PATTERN, ThreadInner, thread_from_ready};
 
 /// 就绪表: 每个优先级一个就绪队列 (队尾插入)
 static READY_TABLE: KCell<[ListHead; PRIORITY_MAX as usize]> =
-    KCell::new([ListHead::const_new(); PRIORITY_MAX as usize]);
+    KCell::new([const { ListHead::const_new() }; PRIORITY_MAX as usize]);
 /// 就绪优先级位图
 static READY_GROUP: AtomicU32 = AtomicU32::new(0);
 /// 当前线程
-static CURRENT: AtomicPtr<Thread> = AtomicPtr::new(core::ptr::null_mut());
+static CURRENT: AtomicPtr<ThreadInner> = AtomicPtr::new(core::ptr::null_mut());
 
 /// 当前线程 (调度器启动前为 null)
 #[inline]
-pub(crate) fn current() -> *mut Thread {
+pub(crate) fn current() -> *mut ThreadInner {
     CURRENT.load(Ordering::Relaxed)
 }
 
@@ -51,9 +52,9 @@ pub(crate) fn ready_group_value() -> u32 {
 
 /// 就绪线程总数 (遍历全部优先级队列, 诊断/横幅用)
 pub(crate) fn ready_thread_count() -> usize {
-    critical_section::with(|| unsafe {
+    critical_section::with(|cs| unsafe {
         let mut n = 0;
-        for q in (*READY_TABLE.get()).iter() {
+        for q in READY_TABLE.get(cs).iter() {
             let head = q as *const ListHead as *mut ListHead;
             let mut node = q.next_node();
             while !node.is_null() && node != head {
@@ -67,50 +68,50 @@ pub(crate) fn ready_thread_count() -> usize {
 
 /// 设置当前线程 (调度器启动时)
 #[inline]
-pub(crate) fn set_current(t: *mut Thread) {
+pub(crate) fn set_current(t: *mut ThreadInner) {
     CURRENT.store(t, Ordering::Relaxed);
 }
 
-/// 临界区内: 最高优先级就绪线程
-pub(crate) unsafe fn highest_ready_thread() -> Option<*mut Thread> {
+/// 临界区内: 最高优先级就绪线程 (须持有临界区令牌)
+pub(crate) unsafe fn highest_ready_thread(cs: CriticalSection<'_>) -> Option<*mut ThreadInner> {
     let group = READY_GROUP.load(Ordering::Relaxed);
     if group == 0 {
         return None;
     }
     let prio = group.trailing_zeros() as usize;
-    let node = unsafe { (*READY_TABLE.get()).get_unchecked(prio) }.first()?;
+    let node = unsafe { READY_TABLE.get(cs).get_unchecked(prio) }.first()?;
     Some(unsafe { thread_from_ready(node) })
 }
 
 /// 临界区内: 线程入就绪队列 (队尾)
-pub(crate) unsafe fn ready_insert(t: *mut Thread) {
+pub(crate) unsafe fn ready_insert(t: *mut ThreadInner, cs: CriticalSection<'_>) {
     let prio = unsafe { (*t).current_priority } as usize;
-    let queue = unsafe { (*READY_TABLE.get()).get_unchecked_mut(prio) };
+    let queue = unsafe { READY_TABLE.get(cs).get_unchecked_mut(prio) };
     unsafe { queue.push_back(&mut (*t).ready_node) };
     READY_GROUP.fetch_or(1 << prio, Ordering::Relaxed);
 }
 
 /// 临界区内: 线程出就绪队列
-pub(crate) unsafe fn ready_remove(t: *mut Thread) {
+pub(crate) unsafe fn ready_remove(t: *mut ThreadInner, cs: CriticalSection<'_>) {
     unsafe { (*t).ready_node.remove() };
     let prio = unsafe { (*t).current_priority } as usize;
-    if unsafe { (*READY_TABLE.get()).get_unchecked(prio) }.is_empty() {
+    if unsafe { READY_TABLE.get(cs).get_unchecked(prio) }.is_empty() {
         READY_GROUP.fetch_and(!(1 << prio), Ordering::Relaxed);
     }
 }
 
 /// 临界区内: 修改线程优先级 (就绪时重排就绪队列)
-pub(crate) unsafe fn change_priority(t: *mut Thread, prio: u8) {
+pub(crate) unsafe fn change_priority(t: *mut ThreadInner, prio: u8, cs: CriticalSection<'_>) {
     if unsafe { (*t).current_priority } == prio {
         return;
     }
     let ready = unsafe { (*t).ready_node.is_linked() };
     if ready {
-        unsafe { ready_remove(t) };
+        unsafe { ready_remove(t, cs) };
     }
     unsafe { (*t).current_priority = prio };
     if ready {
-        unsafe { ready_insert(t) };
+        unsafe { ready_insert(t, cs) };
     }
 }
 
@@ -119,12 +120,12 @@ pub(crate) unsafe fn change_priority(t: *mut Thread, prio: u8) {
 /// 最高就绪线程不是当前线程 (或当前线程已让出) 时请求上下文切换;
 /// 线程上下文与中断上下文均只置位 PendSV, 无需区分。
 pub(crate) fn schedule() {
-    critical_section::with(|| unsafe {
+    critical_section::with(|cs| unsafe {
         let cur = current();
         if cur.is_null() {
             return;
         }
-        let Some(to) = highest_ready_thread() else {
+        let Some(to) = highest_ready_thread(cs) else {
             return;
         };
         if to == cur {
@@ -139,12 +140,15 @@ pub(crate) fn schedule() {
         (*cur).yielded = false;
         (*to).yielded = false;
         set_current(to);
+        // MPU/context-switch hooks run inside PendSV only after the actual
+        // running thread's PSP has been saved. Multiple pending requests may
+        // still replace `to`; the hook therefore observes the final CURRENT.
         context::request_switch(&mut (*cur).sp, &mut (*to).sp);
     });
 }
 
 /// 栈溢出检查: PSP 越界或栈底魔数被破坏
-unsafe fn stack_guard_check(t: *mut Thread) {
+unsafe fn stack_guard_check(t: *mut ThreadInner) {
     let base = (*t).stack_addr;
     let end = base + (*t).stack_size;
     let sp = (*t).sp;
@@ -170,7 +174,7 @@ unsafe fn stack_guard_check(t: *mut Thread) {
 /// 返回是否需要重新调度。
 pub(crate) unsafe fn tick_increase() -> bool {
     let mut need = false;
-    critical_section::with(|| unsafe {
+    critical_section::with(|cs| unsafe {
         let cur = current();
         if cur.is_null() {
             return;
@@ -186,7 +190,7 @@ pub(crate) unsafe fn tick_increase() -> bool {
             t.remaining_tick = t.init_tick;
             if t.ready_node.is_linked() {
                 t.ready_node.remove();
-                ready_insert(cur);
+                ready_insert(cur, cs);
                 t.yielded = true;
                 need = true;
             }
@@ -198,12 +202,12 @@ pub(crate) unsafe fn tick_increase() -> bool {
 /// 当前线程主动让出 CPU (同优先级轮转)
 pub(crate) unsafe fn yield_thread() {
     let cur = current();
-    let need = critical_section::with(|| unsafe {
+    let need = critical_section::with(|cs| unsafe {
         if !(*cur).ready_node.is_linked() {
             return false;
         }
         (*cur).ready_node.remove();
-        ready_insert(cur);
+        ready_insert(cur, cs);
         (*cur).yielded = true;
         true
     });

@@ -25,10 +25,20 @@
 //!   `rt_sem_take` → [`Semaphore::take`] 等;
 //! - 临界区 = 关中断 (PRIMASK), 调度锁由临界区覆盖;
 //! - 时间片为 0 表示不参与轮转 (RT-Thread 的 `tick` 字段);
-//! - 定时器仅硬定时器 (回调在中断上下文)。
+//! - 定时器仅硬定时器 (回调在中断上下文);
+//! - **临界区令牌化** ([`CriticalSection`](crate::critical_section::CriticalSection)):
+//!   内核共享状态 ([`KCell`](crate::rtos::klist::KCell)) 的访问须出示
+//!   令牌, 派生引用生命周期绑定临界区作用域 —— "须在关中断区间内
+//!   访问"由借用检查器强制, 引用无法逃逸出临界区;
+//! - **互斥量泛型化为 [`Mutex<T>`]** (非递归, 守卫经 `DerefMut` 提供
+//!   受保护数据的独占访问, 持有中重复获取返回 [`Error::Invalid`]);
+//! - **线程句柄为 [`Arc<Thread>`]**: TCB 由用户句柄与内核侧强引用
+//!   共同维持, 线程回收后句柄不悬垂;
+//! - 邮箱泛型化 ([`Mailbox<T>`], 消息类型编码在类型中)。
 #![allow(dead_code)]
 
 pub(crate) mod context;
+pub(crate) mod hooks;
 pub(crate) mod idle;
 pub(crate) mod ipc;
 pub(crate) mod klist;
@@ -37,6 +47,8 @@ pub(crate) mod thread;
 pub(crate) mod timer;
 
 use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::critical_section;
 
 /// 时钟节拍频率 (Hz), 须与 SysTick 配置一致 (.cargo/config.toml)
 pub const TICKS_PER_SEC: u32 = crate::config::TICKS_PER_SEC;
@@ -48,7 +60,7 @@ pub const IDLE_PRIORITY: u8 = crate::config::IDLE_PRIORITY;
 /// 全局节拍计数 (由 [`tick_increase`] 在时钟中断中累加)
 static TICK: AtomicU32 = AtomicU32::new(0);
 
-/// 当前节拍 (毫秒, 与 SysTick 频率一致)
+/// 当前内核节拍 (32 位回绕计数)
 pub fn tick() -> u32 {
     TICK.load(Ordering::Relaxed)
 }
@@ -61,9 +73,24 @@ pub(crate) fn scheduler_started() -> bool {
     !sched::current().is_null()
 }
 
-/// 运行时间 (ms)
+/// 运行时间 (ms, 32 位回绕计数)
+///
+/// 使用 64 位中间值避免 `tick * 1000` 溢出; 返回值保留原有 `u32`
+/// API, 超过 `u32::MAX` 毫秒后按模 2^32 回绕。
 pub fn uptime_ms() -> u32 {
-    tick()
+    ((tick() as u64 * 1000) / TICKS_PER_SEC as u64) as u32
+}
+
+/// Convert milliseconds to kernel ticks.
+///
+/// Zero remains zero. A nonzero duration is rounded up to at least one tick
+/// and clamped to the signed half-range used by the wrap-safe timer ordering.
+pub fn ticks_from_ms(ms: u32) -> u32 {
+    if ms == 0 {
+        return 0;
+    }
+    let ticks = (ms as u64 * TICKS_PER_SEC as u64).div_ceil(1000);
+    ticks.min(i32::MAX as u64) as u32
 }
 
 /// 初始化内核: 设置 PendSV/SysTick 中断优先级, 创建空闲线程。
@@ -76,14 +103,17 @@ pub fn init() {
 
 /// 启动调度器: 切换到最高优先级线程, **永不返回**。
 pub fn start() -> ! {
-    let first = unsafe { sched::highest_ready_thread() }.expect("rtos::start: 没有可运行的线程");
-    unsafe {
+    let first = critical_section::with(|cs| unsafe {
+        let first = sched::highest_ready_thread(cs).expect("rtos::start: 没有可运行的线程");
         sched::set_current(first);
+        first
+    });
+    unsafe {
         context::switch_to_first(&mut (*first).sp as *mut usize as usize);
     }
     // PendSV 即将执行首个切换; 此处永不返回
     loop {
-        unsafe { core::arch::asm!("wfi") };
+        crate::arch::wait_for_interrupt();
     }
 }
 
@@ -100,7 +130,13 @@ pub fn tick_increase() {
 
 // 内核 API 全集, 部分供应用选用 (二进制 crate 中未使用项会告警)
 #[allow(unused_imports)]
-pub use ipc::{Error, Event, EventOpt, Mailbox, MessageQueue, Mutex, Semaphore, Timeout};
+pub use hooks::{
+    ContextSwitchHook, ContextSwitchInfo, IdleHook, set_context_switch_hook, set_idle_hook,
+};
+#[allow(unused_imports)]
+pub use ipc::{
+    Error, Event, EventOpt, Mailbox, MessageQueue, Mutex, MutexGuard, Semaphore, Timeout,
+};
 #[allow(unused_imports)]
 pub use thread::{
     Thread, ThreadInfo, thread_create, thread_delay, thread_delay_ms, thread_info_list,

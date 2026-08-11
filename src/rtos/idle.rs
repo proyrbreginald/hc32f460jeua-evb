@@ -9,16 +9,17 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::critical_section;
+use crate::critical_section::CriticalSection;
 use crate::rtos::klist::{KCell, ListHead};
 use crate::rtos::sched;
-use crate::rtos::thread::{Thread, free_thread, thread_create};
+use crate::rtos::thread::{ThreadInner, free_thread, thread_create};
 
 /// 僵尸队列: 已退出/被删除的线程等待空闲线程回收
 static DEFUNCT: KCell<ListHead> = KCell::new(ListHead::const_new());
 
-/// 临界区内: 线程进入僵尸队列
-pub(crate) unsafe fn defunct_push(t: *mut Thread) {
-    unsafe { (*DEFUNCT.get_mut()).push_back(&mut (*t).defunct_node) };
+/// 临界区内: 线程进入僵尸队列 (须持有临界区令牌)
+pub(crate) unsafe fn defunct_push(t: *mut ThreadInner, cs: CriticalSection<'_>) {
+    unsafe { (*DEFUNCT.get(cs)).push_back(&mut (*t).defunct_node) };
 }
 
 /// 创建空闲线程 (由 [`crate::rtos::init`] 调用)
@@ -33,22 +34,36 @@ pub(crate) fn create_idle() {
     );
 }
 
-/// 空闲线程主循环: 回收僵尸线程 → 让出 CPU → 等待中断
+/// 空闲线程主循环: 栈溢出巡检 → idle hook → 回收僵尸线程 → 让出 CPU
 extern "C" fn idle_entry(_param: usize) {
     loop {
+        // 栈溢出巡检: 任一线程栈底 canary 被破坏即 panic
+        // (panic 处理器按 STRATEGY 停机或复位, 见 panic 模块)
+        if let Some(name) = crate::rtos::thread::check_stack_canaries() {
+            panic!("线程栈溢出: {}", name);
+        }
+        // 主栈 (MSP: 启动/中断栈) canary 巡检 (堆/主栈边界字)
+        if !crate::rtos::thread::check_main_stack_canary() {
+            panic!("主栈 (MSP) 溢出: 中断/启动栈 canary 被破坏");
+        }
+        crate::rtos::hooks::run_idle_hook();
         defunct_execute();
         sched::schedule();
         // 无更紧急线程时进入低功耗等待 (SysTick 等中断唤醒)
-        unsafe { core::arch::asm!("wfi") };
+        crate::arch::wait_for_interrupt();
     }
 }
 
 /// 回收僵尸队列中的线程 (释放栈与 TCB)
 fn defunct_execute() {
     loop {
-        let t = critical_section::with(|| unsafe {
-            let node = (*DEFUNCT.get_mut()).pop_first()?;
-            Some(thread_from_defunct(node))
+        let t = critical_section::with(|cs| unsafe {
+            let node = (*DEFUNCT.get(cs)).pop_first()?;
+            let t = thread_from_defunct(node);
+            // ALL_THREADS 也受同一临界区保护。先从诊断链表摘除，再在
+            // 临界区外释放栈/Arc，避免 SysTick 抢占后与 `ps` 并发遍历。
+            (*t).list_node.remove();
+            Some(t)
         });
         let Some(t) = t else { break };
         unsafe { free_thread(t) };
@@ -56,6 +71,6 @@ fn defunct_execute() {
 }
 
 /// 僵尸节点 → 线程
-unsafe fn thread_from_defunct(node: *mut ListHead) -> *mut Thread {
-    crate::rtos::klist::container_of!(node, Thread, defunct_node)
+unsafe fn thread_from_defunct(node: *mut ListHead) -> *mut ThreadInner {
+    crate::rtos::klist::container_of!(node, ThreadInner, defunct_node)
 }

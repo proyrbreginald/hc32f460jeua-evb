@@ -150,6 +150,19 @@ fn write32(offset: usize, value: u32) {
     unsafe { core::ptr::write_volatile((CRC_BASE + offset) as *mut u32, value) };
 }
 
+fn write_u16(offset: usize, value: u16) {
+    unsafe { core::ptr::write_volatile((CRC_BASE + offset) as *mut u16, value) };
+}
+
+/// 当前协议 (读 CR.bit1, 对齐 DDL CRC_GetResult 的 READ_REG32_BIT)
+fn protocol_now() -> Protocol {
+    if read32(CR) & CR_CRC32 != 0 {
+        Protocol::Crc32
+    } else {
+        Protocol::Crc16
+    }
+}
+
 /// 使能 CRC 时钟 (FCG0.bit23 清位; FCG0 受 FCG0PC 写保护)
 fn clock_enable() {
     unsafe {
@@ -182,12 +195,21 @@ pub fn init(cfg: Config) {
     if cfg.protocol == Protocol::Crc32 {
         write32(CR, cr | CR_CRC32);
     }
-    write32(RESLT, cfg.init_value);
+    // 初值写入宽度按协议区分 (对齐 DDL CRC_Init: CRC16 用 16 位写,
+    // CRC32 用 32 位写, 避免触碰 RESLT 高半字的 CRCFLAG16 等位)
+    match cfg.protocol {
+        Protocol::Crc16 => write_u16(RESLT, cfg.init_value as u16),
+        Protocol::Crc32 => write32(RESLT, cfg.init_value),
+    }
 }
 
-/// 设置初值 (累加模式中途重置, 对齐 DDL `CRC_SetInitValue`)
+/// 设置初值 (累加模式中途重置, 对齐 DDL `CRC_SetInitValue`:
+/// CRC16 掩 0xFFFF, CRC32 全写)
 pub fn set_init_value(value: u32) {
-    write32(RESLT, value);
+    match protocol_now() {
+        Protocol::Crc16 => write32(RESLT, value & 0xFFFF),
+        Protocol::Crc32 => write32(RESLT, value),
+    }
 }
 
 /// 累加一段数据 (按指定宽度写 DAT0, 对齐 DDL `CRC_*_AccumulateData`)
@@ -219,11 +241,16 @@ pub fn accumulate(data: &[u8], width: DataWidth) {
     }
 }
 
-/// 读取计算结果 (CRC32 全 32 位; CRC16 取低 16 位, 对齐 DDL `CRC_GetResult`)
+/// 读取计算结果 (对齐 DDL `CRC_GetResult`: CRC32 读全 32 位;
+/// CRC16 掩 0xFFFF —— RESLT 高半字含 CRCFLAG16 完成标志位, 不掩会
+/// 混入结果)。
 ///
 /// 当 REFIN+REFOUT+XOROUT 全使能时即标准 CRC 值。
 pub fn result() -> u32 {
-    read32(RESLT)
+    match protocol_now() {
+        Protocol::Crc16 => read32(RESLT) & 0xFFFF,
+        Protocol::Crc32 => read32(RESLT),
+    }
 }
 
 /// 计算完成标志 (对齐 DDL `CRC_GetResultStatus`)

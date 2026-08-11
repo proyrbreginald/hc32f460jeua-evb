@@ -19,6 +19,7 @@ use crate::uart;
 /// 编译期解析十进制整数字符串 (支持 `_` 分隔; 非法字符/溢出 → 编译报错)
 const fn parse_u32(s: &str) -> u32 {
     let bytes = s.as_bytes();
+    assert!(!bytes.is_empty(), "非法配置值: 整数不能为空");
     let mut i = 0;
     let mut v: u64 = 0;
     while i < bytes.len() {
@@ -27,13 +28,34 @@ const fn parse_u32(s: &str) -> u32 {
             b == b'_' || (b >= b'0' && b <= b'9'),
             "非法配置值: 应为十进制整数"
         );
-        if b != b'_' {
+        if b == b'_' {
+            assert!(
+                i > 0 && i + 1 < bytes.len() && bytes[i - 1] != b'_',
+                "非法配置值: `_` 只能分隔数字"
+            );
+        } else {
             v = v * 10 + (b - b'0') as u64;
         }
         i += 1;
     }
     assert!(v <= u32::MAX as u64, "非法配置值: 溢出 u32");
     v as u32
+}
+
+/// 是否为非空的可打印 ASCII 字符串。
+const fn is_printable_ascii(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] < b' ' || bytes[i] > b'~' {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// 编译期解析 u8 (超出 0~255 → 编译报错)
@@ -114,6 +136,15 @@ pub const XTAL_DRV: u32 = if eq_str(env!("CFG_XTAL_DRV"), "ulow") {
 } else {
     panic!("CFG_XTAL_DRV 非法 (可用 ulow/low/mid/high)")
 };
+/// XTAL 超强驱动 (CFG_XTAL_SUPDRV = true/false, XTALCFGR.SUPDRV;
+/// 对齐 DDL CLK_XTAL_SUPDRV_ON, 评估板默认开启)
+pub const XTAL_SUPDRV: bool = if eq_str(env!("CFG_XTAL_SUPDRV"), "true") {
+    true
+} else if eq_str(env!("CFG_XTAL_SUPDRV"), "false") {
+    false
+} else {
+    panic!("CFG_XTAL_SUPDRV 非法 (可用 true/false)")
+};
 /// HRC 频率 (MHz) (CFG_HRC_FREQ = 16/20)
 ///
 /// 写入 flash 0x404 的 ICG1 配置字 (bit0 = HRCFREQSEL, 0=20MHz/1=16MHz),
@@ -142,6 +173,7 @@ pub const PLL_N: u32 = parse_u32(env!("CFG_PLL_N"));
 pub const PLL_P: u32 = parse_u32(env!("CFG_PLL_P"));
 pub const PLL_Q: u32 = parse_u32(env!("CFG_PLL_Q"));
 pub const PLL_R: u32 = parse_u32(env!("CFG_PLL_R"));
+const _: () = assert!(PLL_SRC <= 1, "CFG_PLL_SRC 非法 (可用 0/1)");
 // ---- MPLL 参数编译期校验 (对齐 DDL: 位宽 + VCO 输入/输出范围) ----
 /// 位宽与有效倍频/分频范围 (寄存器值+1 才是实际值: N→20~480, P/Q/R→2~16)
 const fn assert_pll_width(m: u32, n: u32, p: u32, q: u32, r: u32) {
@@ -158,23 +190,32 @@ const fn assert_pll_width(m: u32, n: u32, p: u32, q: u32, r: u32) {
     );
 }
 
-/// XTAL 源 (PLL_SRC=0) 时的 VCO 输入/输出范围 (参考手册;
-/// HRC 源频率运行时决定, 无法静态校验)
-const fn assert_pll_xtal_range(xtal_hz: u32, m: u32, n: u32) {
+/// PLL 输入/VCO 范围校验。XTAL 与 HRC 频率都由编译期配置确定，使用
+/// `u64` 保证错误的高倍频组合也不会在校验表达式中先发生整数回绕。
+const fn assert_pll_range(source_hz: u32, m: u32, n: u32) {
+    let source_hz = source_hz as u64;
+    let input_div = m as u64 + 1;
+    let vco_numerator = source_hz * (n as u64 + 1);
     assert!(
-        xtal_hz / (m + 1) >= 1_000_000 && xtal_hz / (m + 1) <= 25_000_000,
-        "PLL 输入频率 XTAL/(M+1) 应为 1~25MHz"
+        source_hz >= 1_000_000 * input_div && source_hz <= 25_000_000 * input_div,
+        "PLL 输入频率 source/(M+1) 应为 1~25MHz"
     );
     assert!(
-        xtal_hz / (m + 1) * (n + 1) >= 240_000_000 && xtal_hz / (m + 1) * (n + 1) <= 480_000_000,
+        vco_numerator >= 240_000_000 * input_div && vco_numerator <= 480_000_000 * input_div,
         "PLL VCO 输出频率应为 240~480MHz"
     );
 }
 
 const _: () = assert_pll_width(PLL_M, PLL_N, PLL_P, PLL_Q, PLL_R);
-const _: () = if PLL_SRC == 0 {
-    assert_pll_xtal_range(XTAL_HZ, PLL_M, PLL_N)
-};
+const _: () = assert_pll_range(
+    if PLL_SRC == 0 {
+        XTAL_HZ
+    } else {
+        HRC_FREQ_MHZ * 1_000_000
+    },
+    PLL_M,
+    PLL_N,
+);
 /// 总线分频系数 (CFG_DIV_*), 非法值编译期报错
 pub const DIV_HCLK: u32 = parse_u32(env!("CFG_DIV_HCLK"));
 pub const DIV_PCLK0: u32 = parse_u32(env!("CFG_DIV_PCLK0"));
@@ -197,6 +238,7 @@ const _: () = assert_div(DIV_EXCLK);
 pub const SYSTICK_FREQ_HZ: u32 = parse_u32(env!("CFG_SYSTICK_HZ"));
 /// RTOS 节拍频率 (Hz) (CFG_TICKS_PER_SEC)
 pub const TICKS_PER_SEC: u32 = parse_u32(env!("CFG_TICKS_PER_SEC"));
+const _: () = assert!(TICKS_PER_SEC > 0, "CFG_TICKS_PER_SEC 必须大于 0");
 /// 两者必须一致 (编译期校验)
 const _: () = assert!(
     SYSTICK_FREQ_HZ == TICKS_PER_SEC,
@@ -204,10 +246,26 @@ const _: () = assert!(
 );
 /// 优先级数量 (0 = 最高) (CFG_PRIORITY_MAX)
 pub const PRIORITY_MAX: u8 = parse_u8(env!("CFG_PRIORITY_MAX"));
+const _: () = assert!(
+    PRIORITY_MAX >= 1 && PRIORITY_MAX <= 32,
+    "CFG_PRIORITY_MAX 必须在 1~32 范围内"
+);
 /// 空闲线程优先级 (最低) (CFG_IDLE_PRIORITY)
 pub const IDLE_PRIORITY: u8 = parse_u8(env!("CFG_IDLE_PRIORITY"));
+const _: () = assert!(
+    IDLE_PRIORITY as u16 + 1 == PRIORITY_MAX as u16,
+    "CFG_IDLE_PRIORITY 必须等于 CFG_PRIORITY_MAX - 1"
+);
 /// 空闲线程栈大小 (字节) (CFG_IDLE_STACK)
 pub const IDLE_STACK_SIZE: usize = parse_u32(env!("CFG_IDLE_STACK")) as usize;
+const _: () = assert!(
+    IDLE_STACK_SIZE >= 256,
+    "CFG_IDLE_STACK 不得小于线程最小栈 256 字节"
+);
+const _: () = assert!(
+    IDLE_STACK_SIZE.is_multiple_of(8),
+    "CFG_IDLE_STACK 必须按 8 字节对齐"
+);
 
 // ============================== [uart] ==============================
 
@@ -227,6 +285,7 @@ pub const UART_RX_PIN: u8 = parse_u8(env!("CFG_UART_RX_PIN"));
 pub const UART_RX_FSEL: u8 = parse_u8(env!("CFG_UART_RX_FSEL"));
 /// 波特率 (bps) (CFG_UART_BAUDRATE)
 pub const UART_BAUDRATE: u32 = parse_u32(env!("CFG_UART_BAUDRATE"));
+const _: () = assert!(UART_BAUDRATE > 0, "CFG_UART_BAUDRATE 必须大于 0");
 /// 过采样 (CFG_UART_OVERSAMPLE = 8/16)
 pub const UART_OVERSAMPLE: uart::Oversample = match parse_u32(env!("CFG_UART_OVERSAMPLE")) {
     8 => uart::Oversample::Eight,
@@ -271,6 +330,15 @@ pub const UART_FIRST_BIT: uart::FirstBit = if eq_str(env!("CFG_UART_FIRST_BIT"),
 } else {
     panic!("CFG_UART_FIRST_BIT 非法 (可用 lsb/msb)")
 };
+/// 起始位检测极性 (CFG_UART_START_POLARITY = falling/low; DDL 默认下降沿)
+pub const UART_START_POLARITY: uart::StartBitPolarity =
+    if eq_str(env!("CFG_UART_START_POLARITY"), "falling") {
+        uart::StartBitPolarity::Falling
+    } else if eq_str(env!("CFG_UART_START_POLARITY"), "low") {
+        uart::StartBitPolarity::Low
+    } else {
+        panic!("CFG_UART_START_POLARITY 非法 (可用 falling/low)")
+    };
 /// 硬件流控 (CFG_UART_FLOW_CTRL = none/cts; RTS 为 F460 默认行为)
 pub const UART_FLOW_CTRL: uart::FlowControl = if eq_str(env!("CFG_UART_FLOW_CTRL"), "none") {
     uart::FlowControl::None
@@ -289,6 +357,10 @@ pub const UART_NOISE_FILTER: bool = if eq_str(env!("CFG_UART_NOISE_FILTER"), "tr
 };
 /// 接收环形缓冲大小 (字节) (CFG_UART_RX_BUF_SIZE)
 pub const UART_RX_BUF_SIZE: usize = parse_u32(env!("CFG_UART_RX_BUF_SIZE")) as usize;
+const _: () = assert!(
+    UART_RX_BUF_SIZE >= 16 && UART_RX_BUF_SIZE <= 4096,
+    "CFG_UART_RX_BUF_SIZE 应为 16~4096"
+);
 /// INTC 中断通道 (CFG_UART_IRQ_CHANNEL, INT000~INT127; INT128+ 为共享线)
 pub const UART_RX_IRQ_CHANNEL: usize = parse_u32(env!("CFG_UART_IRQ_CHANNEL")) as usize;
 const _: () = assert!(
@@ -324,6 +396,92 @@ pub const SHELL_PASSWORD: &str = env!("CFG_SHELL_PASSWORD");
 pub const SHELL_LOGIN_TRIES: u32 = parse_u32(env!("CFG_SHELL_LOGIN_TRIES"));
 /// 输入行缓冲区大小 (字节) (CFG_SHELL_LINE_BUF)
 pub const SHELL_LINE_BUF_SIZE: usize = parse_u32(env!("CFG_SHELL_LINE_BUF")) as usize;
+/// RAM 中保留的历史命令条数 (CFG_SHELL_HISTORY_SIZE)
+pub const SHELL_HISTORY_SIZE: usize = parse_u32(env!("CFG_SHELL_HISTORY_SIZE")) as usize;
+const _: () = assert!(
+    SHELL_LINE_BUF_SIZE >= 32 && SHELL_LINE_BUF_SIZE <= 256,
+    "CFG_SHELL_LINE_BUF 应为 32~256"
+);
+const _: () = assert!(
+    SHELL_LOGIN_TRIES >= 1 && SHELL_LOGIN_TRIES <= 100,
+    "CFG_SHELL_LOGIN_TRIES 应为 1~100"
+);
+const _: () = assert!(
+    is_printable_ascii(SHELL_USERNAME)
+        && SHELL_USERNAME.len() <= SHELL_LINE_BUF_SIZE
+        && SHELL_USERNAME.as_bytes()[0] != b' '
+        && SHELL_USERNAME.as_bytes()[SHELL_USERNAME.len() - 1] != b' ',
+    "CFG_SHELL_USERNAME 必须为非空可打印 ASCII，且不能首尾为空格或超过行缓冲"
+);
+const _: () = assert!(
+    is_printable_ascii(SHELL_PASSWORD) && SHELL_PASSWORD.len() <= SHELL_LINE_BUF_SIZE,
+    "CFG_SHELL_PASSWORD 必须为非空可打印 ASCII，且不能超过行缓冲"
+);
+const _: () = assert!(
+    SHELL_HISTORY_SIZE >= 1 && SHELL_HISTORY_SIZE <= 16,
+    "CFG_SHELL_HISTORY_SIZE 应为 1~16"
+);
+/// nano 风格编辑器无法自动探测 ANSI 终端时使用的回退宽度与高度。
+pub const NANO_COLUMNS: usize = parse_u32(env!("CFG_NANO_COLUMNS")) as usize;
+pub const NANO_ROWS: usize = parse_u32(env!("CFG_NANO_ROWS")) as usize;
+/// 编辑器缓冲区上限。文件系统的实际剩余容量仍由写入预检决定。
+pub const NANO_MAX_BYTES: usize = parse_u32(env!("CFG_NANO_MAX_BYTES")) as usize;
+const _: () = assert!(
+    NANO_COLUMNS >= 40 && NANO_COLUMNS <= 240,
+    "CFG_NANO_COLUMNS 应为 40~240"
+);
+const _: () = assert!(
+    NANO_ROWS >= 8 && NANO_ROWS <= 100,
+    "CFG_NANO_ROWS 应为 8~100"
+);
+const _: () = assert!(
+    NANO_MAX_BYTES >= 256 && NANO_MAX_BYTES <= 32_704,
+    "CFG_NANO_MAX_BYTES 应为 256~32704"
+);
+
+// ============================== [mpu] ==============================
+
+/// 内存保护单元 (CFG_MPU_ENABLE = true/false)
+///
+/// 静态区域保护 (FLASH 只读 / SRAM+外设 XN) + 线程栈守卫
+/// (硬件捕获栈溢出)。正确代码不受影响, 默认开启。
+pub const MPU_ENABLE: bool = if eq_str(env!("CFG_MPU_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_MPU_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_MPU_ENABLE 非法 (可用 true/false)")
+};
+
+// ============================== [wdt] ==============================
+
+/// 硬件看门狗 (CFG_WDT_ENABLE = true/false; supervisor 线程喂狗)
+///
+/// 默认关闭: 调试器断点暂停期间 WDT 超时会复位目标板; 产品部署
+/// 时开启。supervisor 必须保持最高 RTOS 优先级，避免正常长输出饿死。
+pub const WDT_ENABLE: bool = if eq_str(env!("CFG_WDT_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_WDT_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_WDT_ENABLE 非法 (可用 true/false)")
+};
+/// WDT supervisor 栈、优先级及喂狗周期。
+pub const WDT_STACK_SIZE: usize = parse_u32(env!("CFG_WDT_STACK")) as usize;
+pub const WDT_PRIORITY: u8 = parse_u8(env!("CFG_WDT_PRIORITY"));
+pub const WDT_FEED_INTERVAL_MS: u32 = parse_u32(env!("CFG_WDT_FEED_MS"));
+const _: () = assert!(
+    WDT_STACK_SIZE >= 256 && WDT_STACK_SIZE.is_multiple_of(8),
+    "CFG_WDT_STACK 必须不小于 256 且按 8 字节对齐"
+);
+const _: () = assert!(
+    WDT_PRIORITY == 0 && WDT_PRIORITY < PRIORITY_MAX,
+    "CFG_WDT_PRIORITY 必须为最高优先级 0"
+);
+const _: () = assert!(
+    WDT_FEED_INTERVAL_MS > 0 && WDT_FEED_INTERVAL_MS <= 500,
+    "CFG_WDT_FEED_MS 必须在 1~500ms 范围内"
+);
 
 // ============================== [rtc] ==============================
 
@@ -427,3 +585,25 @@ pub const APP_SHELL_PRIORITY: u8 = parse_u8(env!("CFG_APP_SHELL_PRIORITY"));
 pub const APP_SHELL_TIMESLICE: u32 = parse_u32(env!("CFG_APP_SHELL_TIMESLICE"));
 /// 周期定时器周期 (ms) (CFG_APP_TIMER_PERIOD_MS)
 pub const APP_TIMER_PERIOD_MS: u32 = parse_u32(env!("CFG_APP_TIMER_PERIOD_MS"));
+
+const _: () = assert!(
+    APP_LED_STACK >= 256 && APP_LED_STACK.is_multiple_of(8),
+    "CFG_APP_LED_STACK 必须不小于 256 且按 8 字节对齐"
+);
+const _: () = assert!(
+    APP_SHELL_STACK >= 256 && APP_SHELL_STACK.is_multiple_of(8),
+    "CFG_APP_SHELL_STACK 必须不小于 256 且按 8 字节对齐"
+);
+const _: () = assert!(
+    APP_LED_PRIORITY < IDLE_PRIORITY && APP_SHELL_PRIORITY < IDLE_PRIORITY,
+    "CFG_APP_*_PRIORITY 必须高于 idle 且位于有效优先级范围"
+);
+const _: () = assert!(
+    !WDT_ENABLE || (WDT_PRIORITY < APP_LED_PRIORITY && WDT_PRIORITY < APP_SHELL_PRIORITY),
+    "启用 WDT 时 CFG_WDT_PRIORITY 必须高于所有应用线程"
+);
+const _: () = assert!(APP_LED_BLINK_MS > 0, "CFG_APP_LED_BLINK_MS 必须大于 0");
+const _: () = assert!(
+    APP_TIMER_PERIOD_MS > 0,
+    "CFG_APP_TIMER_PERIOD_MS 必须大于 0"
+);

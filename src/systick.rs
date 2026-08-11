@@ -1,12 +1,15 @@
 //! SysTick 节拍驱动
 //!
-//! 对齐 DDL `hc32_ll_utility.c` 的 SysTick 驱动 (仅保留 [`init`])。
+//! 对齐 DDL `hc32_ll_utility.c` 的 SysTick_Init (内部即 CMSIS
+//! `SysTick_Config`: LOAD=ticks-1, VAL=0, CTRL=CLKSOURCE|TICKINT|ENABLE)。
 //!
 //! # 时钟源
 //!
-//! SysTick 时钟 = HCLK = 当前系统时钟, 运行时通过
-//! [`crate::clk::system_clock_hz`] 查询 —— 支持切换外部晶振时钟源后
-//! 自动适配 (无需修改本模块)。
+//! CLKSOURCE=1 → SysTick 时钟 = **处理器时钟 HCLK** (系统时钟 ÷
+//! SCFGR.HCLKS 分频), 运行时经 [`crate::clk::hclk_hz`] 查询 ——
+//! 支持切换外部晶振时钟源后自动适配 (无需修改本模块), 且 HCLK
+//! 分频非 1 时节拍频率依然正确 (DDL 直接用 SystemCoreClock, 仅在
+//! HCLK÷1 时成立)。
 //!
 //! # 时序
 //!
@@ -89,8 +92,8 @@ pub fn init(freq_hz: u32) -> Result<(), SystickError> {
         return Err(SystickError::InvalidFrequency);
     }
 
-    // 每次中断间隔的 HCLK 周期数 (系统时钟运行时查询, 支持切时钟源)
-    let hclk = crate::clk::system_clock_hz();
+    // 每次中断间隔的 HCLK 周期数 (运行时查询, 支持切时钟源/总线分频)
+    let hclk = crate::clk::hclk_hz();
     let ticks = hclk / freq_hz;
     if ticks == 0 || ticks > RELOAD_MASK + 1 {
         return Err(SystickError::FrequencyOutOfRange);

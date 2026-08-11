@@ -27,7 +27,7 @@
 //!
 //! ```no_run
 //! // 切换系统时钟前按目标频率配置等待周期 (由 clk 模块调用)
-//! sram::set_wait_cycles(clk::hclk_hz());
+//! sram::set_wait_cycles(clk::hclk_hz())?;
 //! // 查询/清除奇偶或 ECC 错误 (正常为 None)
 //! if let Some(e) = sram::error() { ...; sram::clear_status(sram::ERR_ALL); }
 //! ```
@@ -77,6 +77,8 @@ pub const ERR_ALL: u32 = ERR_SRAM3_1 | ERR_SRAM3_2 | ERR_SRAM12 | ERR_SRAMH | ER
 /// SRAM 错误类型 (由 CKSR 映射)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SramError {
+    /// 等待周期寄存器写入后回读不一致。
+    WaitCycleWriteFailed,
     /// SRAM3 ECC 1 位错误 (可纠正)
     Sram3Ecc1,
     /// SRAM3 ECC 2 位错误 (不可纠正)
@@ -138,7 +140,7 @@ pub fn lock() {
 ///
 /// 结果与 DDL BSP_CLK_Init 一致: ≤100MHz → SRAM3=1 其余 0;
 /// >100MHz → SRAM1/2/3/Ret=1, SRAMH=0。
-pub fn set_wait_cycles(hclk_hz: u32) {
+pub fn set_wait_cycles(hclk_hz: u32) -> Result<(), SramError> {
     let w = wait_cycles(hclk_hz);
     let wtcr = (w.sram12 as u32) << WTCR_SRAM12_RWT_POS
         | (w.sram12 as u32) << WTCR_SRAM12_WWT_POS
@@ -152,7 +154,13 @@ pub fn set_wait_cycles(hclk_hz: u32) {
     unsafe {
         core::ptr::write_volatile((SRAMC + WTCR) as *mut u32, wtcr);
     }
+    let applied = unsafe { core::ptr::read_volatile((SRAMC + WTCR) as *const u32) == wtcr };
     lock();
+    if applied {
+        Ok(())
+    } else {
+        Err(SramError::WaitCycleWriteFailed)
+    }
 }
 
 /// 读取当前等待周期配置
