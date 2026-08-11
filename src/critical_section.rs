@@ -9,10 +9,9 @@
 //!
 //! # 临界区令牌 ([`CriticalSection`])
 //!
-//! [`with`] 把 ZST 令牌 [`CriticalSection`] 传入闭包, 其生命周期
-//! 绑定临界区作用域: 内核共享状态 (见 [`crate::rtos::klist::KCell`])
-//! 的访问须出示该令牌, 派生的引用**无法逃逸出临界区** ——
-//! "必须关中断访问"从文档约定变为编译期强制的类型契约。
+//! [`with`] 把 ZST 令牌 [`CriticalSection`] 传入闭包，其生命周期绑定
+//! 临界区作用域。令牌证明当前 CPU 已关中断；`KCell` 等内部 unsafe
+//! 容器仍要求调用方另外证明同一存储不存在重叠可变借用。
 
 use core::marker::PhantomData;
 
@@ -20,7 +19,8 @@ use core::marker::PhantomData;
 ///
 /// 生命周期 `'cs` 绑定临界区作用域, 用于类型层面证明某段代码
 /// 运行在关中断上下文; 无法在闭包外构造 (私有字段)。
-/// `Copy` (零大小类型), 可自由传递/复用。
+/// `Copy` (零大小类型)，可用于多个互不重叠的内核对象。它只证明同步
+/// 条件，不代表对某个具体对象的独占所有权。
 #[derive(Clone, Copy)]
 pub struct CriticalSection<'cs> {
     _lifetime: PhantomData<&'cs ()>,
@@ -44,10 +44,8 @@ pub fn with<R>(f: impl FnOnce(CriticalSection<'_>) -> R) -> R {
 
 /// 当前是否运行在中断上下文 (IPSR != 0)
 ///
-/// 供 `debug_assert!` 拦截"中断上下文调用线程专用 API"的误用
-/// (阻塞式 IPC/延时/加锁打印等 —— 在 ISR 中会挂起被打断的线程,
-/// 或对打印互斥量死锁)。release 构建下 `debug_assert!` 被移除,
-/// 零运行时开销。
+/// 阻塞 IPC、线程延时和控制台等公共入口用它在所有构建配置下拒绝
+/// 错误上下文；内部诊断断言也可复用。
 #[inline]
 pub fn in_isr() -> bool {
     crate::arch::in_exception()

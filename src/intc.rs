@@ -71,6 +71,10 @@ pub enum IrqError {
     LineTaken,
     /// 中断线越界 (注册仅支持 INT000~INT127, 共享线 INT128+ 不支持)
     LineUnsupported,
+    /// 事件源超出 SEL 字段范围或使用了未映射保留值 0x1FF
+    SourceInvalid,
+    /// NVIC 优先级超出 Cortex-M4 的 0~15 范围
+    PriorityInvalid,
 }
 
 /// 事件源编号 (`en_int_src_t`, 参考 DDL hc32f460.h L489~812)
@@ -321,23 +325,33 @@ pub fn priority(line: Line) -> u8 {
 /// - `priority`: 0~15 (越小越高);
 /// - `handler`: 中断回调 (中断上下文执行, 末尾会返回, 无需清挂起)。
 ///
-/// 失败 ([`IrqError::LineTaken`]) 表示该线已被其他事件源占用,
-/// 应更换中断线或先 [`unregister`]。
+/// 失败时返回占用、范围或参数错误；不会留下半注册状态。
 pub fn register(source: u32, line: Line, priority: u8, handler: Handler) -> Result<(), IrqError> {
     let n = line.n();
     if n >= 128 {
         return Err(IrqError::LineUnsupported);
     }
-    let sel = unsafe { core::ptr::read_volatile(sel_addr(n)) };
-    if sel != SEL_UNMAPPED && sel != source {
-        return Err(IrqError::LineTaken);
+    if source >= SEL_UNMAPPED {
+        return Err(IrqError::SourceInvalid);
     }
-    route(source, line);
-    crate::vector_table::register_irq(n as usize, handler);
-    clear_pend(line);
-    set_priority(line, priority);
-    enable(line);
-    Ok(())
+    if priority > 15 {
+        return Err(IrqError::PriorityInvalid);
+    }
+    crate::critical_section::with(|_| {
+        let sel = unsafe { core::ptr::read_volatile(sel_addr(n)) };
+        if sel != SEL_UNMAPPED && sel != source {
+            return Err(IrqError::LineTaken);
+        }
+        // 检查、路由、callback 发布与使能是同一个事务，避免并发注册
+        // 形成 source 与 handler 错配。
+        disable(line);
+        route(source, line);
+        crate::vector_table::register_irq(n as usize, handler);
+        clear_pend(line);
+        set_priority(line, priority);
+        enable(line);
+        Ok(())
+    })
 }
 
 /// 注销中断: 失能 → 解除路由 → 移除回调 (复位 SEL 为 0x1FF)
@@ -346,7 +360,9 @@ pub fn unregister(line: Line) {
     if n >= 128 {
         return;
     }
-    disable(line);
-    unroute(line);
-    crate::vector_table::unregister_irq(n as usize);
+    crate::critical_section::with(|_| {
+        disable(line);
+        unroute(line);
+        crate::vector_table::unregister_irq(n as usize);
+    });
 }

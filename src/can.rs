@@ -302,6 +302,9 @@ pub fn bit_timing_for(
     baudrate: u32,
     sample_point_pct: u32,
 ) -> Option<(u32, u32, u32, u32)> {
+    if can_clk == 0 || baudrate == 0 {
+        return None;
+    }
     for presc in 1..=64u32 {
         let tq = can_clk / presc;
         if tq == 0 {
@@ -358,7 +361,10 @@ pub fn init(cfg: Config) -> Result<(), CanError> {
     write8(ACFCTRL, 0); // 滤波地址 0
     write32(ACF, cfg.filter_id & ACF_ACODE);
     modify8(ACFCTRL, |v| v | ACFCTRL_SELMASK);
-    write32(ACF, (cfg.filter_mask & ACF_ACODE) | cfg.filter_type.acf_bits());
+    write32(
+        ACF,
+        (cfg.filter_mask & ACF_ACODE) | cfg.filter_type.acf_bits(),
+    );
 
     // 7. 退出本地复位 → 进入 CAN 通信
     modify8(CFG_STAT, |v| v & !CFG_STAT_RESET);
@@ -400,10 +406,7 @@ pub fn init(cfg: Config) -> Result<(), CanError> {
         RTIE,
         RTI_RIE | RTI_ROIE | RTI_RFIE | RTI_RAFIE | RTI_TPIE | RTI_TSIE | RTI_EIE,
     );
-    write8(
-        ERRINT,
-        ERRINT_BEIE | ERRINT_ALIE | ERRINT_EPIE,
-    );
+    write8(ERRINT, ERRINT_BEIE | ERRINT_ALIE | ERRINT_EPIE);
 
     Ok(())
 }

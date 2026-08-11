@@ -31,7 +31,6 @@ macro_rules! container_of {
 pub(crate) use container_of;
 
 /// 双向链表节点
-#[derive(Clone, Copy)]
 pub(crate) struct ListHead {
     next: *mut ListHead,
     prev: *mut ListHead,
@@ -45,9 +44,9 @@ unsafe impl Sync for ListHead {}
 /// 内核全局单元 — 为 `static` 提供 Sync 的 `UnsafeCell`
 ///
 /// 内核全局状态 (就绪表/定时链表/僵尸队列等) 均经此类声明。
-/// 访问必须出示 [`CriticalSection`] 令牌 (见 [`KCell::get`]),
-/// 返回的可变引用生命周期绑定临界区作用域 —— 无法逃逸出
-/// 关中断区间, 编译器强制"须在临界区内访问"的契约。
+/// 访问必须出示 [`CriticalSection`] 令牌 (见 [`KCell::get`])，返回引用
+/// 不能逃逸出临界区。由于令牌可复制，调用方仍须在每次 unsafe 调用处
+/// 证明没有为同一 `KCell` 制造重叠的 `&mut`。
 pub(crate) struct KCell<T>(core::cell::UnsafeCell<T>);
 
 // 内核保证所有访问均经临界区令牌, 令牌生命周期内中断已关闭
@@ -62,8 +61,12 @@ impl<T> KCell<T> {
     ///
     /// 令牌 `cs` 证明调用方运行在关中断上下文, 返回的 `&mut T`
     /// 与临界区作用域同生命周期 —— 临界区结束后引用即失效,
-    /// 无法存储后越界使用。注意: 同一临界区内对同一 `KCell`
-    /// 仅可调用一次 (返回 `&mut`, 重复调用会被借用检查拒绝)。
+    /// 无法存储后越界使用。
+    ///
+    /// # Safety
+    ///
+    /// 同一临界区内不得对同一单元生成重叠引用。令牌证明中断已关闭，
+    /// 但不跟踪具体 `KCell` 的借用状态。
     #[inline]
     #[allow(clippy::mut_from_ref)] // 访问经临界区令牌 (CriticalSection) 授权
     pub unsafe fn get<'cs>(&self, _cs: CriticalSection<'cs>) -> &'cs mut T {

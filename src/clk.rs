@@ -247,6 +247,8 @@ pub fn init() -> Result<(), ClkError> {
 pub enum ClkError {
     /// EFM 当前不能修改等待周期或缓存状态。
     Efm(crate::efm::EfmError),
+    /// SRAM 等待周期写入未生效。
+    Sram(crate::sram::SramError),
     /// 晶振起振超时 (检查电路/引脚/稳定时间)
     XtalStableTimeout,
     /// HRC 起振超时
@@ -258,6 +260,12 @@ pub enum ClkError {
 impl From<crate::efm::EfmError> for ClkError {
     fn from(error: crate::efm::EfmError) -> Self {
         Self::Efm(error)
+    }
+}
+
+impl From<crate::sram::SramError> for ClkError {
+    fn from(error: crate::sram::SramError) -> Self {
+        Self::Sram(error)
     }
 }
 
@@ -353,7 +361,11 @@ pub fn pll_init(cfg: PllConfig) -> Result<(), ClkError> {
     };
     if !wait_stable(src_flag) {
         cmu_lock();
-        return Err(ClkError::XtalStableTimeout);
+        return Err(if cfg.src == 0 {
+            ClkError::XtalStableTimeout
+        } else {
+            ClkError::HrcStableTimeout
+        });
     }
 
     // 开启 MPLL (MPLLOFF=0) 并等待锁定
@@ -390,8 +402,8 @@ pub fn switch_to_pll() -> Result<(), ClkError> {
     // 目标频率 = 已配置 PLLCFGR 的实际输出 (运行时计算)
     let target = pll_hz();
 
-    efm.set_wait_cycle(target);
-    crate::sram::set_wait_cycles(target);
+    efm.set_wait_cycle(target)?;
+    crate::sram::set_wait_cycles(target)?;
     // 126~200MHz 输入采样需 3 个读等待周期 (对齐 BSP_CLK_Init)
     set_gpio_read_wait(GPIO_RD_WAIT_200MHZ);
     // 高性能电源模式 (200MHz 必需)
@@ -604,7 +616,10 @@ pub fn xtal_init() -> Result<(), ClkError> {
     write8(CMU_BASE + CMU_XTALSTBCR, XTAL_STABLE_TIME);
     // 4. 驱动能力/超强驱动/模式 (对齐 DDL CLK_XtalInit 的
     //    (u8SuperDrv | u8Drv | u8Mode) 写入)
-    write8(CMU_BASE + CMU_XTALCFGR, XTAL_DRV | XTAL_SUPDRV | XTAL_MODE_OSC);
+    write8(
+        CMU_BASE + CMU_XTALCFGR,
+        XTAL_DRV | XTAL_SUPDRV | XTAL_MODE_OSC,
+    );
     // 5. 启动晶振 (XTALSTP=0)
     write8(CMU_BASE + CMU_XTALCR, 0);
 
@@ -663,8 +678,8 @@ pub fn xtal_cmd(enable: bool) -> Result<(), ClkError> {
 /// (当前或目标源为 PLL 时, 切换窗口内 FCG 必须关闭)。
 pub fn switch_to_hrc() -> Result<(), ClkError> {
     let mut efm = crate::efm::begin_configuration()?;
-    efm.set_wait_cycle(hrc_hz());
-    crate::sram::set_wait_cycles(hrc_hz());
+    efm.set_wait_cycle(hrc_hz())?;
+    crate::sram::set_wait_cycles(hrc_hz())?;
     let fcg = if system_clk_is_pll() {
         Some(fcg_close())
     } else {
@@ -688,8 +703,8 @@ pub fn switch_to_hrc() -> Result<(), ClkError> {
 /// 从 PLL 切换回来时按 DDL `SetSysClockSrc` 要求关闭外设时钟。
 pub fn switch_to_xtal() -> Result<(), ClkError> {
     let mut efm = crate::efm::begin_configuration()?;
-    efm.set_wait_cycle(XTAL_HZ);
-    crate::sram::set_wait_cycles(XTAL_HZ);
+    efm.set_wait_cycle(XTAL_HZ)?;
+    crate::sram::set_wait_cycles(XTAL_HZ)?;
     let fcg = if system_clk_is_pll() {
         Some(fcg_close())
     } else {
@@ -718,6 +733,17 @@ pub fn system_clock_hz() -> u32 {
         CLK_SRC_XTAL32 => XTAL32_HZ,
         CLK_SRC_PLL => pll_hz(),
         _ => 0,
+    }
+}
+
+/// 当前硬件实际使用的系统时钟源。
+pub fn active_clock_source() -> Option<ClockSource> {
+    match read8(CMU_BASE + CMU_CKSWR) & 0x7 {
+        CLK_SRC_MRC => Some(ClockSource::Mrc),
+        CLK_SRC_HRC => Some(ClockSource::Hrc),
+        CLK_SRC_XTAL => Some(ClockSource::Xtal),
+        CLK_SRC_PLL => Some(ClockSource::Pll),
+        _ => None,
     }
 }
 
@@ -862,7 +888,8 @@ fn pll_hz() -> u32 {
     } else {
         XTAL_HZ
     };
-    src / (m + 1) * (n + 1) / (p + 1)
+    let hz = (src as u64) * (n as u64 + 1) / (m as u64 + 1) / (p as u64 + 1);
+    hz.min(u32::MAX as u64) as u32
 }
 
 fn read8(addr: usize) -> u32 {

@@ -14,6 +14,13 @@
 //! 使用 (如 `static TIMER: Timer = Timer::new()`), 同时避免编译器
 //! 将 const 初始化的对象提升到只读存储 (FLASH), 导致内核原地修改
 //! 被静默丢弃、链表被注入非法节点。
+//!
+//! # 固定地址
+//!
+//! 定时器启动后，其内嵌链表节点地址会存入全局定时器链表。因此 [`Timer`]
+//! 是 `!Unpin`，公开的启动/停止/查询 API 均要求 [`Pin<&Timer>`]。堆上对象
+//! 可用 `Box::pin` 固定，静态对象可用 [`Timer::pin_static`] 获取安全的 Pin。
+//! 析构会在释放存储前自动摘除尚未到期的节点。
 
 // 内核模块: unsafe 契约由临界区与模块文档统一说明, 函数体内不再逐段包裹
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -21,6 +28,8 @@
 #![allow(dead_code)]
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomPinned;
+use core::pin::Pin;
 
 use crate::critical_section;
 use crate::critical_section::CriticalSection;
@@ -29,6 +38,9 @@ use crate::rtos::tick;
 
 /// 定时器链表头 (按 timeout_tick 升序)
 static TIMER_LIST: KCell<ListHead> = KCell::new(ListHead::const_new());
+
+/// 有符号差值回绕比较只能可靠表示未来半个 `u32` tick 空间。
+const MAX_TIMER_TICKS: u32 = i32::MAX as u32;
 
 /// 空回调 (const 初始化占位)
 extern "C" fn nop_callback(_param: usize) {}
@@ -46,6 +58,7 @@ struct TimerInner {
 /// 定时器对象
 pub struct Timer {
     inner: UnsafeCell<TimerInner>,
+    _pin: PhantomPinned,
 }
 
 unsafe impl Send for Timer {}
@@ -63,24 +76,37 @@ impl Timer {
                 callback: nop_callback,
                 param: 0,
             }),
+            _pin: PhantomPinned,
         }
+    }
+
+    /// 将静态定时器转换为固定地址引用。
+    ///
+    /// `'static` 引用保证对象在程序生命周期内不会被移动或析构，因此满足
+    /// [`Pin`] 的地址稳定契约。非静态对象应使用 `Box::pin` 或 `pin!`。
+    pub fn pin_static(&'static self) -> Pin<&'static Self> {
+        // SAFETY: `self` 位于静态存储中，地址在整个程序生命周期内稳定。
+        unsafe { Pin::new_unchecked(self) }
     }
 
     /// 启动定时器: `delay_ticks` 后触发回调;
     /// `period_ticks != 0` 时周期触发 (每 `period_ticks` 一拍)。
     ///
-    /// # 注意事项
-    /// - 回调运行在中断上下文, 应保持简短, 避免阻塞式调用;
-    /// - 启动后定时器对象必须保持原位 (静态或堆分配), 不可移动。
+    /// `delay_ticks == 0` 按 1 tick 处理，避免回调在同一轮到期扫描中
+    /// 以零延时重启自身而形成中断活锁。
+    ///
+    /// 回调运行在中断上下文，应保持简短并避免阻塞式调用。Pin 保证从
+    /// 本次启动到停止或析构期间，侵入式链表中的节点地址保持有效。
     pub fn start(
-        &self,
+        self: Pin<&Self>,
         delay_ticks: u32,
         period_ticks: u32,
         callback: extern "C" fn(usize),
         param: usize,
     ) {
+        let timer = self.get_ref();
         critical_section::with(|cs| unsafe {
-            self.start_internal(delay_ticks, period_ticks, callback, param, cs);
+            timer.start_internal(delay_ticks, period_ticks, callback, param, cs);
         });
     }
 
@@ -89,7 +115,7 @@ impl Timer {
     /// 非零时长向上取整到至少一个 tick，并钳位到定时器回绕安全窗口；
     /// `period_ms == 0` 表示一次性定时器。
     pub fn start_ms(
-        &self,
+        self: Pin<&Self>,
         delay_ms: u32,
         period_ms: u32,
         callback: extern "C" fn(usize),
@@ -107,15 +133,16 @@ impl Timer {
     ///
     /// 若到期处理已经摘除本次定时器并提交回调, `stop` 只取消后续
     /// 周期, 已提交的本次回调仍可能执行。
-    pub fn stop(&self) {
-        critical_section::with(|_| unsafe {
-            self.stop_internal();
+    pub fn stop(self: Pin<&Self>) {
+        let timer = self.get_ref();
+        critical_section::with(|cs| unsafe {
+            timer.stop_internal(cs);
         });
     }
 
     /// 定时器是否处于启动状态
-    pub fn is_active(&self) -> bool {
-        critical_section::with(|_| unsafe { (*self.ptr()).started })
+    pub fn is_active(self: Pin<&Self>) -> bool {
+        critical_section::with(|_| unsafe { (*self.get_ref().ptr()).started })
     }
 
     #[inline]
@@ -123,7 +150,14 @@ impl Timer {
         self.inner.get()
     }
 
-    /// 临界区内: 启动 (重启时先摘除旧节点)
+    /// 临界区内启动；重启时先摘除旧节点。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须持有 `cs` 对应的临界区，并保证 `self` 从调用开始到
+    /// `stop_internal`、一次性到期或析构为止地址稳定。公开 API 通过 Pin
+    /// 保证此条件；线程内建定时器由 TCB 的内核侧 `Arc` 强引用保证活动期
+    /// 不会移动或释放。
     pub(crate) unsafe fn start_internal(
         &self,
         delay_ticks: u32,
@@ -133,6 +167,8 @@ impl Timer {
         cs: CriticalSection<'_>,
     ) {
         let t = unsafe { &mut *self.ptr() };
+        let delay_ticks = delay_ticks.clamp(1, MAX_TIMER_TICKS);
+        let period_ticks = period_ticks.min(MAX_TIMER_TICKS);
         t.callback = callback;
         t.param = param;
         t.period_ticks = period_ticks;
@@ -144,13 +180,27 @@ impl Timer {
         insert_sorted(t, cs);
     }
 
-    /// 临界区内: 停止
-    pub(crate) unsafe fn stop_internal(&self) {
+    /// 临界区内停止定时器并摘除节点。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须持有 `cs` 对应的临界区，且 `self` 必须仍位于启动时的
+    /// 地址。函数返回后定时器不再依赖固定地址，可由其所有者正常析构。
+    pub(crate) unsafe fn stop_internal(&self, _cs: CriticalSection<'_>) {
         let t = unsafe { &mut *self.ptr() };
         if t.node.is_linked() {
             t.node.remove();
         }
         t.started = false;
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        critical_section::with(|cs| unsafe {
+            // Pin 保证已启动 Timer 在 Drop 开始前未被移动；先摘链再释放存储。
+            self.stop_internal(cs);
+        });
     }
 }
 

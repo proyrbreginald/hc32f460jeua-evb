@@ -80,7 +80,9 @@ pub fn register_irq(n: usize, handler: IrqHandler) {
 /// 移除外设中断回调 (置空; 未注册的槽位触发时静默返回)
 pub fn unregister_irq(n: usize) {
     assert!(n < 144, "unregister_irq: 仅支持 INT000~INT143");
-    IRQ_HANDLERS[n].0.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
+    IRQ_HANDLERS[n]
+        .0
+        .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
 }
 
 /// 生成分发入口: 查表调用对应槽位的回调 (未注册时静默返回)

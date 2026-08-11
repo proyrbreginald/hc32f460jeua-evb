@@ -429,10 +429,7 @@ impl<const U: u8> Uart<U> {
 
     /// 轮询发送一个字节: 等待 TDR 空 (SR.TXE=1) 后写入 (对齐 USART_WriteData)
     pub fn write_byte(&self, byte: u8) {
-        while self.sr().read() & SR_TXE == 0 {
-            // 等待发送数据寄存器空
-        }
-        self.tdr().write_u16(byte as u16);
+        self.write_word(byte as u16);
     }
 
     /// 轮询发送字节串
@@ -450,10 +447,24 @@ impl<const U: u8> Uart<U> {
     /// 发送 16 位数据 (TDR 为 16 位寄存器, 9 位数据模式下使用;
     /// 8 位模式等价于 [`Uart::write_byte`])
     pub fn write_word(&self, data: u16) {
-        while self.sr().read() & SR_TXE == 0 {
-            // 等待发送数据寄存器空
+        loop {
+            while self.sr().read() & SR_TXE == 0 {
+                // 等待发送数据寄存器空；不在整个等待期间屏蔽中断。
+            }
+            let written = crate::critical_section::with(|_| {
+                // 线程观察 TXE 后可能被 raw-console ISR 抢占。临界区内
+                // 必须再次检查，确保检查与 TDR 写入对所有上下文原子。
+                if self.sr().read() & SR_TXE == 0 {
+                    false
+                } else {
+                    self.tdr().write_u16(data);
+                    true
+                }
+            });
+            if written {
+                return;
+            }
         }
-        self.tdr().write_u16(data);
     }
 
     /// 等待发送完成 (SR.TC=1): 最后一个字节已移出移位寄存器并完成发送。
@@ -553,7 +564,8 @@ impl RxRing {
             return None;
         }
         let b = self.buf[t & (RX_BUF_SIZE - 1)].load(Ordering::Relaxed);
-        self.tail.store((t + 1) & (RX_BUF_SIZE - 1), Ordering::Release);
+        self.tail
+            .store((t + 1) & (RX_BUF_SIZE - 1), Ordering::Release);
         Some(b)
     }
 
@@ -570,12 +582,7 @@ impl RxRing {
 }
 
 /// 各 USART 单元的接收环形缓冲容器 (纯原子, 自动 Sync, 无 unsafe impl)
-static RX_RINGS: [RxRing; 4] = [
-    RxRing::new(),
-    RxRing::new(),
-    RxRing::new(),
-    RxRing::new(),
-];
+static RX_RINGS: [RxRing; 4] = [RxRing::new(), RxRing::new(), RxRing::new(), RxRing::new()];
 
 /// 接收数据成功入队后的通知回调。
 ///
@@ -654,7 +661,8 @@ unsafe extern "C" fn rx_irq_handler<const U: u8>() {
             let byte = core::ptr::read_volatile((base + 0x06) as *const u16) as u8;
             let ring = &RX_RINGS[U as usize - 1];
             let errors = &RX_ERRORS[U as usize - 1];
-            if sr & SR_RXNE != 0 {
+            let error_flags = sr & (SR_PE | SR_FE | SR_ORE);
+            if sr & SR_RXNE != 0 && error_flags == 0 {
                 // 先以 Release 发布 head, 再通知适配层。缓冲满时丢弃最新
                 // 字节且不通知, 避免没有新数据时产生虚假唤醒。
                 if ring.push(byte) {
@@ -677,7 +685,7 @@ unsafe extern "C" fn rx_irq_handler<const U: u8>() {
                     .overrun
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            if sr & (SR_PE | SR_FE | SR_ORE) != 0 {
+            if error_flags != 0 {
                 // 读-改-写 CR1 清除错误标志 (CPE/CFE/CORE, 对齐 USART_ClearStatus)
                 let cr1 = core::ptr::read_volatile((base + 0x0C) as *const u32);
                 core::ptr::write_volatile(

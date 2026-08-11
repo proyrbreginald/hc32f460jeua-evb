@@ -28,7 +28,7 @@
 //! efm::sector_erase(0x0007_C000)?;
 //! efm::program(0x0007_C000, b"hello")?;
 //! // 读回校验 (Flash 内存映射, 任意字节可读)
-//! assert_eq!(efm::read_byte(0x0007_C000), b'h');
+//! assert_eq!(efm::read_byte(0x0007_C000)?, b'h');
 //! ```
 //!
 //! 注意: 写保护/安全 (level1/2)、窗口写保护、swap、OTP 锁、序列编程、
@@ -151,8 +151,12 @@ pub(crate) struct ConfigurationGuard {
 }
 
 impl ConfigurationGuard {
-    pub(crate) fn set_wait_cycle(&mut self, hclk_hz: u32) {
-        set_wait_cycle_unlocked(hclk_hz);
+    pub(crate) fn set_wait_cycle(&mut self, hclk_hz: u32) -> Result<(), EfmError> {
+        if set_wait_cycle_unlocked(hclk_hz) {
+            Ok(())
+        } else {
+            Err(EfmError::Timeout)
+        }
     }
 
     pub(crate) fn enable_cache(&mut self) {
@@ -263,10 +267,7 @@ fn set_op_mode(mode: OpMode) {
 fn disable_cache() -> u32 {
     unsafe {
         let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
-        core::ptr::write_volatile(
-            (EFM_BASE + FRMC) as *mut u32,
-            v & !FRMC_CACHE_ALL,
-        );
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, v & !FRMC_CACHE_ALL);
         v & FRMC_CACHE_ALL
     }
 }
@@ -275,10 +276,7 @@ fn disable_cache() -> u32 {
 fn restore_cache(saved: u32) {
     unsafe {
         let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
-        core::ptr::write_volatile(
-            (EFM_BASE + FRMC) as *mut u32,
-            (v & !FRMC_CACHE_ALL) | saved,
-        );
+        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, (v & !FRMC_CACHE_ALL) | saved);
     }
 }
 
@@ -394,14 +392,18 @@ pub fn swap_disable() -> Result<(), EfmError> {
 
 // ============================== 读 ==============================
 
-/// 读取 Flash 字节 (Flash 内存映射, 任意字节地址)
-pub fn read_byte(addr: u32) -> u8 {
-    unsafe { core::ptr::read_volatile(addr as *const u8) }
+/// 读取主 Flash 字节 (Flash 内存映射)。
+pub fn read_byte(addr: u32) -> Result<u8, EfmError> {
+    if addr >= FLASH_SIZE {
+        return Err(EfmError::InvalidAddr);
+    }
+    Ok(unsafe { core::ptr::read_volatile(addr as *const u8) })
 }
 
-/// 读取 Flash 字 (4 字节, 需字对齐)
-pub fn read_word(addr: u32) -> u32 {
-    unsafe { core::ptr::read_volatile(addr as *const u32) }
+/// 读取主 Flash 字 (4 字节，地址必须按字对齐)。
+pub fn read_word(addr: u32) -> Result<u32, EfmError> {
+    check_addr(addr)?;
+    Ok(unsafe { core::ptr::read_volatile(addr as *const u32) })
 }
 
 /// 读取唯一 ID (UQID0~2, 96 位)
@@ -436,9 +438,7 @@ pub fn sector_erase(addr: u32) -> Result<(), EfmError> {
 
     // 触发: 向目标地址写 0 (擦除 = 全 1, 任意值均可, DDL 用 0)
     // MPU: FLASH 只读区域临时放开 (触发写是"写 Flash 地址")
-    crate::mpu::with_flash_writable(|| unsafe {
-        core::ptr::write_volatile(addr as *mut u32, 0)
-    });
+    crate::mpu::with_flash_writable(|| unsafe { core::ptr::write_volatile(addr as *mut u32, 0) });
     // 扇区擦除 ~ms 级, 超时按 HCLK 折算 ~20ms (对齐 DDL EFM_ERASE_TIMEOUT)
     let result = wait_end(crate::clk::hclk_hz() / 50);
 
@@ -530,25 +530,30 @@ pub const fn wait_cycle(hclk_hz: u32) -> u32 {
     }
 }
 
-fn set_wait_cycle_unlocked(hclk_hz: u32) {
+fn set_wait_cycle_unlocked(hclk_hz: u32) -> bool {
     const FRMC_FLWT_MASK: u32 = 0x0000_00F0;
     let cycles = wait_cycle(hclk_hz) << 4;
 
     unlock();
-    unsafe {
+    let applied = unsafe {
         let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
         core::ptr::write_volatile(
             (EFM_BASE + FRMC) as *mut u32,
             (frmc & !FRMC_FLWT_MASK) | cycles,
         );
         // 回读确认配置生效 (带超时, 防解锁失败时永久自旋)
+        let mut applied = false;
         for _ in 0..10_000 {
-            if core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32) & FRMC_FLWT_MASK == cycles {
+            if core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32) & FRMC_FLWT_MASK == cycles
+            {
+                applied = true;
                 break;
             }
         }
-    }
+        applied
+    };
     lock();
+    applied
 }
 
 /// 复位入口在 `.data` / `.bss` 初始化前设置初始等待周期。
@@ -557,5 +562,7 @@ fn set_wait_cycle_unlocked(hclk_hz: u32) {
 /// 有意不获取 [`OperationGuard`]。运行期时钟切换必须持有
 /// [`ConfigurationGuard`]。
 pub(crate) fn set_wait_cycle_early(hclk_hz: u32) {
-    set_wait_cycle_unlocked(hclk_hz);
+    // 复位源 MRC 8MHz 在 FLWT=0 下本就安全；这里尽力恢复期望值。
+    // 运行期升频路径会检查并传播回读失败。
+    let _ = set_wait_cycle_unlocked(hclk_hz);
 }

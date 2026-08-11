@@ -50,13 +50,13 @@ const fn icg1() -> u32 {
 /// 生成全部 ICG 配置字 (const 求值, 编译期确定)
 const fn icg_words() -> [u32; 8] {
     [
-        ICG0_DEFAULT,  // ICG0 (0x400, DDL ICG_REG_CFG0_CONST)
-        icg1(),        // ICG1 (0x404, HRC 频率/停止由配置调整)
-        0xFFFF_FFFF,   // ICG2 (0x408, 预留)
-        0xFFFF_FFFF,   // ICG3 (0x40C, 预留)
-        0xFFFF_FFFF,   // ICG4 (0x410, 预留)
-        0xFFFF_FFFF,   // ICG5 (0x414, 预留)
-        0xFFFF_FFFF,   // ICG6 (0x418, 预留)
-        0xFFFF_FFFF,   // ICG7 (0x41C, 预留)
+        ICG0_DEFAULT, // ICG0 (0x400, DDL ICG_REG_CFG0_CONST)
+        icg1(),       // ICG1 (0x404, HRC 频率/停止由配置调整)
+        0xFFFF_FFFF,  // ICG2 (0x408, 预留)
+        0xFFFF_FFFF,  // ICG3 (0x40C, 预留)
+        0xFFFF_FFFF,  // ICG4 (0x410, 预留)
+        0xFFFF_FFFF,  // ICG5 (0x414, 预留)
+        0xFFFF_FFFF,  // ICG6 (0x418, 预留)
+        0xFFFF_FFFF,  // ICG7 (0x41C, 预留)
     ]
 }

@@ -29,19 +29,19 @@ use crate::critical_section::CriticalSection;
 use crate::rtos::PRIORITY_MAX;
 use crate::rtos::context;
 use crate::rtos::klist::{KCell, ListHead};
-use crate::rtos::thread::{STACK_PATTERN, Thread, thread_from_ready};
+use crate::rtos::thread::{STACK_PATTERN, ThreadInner, thread_from_ready};
 
 /// 就绪表: 每个优先级一个就绪队列 (队尾插入)
 static READY_TABLE: KCell<[ListHead; PRIORITY_MAX as usize]> =
-    KCell::new([ListHead::const_new(); PRIORITY_MAX as usize]);
+    KCell::new([const { ListHead::const_new() }; PRIORITY_MAX as usize]);
 /// 就绪优先级位图
 static READY_GROUP: AtomicU32 = AtomicU32::new(0);
 /// 当前线程
-static CURRENT: AtomicPtr<Thread> = AtomicPtr::new(core::ptr::null_mut());
+static CURRENT: AtomicPtr<ThreadInner> = AtomicPtr::new(core::ptr::null_mut());
 
 /// 当前线程 (调度器启动前为 null)
 #[inline]
-pub(crate) fn current() -> *mut Thread {
+pub(crate) fn current() -> *mut ThreadInner {
     CURRENT.load(Ordering::Relaxed)
 }
 
@@ -68,12 +68,12 @@ pub(crate) fn ready_thread_count() -> usize {
 
 /// 设置当前线程 (调度器启动时)
 #[inline]
-pub(crate) fn set_current(t: *mut Thread) {
+pub(crate) fn set_current(t: *mut ThreadInner) {
     CURRENT.store(t, Ordering::Relaxed);
 }
 
 /// 临界区内: 最高优先级就绪线程 (须持有临界区令牌)
-pub(crate) unsafe fn highest_ready_thread(cs: CriticalSection<'_>) -> Option<*mut Thread> {
+pub(crate) unsafe fn highest_ready_thread(cs: CriticalSection<'_>) -> Option<*mut ThreadInner> {
     let group = READY_GROUP.load(Ordering::Relaxed);
     if group == 0 {
         return None;
@@ -84,7 +84,7 @@ pub(crate) unsafe fn highest_ready_thread(cs: CriticalSection<'_>) -> Option<*mu
 }
 
 /// 临界区内: 线程入就绪队列 (队尾)
-pub(crate) unsafe fn ready_insert(t: *mut Thread, cs: CriticalSection<'_>) {
+pub(crate) unsafe fn ready_insert(t: *mut ThreadInner, cs: CriticalSection<'_>) {
     let prio = unsafe { (*t).current_priority } as usize;
     let queue = unsafe { READY_TABLE.get(cs).get_unchecked_mut(prio) };
     unsafe { queue.push_back(&mut (*t).ready_node) };
@@ -92,7 +92,7 @@ pub(crate) unsafe fn ready_insert(t: *mut Thread, cs: CriticalSection<'_>) {
 }
 
 /// 临界区内: 线程出就绪队列
-pub(crate) unsafe fn ready_remove(t: *mut Thread, cs: CriticalSection<'_>) {
+pub(crate) unsafe fn ready_remove(t: *mut ThreadInner, cs: CriticalSection<'_>) {
     unsafe { (*t).ready_node.remove() };
     let prio = unsafe { (*t).current_priority } as usize;
     if unsafe { READY_TABLE.get(cs).get_unchecked(prio) }.is_empty() {
@@ -101,7 +101,7 @@ pub(crate) unsafe fn ready_remove(t: *mut Thread, cs: CriticalSection<'_>) {
 }
 
 /// 临界区内: 修改线程优先级 (就绪时重排就绪队列)
-pub(crate) unsafe fn change_priority(t: *mut Thread, prio: u8, cs: CriticalSection<'_>) {
+pub(crate) unsafe fn change_priority(t: *mut ThreadInner, prio: u8, cs: CriticalSection<'_>) {
     if unsafe { (*t).current_priority } == prio {
         return;
     }
@@ -137,16 +137,18 @@ pub(crate) fn schedule() {
         // 前也可能已溢出并破坏相邻 TCB, 每次调度检查缩短发现窗口)
         stack_guard_check(cur);
         stack_guard_check(to);
-        crate::rtos::hooks::run_context_switch_hook(to, cs);
         (*cur).yielded = false;
         (*to).yielded = false;
         set_current(to);
+        // MPU/context-switch hooks run inside PendSV only after the actual
+        // running thread's PSP has been saved. Multiple pending requests may
+        // still replace `to`; the hook therefore observes the final CURRENT.
         context::request_switch(&mut (*cur).sp, &mut (*to).sp);
     });
 }
 
 /// 栈溢出检查: PSP 越界或栈底魔数被破坏
-unsafe fn stack_guard_check(t: *mut Thread) {
+unsafe fn stack_guard_check(t: *mut ThreadInner) {
     let base = (*t).stack_addr;
     let end = base + (*t).stack_size;
     let sp = (*t).sp;

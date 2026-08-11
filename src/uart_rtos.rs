@@ -44,7 +44,9 @@ impl<const U: u8> UartRtosExt for Uart<U> {
             if let Some(byte) = self.read_rx() {
                 return byte;
             }
-            let _ = RX_READY[U as usize - 1].take(Timeout::Forever);
+            RX_READY[U as usize - 1]
+                .take(Timeout::Forever)
+                .expect("阻塞 UART 读取必须在线程上下文");
         }
     }
 

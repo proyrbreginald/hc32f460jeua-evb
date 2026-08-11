@@ -54,6 +54,14 @@ const SCB_BASE: usize = 0xE000_ED00;
 /// 栈顶 (与 link.ld 的 RAM 段末尾一致), 用于估算栈使用量
 const STACK_TOP: usize = 0x2002_7000;
 
+/// Cortex-M 异常帧布局与 EXC_RETURN 位。
+const BASIC_FRAME_WORDS: usize = 8;
+const BASIC_FRAME_BYTES: usize = BASIC_FRAME_WORDS * core::mem::size_of::<u32>();
+const FP_EXTENSION_WORDS: usize = 18;
+const FP_EXTENSION_BYTES: usize = FP_EXTENSION_WORDS * core::mem::size_of::<u32>();
+const EXC_RETURN_USE_PSP: u32 = 1 << 2;
+const EXC_RETURN_BASIC_FRAME: u32 = 1 << 4;
+
 /// panic/fault 后的行为
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PanicStrategy {
@@ -87,19 +95,27 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 // 硬件 fault 统一入口 (HardFault/MemManage/BusFault/UsageFault 向量指向):
-// 由内联汇编定义符号, 入口处寄存器尚未被编译器破坏, 捕获
-// IPSR/MSP/SP/帧指针 (r7) 后直接跳入 fault_diagnose
-// (b 跳转不经过调用约定, r0~r3 传参)。
+// 由汇编在编译器生成函数序言前捕获 IPSR、EXC_RETURN、现场帧指针，
+// 并按 EXC_RETURN.bit2 选择硬件实际使用的 MSP/PSP。随后直接跳入
+// fault_diagnose (b 跳转不经过调用约定, r0~r3 传参)。
 core::arch::global_asm!(
+    ".syntax unified",
+    ".cpu cortex-m4",
+    ".thumb",
     ".section .text.fault_handler, \"ax\"",
     ".global fault_handler",
+    ".type fault_handler, %function",
     ".thumb_func",
     "fault_handler:",
-    "    mrs r0, ipsr", // 异常号
-    "    mrs r1, msp",  // MSP (异常压栈帧基址)
-    "    mov r2, sp",   // 当前 SP (handler 模式下即 MSP)
-    "    mov r3, r7",   // 现场帧指针 (fault 指令所在函数的 FP)
+    "    mrs r0, ipsr", // r0: 异常号
+    "    tst lr, #4",   // EXC_RETURN.bit2: 0=MSP, 1=PSP
+    "    ite eq",
+    "    mrseq r1, msp", // r1: 异常压栈区的原始 SP
+    "    mrsne r1, psp",
+    "    mov r2, lr", // r2: EXC_RETURN (bit4 区分 basic/extended)
+    "    mov r3, r7", // r3: fault 指令所在函数的帧指针
     "    b fault_diagnose",
+    ".size fault_handler, . - fault_handler",
 );
 
 // 硬件 fault 汇编入口 (由上方 global_asm 定义), 向量表引用此符号
@@ -107,51 +123,109 @@ unsafe extern "C" {
     pub fn fault_handler();
 }
 
-/// fault 现场诊断 (由 [`fault_handler`] 汇编跳入: r0=ipsr, r1=msp, r2=sp, r3=fp)
+/// fault 现场诊断。
+///
+/// 由 [`fault_handler`] 汇编跳入: r0=ipsr, r1=stacked_sp,
+/// r2=EXC_RETURN, r3=现场帧指针。
 #[unsafe(no_mangle)]
-unsafe extern "C" fn fault_diagnose(ipsr: u32, msp: u32, _sp: u32, fp: u32) -> ! {
+unsafe extern "C" fn fault_diagnose(ipsr: u32, stacked_sp: u32, exc_return: u32, fp: u32) -> ! {
     write_fmt(format_args!(
         "=== 硬件故障 ===\r\n  异常号: {} ({})\r\n",
         ipsr,
         exception_name(ipsr)
     ));
-    report_fault_registers();
-    report_exception_frame(msp);
-    report_backtrace(fp as usize);
+    let cfsr = report_fault_registers();
+    report_exception_frame(stacked_sp, exc_return, cfsr);
+    if cfsr & CFSR_UNRELIABLE_STACK != 0 {
+        write_fmt(format_args!("  栈状态不可信，跳过帧指针回溯\r\n"));
+    } else {
+        report_backtrace(fp as usize);
+    }
     terminate()
 }
 
-/// 打印异常压栈帧: 硬件在 fault 入口自动压入
-/// `[r0, r1, r2, r3, r12, lr, pc, xpsr]` (msp 指向帧底)
-fn report_exception_frame(msp: u32) {
-    if msp as usize + 32 <= STACK_TOP {
-        unsafe {
-            let f = msp as *const u32;
-            let rd = |i: usize| core::ptr::read_volatile(f.add(i));
-            write_fmt(format_args!(
-                "  异常帧 @0x{:08x}:\r\n    r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x}\r\n",
-                msp,
-                rd(0),
-                rd(1),
-                rd(2),
-                rd(3)
-            ));
-            write_fmt(format_args!(
-                "    r12=0x{:08x} lr=0x{:08x} pc=0x{:08x} xpsr=0x{:08x}\r\n",
-                rd(4),
-                rd(5),
-                rd(6),
-                rd(7)
-            ));
-        }
+/// 打印异常压栈帧。
+///
+/// basic frame 为 `[r0, r1, r2, r3, r12, lr, pc, xpsr]`。M4F 的
+/// `EXC_RETURN.bit4 == 0` 表示原始 SP 先指向 18 字的 FP 扩展区
+/// `[s0..s15, fpscr, reserved]`，basic frame 位于其后；bit4 == 1
+/// 时原始 SP 直接指向 basic frame。
+fn report_exception_frame(stacked_sp: u32, exc_return: u32, cfsr: u32) {
+    write_fmt(format_args!(
+        "  EXC_RETURN=0x{:08x}, 原始栈指针=0x{:08x}\r\n",
+        exc_return, stacked_sp
+    ));
+
+    if !valid_exc_return(exc_return) {
+        write_fmt(format_args!(
+            "  EXC_RETURN 非 Cortex-M4 合法编码，跳过异常帧\r\n"
+        ));
+        return;
     }
+    if cfsr & CFSR_UNRELIABLE_STACK != 0 {
+        write_fmt(format_args!("  CFSR 指示压栈/出栈错误，跳过异常帧读取\r\n"));
+        return;
+    }
+
+    let extended = exc_return & EXC_RETURN_BASIC_FRAME == 0;
+    let extension_bytes = if extended { FP_EXTENSION_BYTES } else { 0 };
+    let raw = stacked_sp as usize;
+    let Some(frame_addr) = raw.checked_add(extension_bytes) else {
+        write_fmt(format_args!("  异常帧地址计算溢出，跳过读取\r\n"));
+        return;
+    };
+    let Some(total_bytes) = extension_bytes.checked_add(BASIC_FRAME_BYTES) else {
+        write_fmt(format_args!("  异常帧长度计算溢出，跳过读取\r\n"));
+        return;
+    };
+    if !stack_range_is_readable(raw, total_bytes) {
+        write_fmt(format_args!(
+            "  异常帧范围无效或未按 4 字节对齐，跳过读取\r\n"
+        ));
+        return;
+    }
+
+    let mut words = [0u32; BASIC_FRAME_WORDS];
+    let frame = frame_addr as *const u32;
+    for (i, word) in words.iter_mut().enumerate() {
+        *word = unsafe { core::ptr::read_volatile(frame.add(i)) };
+    }
+    let stack_name = if exc_return & EXC_RETURN_USE_PSP != 0 {
+        "PSP"
+    } else {
+        "MSP"
+    };
+    let frame_name = if extended { "extended FP" } else { "basic" };
+    write_fmt(format_args!(
+        "  异常帧 @0x{:08x} ({}，{}):\r\n    r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x}\r\n",
+        frame_addr, stack_name, frame_name, words[0], words[1], words[2], words[3]
+    ));
+    write_fmt(format_args!(
+        "    r12=0x{:08x} lr=0x{:08x} pc=0x{:08x} xpsr=0x{:08x}\r\n",
+        words[4], words[5], words[6], words[7]
+    ));
+}
+
+/// Cortex-M4/M4F 可生成的 EXC_RETURN 编码。
+fn valid_exc_return(value: u32) -> bool {
+    matches!(
+        value,
+        0xFFFF_FFF1 | 0xFFFF_FFF9 | 0xFFFF_FFFD | 0xFFFF_FFE1 | 0xFFFF_FFE9 | 0xFFFF_FFED
+    )
+}
+
+/// 地址区间是否完整位于主 SRAM 且满足硬件字对齐。
+fn stack_range_is_readable(addr: usize, bytes: usize) -> bool {
+    addr & (core::mem::align_of::<u32>() - 1) == 0
+        && addr >= STACK_BOTTOM
+        && addr.checked_add(bytes).is_some_and(|end| end <= STACK_TOP)
 }
 
 /// 栈回溯: 沿帧指针链收集返回地址
 ///
 /// AAPCS 帧布局 (force-frame-pointers): `[fp+0]` = 前一帧 FP,
 /// `[fp+4]` = 返回地址 (LR)。合法性检查防止越界读与循环链:
-/// - 帧指针必须在栈范围内且单调递减;
+/// - 帧指针必须在栈范围内、按字对齐且向调用者方向单调递增;
 /// - 返回地址必须指向 flash 代码区 (thumb 位 + 512K 范围)。
 ///
 /// 注意: core 库函数 (无帧指针) 可能中断链, 故不保证完整覆盖;
@@ -159,20 +233,23 @@ fn report_exception_frame(msp: u32) {
 fn stack_backtrace(mut fp: usize, frames: &mut [usize]) -> usize {
     let mut n = 0;
     while n < frames.len() {
-        // 帧必须在栈范围内 (fp 与 fp+8 均合法)
-        if fp < STACK_BOTTOM || fp + 8 > STACK_TOP {
+        // 帧必须在栈范围内 (fp 与 fp+8 均合法)，checked_add 防回绕。
+        if !stack_range_is_readable(fp, 2 * core::mem::size_of::<usize>()) {
             break;
         }
         let prev = unsafe { core::ptr::read_volatile(fp as *const usize) };
-        let pc = unsafe { core::ptr::read_volatile((fp + 4) as *const usize) };
+        let Some(pc_addr) = fp.checked_add(core::mem::size_of::<usize>()) else {
+            break;
+        };
+        let pc = unsafe { core::ptr::read_volatile(pc_addr as *const usize) };
         // 返回地址必须指向 flash 代码区 (thumb 位为 1)
         if pc & 1 == 0 || pc & !1 >= FLASH_SIZE {
             break;
         }
         frames[n] = pc;
         n += 1;
-        // 栈向下增长: 前帧必须低于当前帧, 否则视为无效链 (防循环)
-        if prev >= fp || prev == 0 {
+        // 栈向下增长: 调用者帧位于更高地址，且下一帧自身也必须可读。
+        if prev <= fp || !stack_range_is_readable(prev, 2 * core::mem::size_of::<usize>()) {
             break;
         }
         fp = prev;
@@ -202,19 +279,29 @@ const STACK_BOTTOM: usize = 0x1FFF_8000;
 /// 打印当前异常上下文与栈信息
 fn report_context() {
     let ipsr = mrs_ipsr();
-    let sp = mrs_msp();
-    let stack_used = STACK_TOP.wrapping_sub(sp as usize);
-    write_fmt(format_args!(
-        "  上下文: {} (ipsr={}), sp=0x{:08x}, 栈使用=0x{:x} B\r\n",
-        exception_name(ipsr),
-        ipsr,
-        sp,
-        stack_used
-    ));
+    let uses_psp = ipsr == 0 && mrs_control() & (1 << 1) != 0;
+    if uses_psp {
+        write_fmt(format_args!(
+            "  上下文: {} (ipsr={}), PSP=0x{:08x}\r\n",
+            exception_name(ipsr),
+            ipsr,
+            mrs_psp()
+        ));
+    } else {
+        let sp = mrs_msp();
+        let stack_used = STACK_TOP.saturating_sub(sp as usize);
+        write_fmt(format_args!(
+            "  上下文: {} (ipsr={}), MSP=0x{:08x}, 主栈使用=0x{:x} B\r\n",
+            exception_name(ipsr),
+            ipsr,
+            sp,
+            stack_used
+        ));
+    }
 }
 
 /// 读取并解码 SCB fault 状态寄存器 (CFSR/HFSR/BFAR/MMFAR)
-fn report_fault_registers() {
+fn report_fault_registers() -> u32 {
     unsafe {
         let cfsr = core::ptr::read_volatile((SCB_BASE + 0x28) as *const u32);
         let hfsr = core::ptr::read_volatile((SCB_BASE + 0x2C) as *const u32);
@@ -242,6 +329,7 @@ fn report_fault_registers() {
         if cfsr & CFSR_BFARVALID != 0 {
             write_fmt(format_args!("  BFAR 0x{:08x}\r\n", bfar));
         }
+        cfsr
     }
 }
 
@@ -259,28 +347,33 @@ fn terminate() -> ! {
 /// CFSR 原因位表: (掩码, 名称)
 ///
 /// MMFSR[7:0] + BFSR[15:8] + UFSR[24:16]
-const CFSR_BITS: [(u32, &str); 12] = [
+const CFSR_BITS: [(u32, &str); 14] = [
     (1 << 0, "IACCVIOL"),
     (1 << 1, "DACCVIOL"),
     (1 << 3, "MUNSTKERR"),
     (1 << 4, "MSTKERR"),
+    (1 << 5, "MLSPERR"),
     (1 << 8, "IBUSERR"),
     (1 << 9, "PRECISERR"),
     (1 << 10, "IMPRECISERR"),
     (1 << 11, "UNSTKERR"),
     (1 << 12, "STKERR"),
+    (1 << 13, "LSPERR"),
     (1 << 16, "UNDEFINSTR"),
     (1 << 17, "INVSTATE"),
     (1 << 18, "INVPC"),
 ];
 const CFSR_MMARVALID: u32 = 1 << 7;
-const CFSR_BFARVALID: u32 = 1 << 14;
+const CFSR_BFARVALID: u32 = 1 << 15;
+/// 异常帧可能没有完整生成或栈状态已不可信。
+const CFSR_UNRELIABLE_STACK: u32 =
+    (1 << 3) | (1 << 4) | (1 << 5) | (1 << 11) | (1 << 12) | (1 << 13);
 
 /// HFSR 原因位表
 const HFSR_BITS: [(u32, &str); 3] = [
-    (1 << 1, "VECTBL"),
+    (1 << 1, "VECTTBL"),
     (1 << 30, "FORCED"),
-    (1 << 31, "VECTTBL"),
+    (1 << 31, "DEBUGEVT"),
 ];
 
 /// 异常号 → 名称 (IPSR 值)
@@ -315,6 +408,24 @@ fn mrs_msp() -> u32 {
     let value: u32;
     unsafe {
         core::arch::asm!("mrs {}, msp", out(reg) value);
+    }
+    value
+}
+
+/// 读取 PSP。
+fn mrs_psp() -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!("mrs {}, psp", out(reg) value);
+    }
+    value
+}
+
+/// 读取 CONTROL (bit1=线程模式使用 PSP)。
+fn mrs_control() -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!("mrs {}, control", out(reg) value);
     }
     value
 }

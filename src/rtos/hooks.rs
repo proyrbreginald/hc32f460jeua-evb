@@ -7,7 +7,7 @@
 use crate::critical_section;
 use crate::critical_section::CriticalSection;
 use crate::rtos::klist::KCell;
-use crate::rtos::thread::Thread;
+use crate::rtos::thread::ThreadInner;
 
 /// Function invoked once per idle-loop iteration.
 pub type IdleHook = fn();
@@ -50,8 +50,10 @@ pub fn set_idle_hook(hook: Option<IdleHook>) {
 /// Install or remove the context-switch hook.
 ///
 /// Registration must be completed before [`crate::rtos::start`]. The hook
-/// executes in the scheduler's PRIMASK critical section and therefore must be
-/// bounded, non-blocking, and must not call blocking RTOS APIs.
+/// executes from PendSV on the main exception stack, after the old thread's
+/// PSP has been saved and before the new thread's PSP is restored. Interrupts
+/// are masked, so it must be bounded, non-blocking, and must not call blocking
+/// RTOS APIs.
 pub fn set_context_switch_hook(hook: Option<ContextSwitchHook>) {
     debug_assert!(
         !crate::rtos::scheduler_started(),
@@ -75,7 +77,7 @@ pub(crate) fn run_idle_hook() {
 ///
 /// `next` must point to a live TCB selected by the scheduler, and `cs` must be
 /// the token for the scheduler's active critical section.
-pub(crate) unsafe fn run_context_switch_hook(next: *mut Thread, cs: CriticalSection<'_>) {
+pub(crate) unsafe fn run_context_switch_hook(next: *mut ThreadInner, cs: CriticalSection<'_>) {
     let hook = unsafe { *CONTEXT_SWITCH_HOOK.get(cs) };
     if let Some(hook) = hook {
         let info = unsafe {
@@ -88,4 +90,21 @@ pub(crate) unsafe fn run_context_switch_hook(next: *mut Thread, cs: CriticalSect
         };
         hook(info);
     }
+}
+
+/// PendSV bridge for the optional context-switch hook.
+///
+/// The scheduler updates `CURRENT` and the pending target PSP atomically under
+/// PRIMASK. PendSV also runs with PRIMASK set, so `CURRENT` identifies the
+/// final target even when several scheduling requests were coalesced before
+/// PendSV ran.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn pendsv_run_context_switch_hook() {
+    critical_section::with(|cs| unsafe {
+        let next = crate::rtos::sched::current();
+        debug_assert!(!next.is_null(), "PendSV target thread must be set");
+        if !next.is_null() {
+            run_context_switch_hook(next, cs);
+        }
+    });
 }

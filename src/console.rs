@@ -28,9 +28,9 @@
 //!
 //! # 中断上下文
 //!
-//! 中断/定时器回调内**不可**调用加锁打印 (会挂起被打断的线程);
-//! 如需在中断中输出, 使用 [`write_fmt_raw`] (无锁, 输出可能与其他
-//! 上下文交错, 仅用于诊断)。内核 panic/fault 诊断即走该通道。
+//! 中断/定时器回调中的 `print!`/`println!` 自动退化为 [`write_fmt_raw`]
+//! (无锁，输出可能与线程交错)，不会尝试阻塞互斥量。内核 panic/fault
+//! 诊断也使用该通道。
 //!
 //! # 串口背压
 //!
@@ -57,7 +57,8 @@ static READY: AtomicBool = AtomicBool::new(false);
 
 /// 标记控制台就绪 (由应用在 UART 初始化完成后调用一次)
 pub fn mark_ready() {
-    READY.store(true, Ordering::Relaxed);
+    // 发布 UART 初始化在先、其他执行上下文观察 READY 在后的关系。
+    READY.store(true, Ordering::Release);
 }
 
 /// 向控制台输出格式化内容 (由 `print!` 宏调用)
@@ -69,19 +70,19 @@ pub fn mark_ready() {
 /// 避免在 `rtos::init()` 之前使用互斥量 (此时 `sched::current()`
 /// 为空, 内核阻塞原语不可用)。
 pub fn write_fmt(args: core::fmt::Arguments<'_>) {
-    if !READY.load(Ordering::Relaxed) {
+    if !READY.load(Ordering::Acquire) {
         return; // UART 未就绪: 静默丢弃, 防止 TXE 等待死循环
     }
     if crate::rtos::scheduler_started() {
-        // 中断上下文禁止加锁打印: 会挂起被打断的线程 (打印互斥量死锁)。
-        // 诊断输出请用 write_fmt_raw (无锁)。
-        debug_assert!(
-            !crate::critical_section::in_isr(),
-            "中断上下文不可加锁打印, 请使用 console::write_fmt_raw"
-        );
-        // RAII 守卫: 离开本函数作用域时自动释放打印锁,
-        // 忘解锁/重复解锁在类型层面被排除 (见 rtos::ipc::MutexGuard)
-        let _guard = PRINT_MUTEX.lock(Timeout::Forever).ok();
+        if crate::critical_section::in_isr() {
+            write_fmt_raw(args);
+            return;
+        }
+        // 只有确实取得 RAII 守卫后才输出。递归格式化等锁协议错误会
+        // 丢弃本次嵌套输出，而不是绕过锁破坏外层打印的原子性。
+        let Ok(_guard) = PRINT_MUTEX.lock(Timeout::Forever) else {
+            return;
+        };
         write_fmt_raw(args);
     } else {
         write_fmt_raw(args);
@@ -93,19 +94,21 @@ pub fn write_fmt(args: core::fmt::Arguments<'_>) {
 /// 内容与换行在同一把锁内完成, 任意时刻至多一个线程占用串口,
 /// 行与行之间不会交错。
 pub fn write_fmt_line(args: core::fmt::Arguments<'_>) {
-    if !READY.load(Ordering::Relaxed) {
+    if !READY.load(Ordering::Acquire) {
         return; // UART 未就绪: 静默丢弃, 防止 TXE 等待死循环
     }
     if crate::rtos::scheduler_started() {
-        // 同 write_fmt: 中断上下文不可加锁打印 (打印互斥量死锁)
-        debug_assert!(
-            !crate::critical_section::in_isr(),
-            "中断上下文不可加锁打印, 请使用 console::write_fmt_raw"
-        );
+        if crate::critical_section::in_isr() {
+            write_fmt_raw(args);
+            write_fmt_raw(core::format_args!("\r\n"));
+            return;
+        }
         // 内容与换行在同一守卫内完成 (RAII), 行与行之间不会交错;
         // 守卫析构前校验锁仍由当前线程持有 (正常情况下必然成立,
         // 作为打印路径回归的哨兵检查)
-        let guard = PRINT_MUTEX.lock(Timeout::Forever).ok();
+        let Ok(guard) = PRINT_MUTEX.lock(Timeout::Forever) else {
+            return;
+        };
         write_fmt_raw(args);
         debug_assert_eq!(
             PRINT_MUTEX.owner(),
@@ -124,6 +127,9 @@ pub fn write_fmt_line(args: core::fmt::Arguments<'_>) {
 ///
 /// 不获取打印锁, 不阻塞; 输出可能与其他上下文交错。
 pub fn write_fmt_raw(args: core::fmt::Arguments<'_>) {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
     let mut uart = ConsoleUart::take();
     let _ = core::fmt::write(&mut uart, args);
 }

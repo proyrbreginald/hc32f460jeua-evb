@@ -8,12 +8,13 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 
 - 零依赖裸机 Rust (edition 2024, `thumbv7em-none-eabihf`),无 PAC/HAL crate;
 - 寄存器级外设驱动:时钟 (XTAL+MPLL→200MHz,失败自动回退)、GPIO、SysTick、USART;
-- 全局堆分配器 (边界标记 + 首次适配,中断安全),支持 `Vec`/`Box`/`String`;
+- 全局堆分配器 (边界标记 + 首次适配,中断安全),完整支持 `Layout` 的任意
+  2 的幂对齐，并以 checked 算术拒绝越界布局，支持 `Vec`/`Box`/`String`;
 - **RTOS 内核**:32 级位图调度 + 时间片轮转、优先级继承互斥量、硬定时器、
   信号量/事件/邮箱/消息队列、线程生命周期与僵尸回收;
 - **原子打印**:打印锁 (优先级继承) 保证输出整行不交错,高优先级线程
   不会无界等待低优先级线程;
-- 完整的 panic/fault 诊断 (CFSR/HFSR 解码 + 栈回溯)。
+- 完整的 panic/fault 诊断 (CFSR/HFSR 解码 + 基本/浮点异常帧 + 安全栈回溯)。
 
 ## 工程配置 (.cargo/config.toml)
 
@@ -37,6 +38,9 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_SHELL_HISTORY_SIZE` | RAM 中保留的历史命令条数 (1~16，默认 8，复位后清空) |
 | `CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` / `CFG_NANO_MAX_BYTES` | nano 终端探测回退尺寸 / 单文件编辑上限 |
 | `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
+| `CFG_RTC_ENABLE` | RTC 与日志运行时长时间戳开关 |
+| `CFG_WDT_ENABLE` / `CFG_WDT_*` | WDT 开关 / supervisor 栈、最高优先级与喂狗周期 |
+| `CFG_MPU_ENABLE` | FLASH/SRAM/外设属性与线程栈守卫开关 |
 | `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
 
 约束:
@@ -45,7 +49,8 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 - UART/LED 的**端口类型** (PortA/PortC) 由 Rust 类型系统编码, 固定在
   `board.rs` 中, 引脚号/功能号等数值参数可在此配置; 引脚存在性仍由
   `Pin::new()` 编译期校验 (JEUA 封装引脚表);
-- `build.rs` 仅负责构建日期与 rustc 版本 (启动横幅显示用)。
+- `build.rs` 仅负责构建日期与 rustc 版本 (启动横幅显示用)；设置
+  `SOURCE_DATE_EPOCH` 可固定横幅中的 UTC 构建日期，非法值会使构建失败。
 
 ## 目录结构
 
@@ -54,13 +59,15 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 ```
 src/
 ├── main.rs            # 应用入口: 线程/定时器创建与板级资源编排
+├── lib.rs             # 可由主机测试的硬件无关算法入口
+├── heap_layout.rs     # 分配布局规划 (checked 对齐/溢出处理)
 ├── config.rs          # 编译期配置入口 (.cargo/config.toml [env] → 类型化常量)
 ├── board.rs           # BSP: 板载资源绑定与硬件初始化顺序
 ├── arch/              # CPU 原语 backend (当前为 Cortex-M)
 ├── banner.rs          # 启动横幅 (应用层): 块字符大标题 + 内核信息面板
-├── startup.rs         # 复位入口: SRAM 等待周期/FPU/.data/.bss → main
+├── startup.rs         # 两阶段复位入口: 无栈 SRAM3 配置 → Rust 初始化
 ├── vector_table.rs    # 复位/异常/144 外设中断向量表 + INT000~007 中断分发
-├── panic.rs           # panic 与硬件 fault 诊断 (CFSR/HFSR 解码, 栈回溯)
+├── panic.rs           # fault 帧校验、CFSR/HFSR 解码与安全栈回溯
 ├── critical_section.rs# PRIMASK 临界区 (嵌套安全, 中断安全的基础)
 ├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
 ├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
@@ -81,7 +88,6 @@ src/
 ├── shell/
 │   ├── editor.rs      # nano 风格 ANSI 全屏文本编辑器
 │   └── path.rs        # 固定容量 Linux 风格路径解析与当前目录维护
-├── build.rs           # 构建元数据 (日期/rustc 版本, 供启动横幅使用)
 └── rtos/              # RTOS 内核 (RT-Thread 架构移植, 不依赖应用模块)
     ├── mod.rs         # 公共 API: init/start/tick/thread_create 等
     ├── klist.rs       # 侵入式链表 + container_of 宏 (rt_list 移植)
@@ -90,14 +96,30 @@ src/
     ├── timer.rs       # 有序链表硬定时器 (tick 回绕安全)
     ├── ipc.rs         # 信号量/互斥量(优先级继承)/事件/邮箱/消息队列
     ├── idle.rs        # 空闲线程 (wfi) + 僵尸线程回收
-    ├── hooks.rs       # idle/context-switch 静态集成 hook
-    └── context.rs     # Cortex-M4 PendSV 上下文切换汇编 (含 FPU)
+    ├── hooks.rs       # 通用 idle/context-switch hook (MPU 使用后者)
+    └── context.rs     # Cortex-M4F PendSV 上下文切换汇编 (惰性 FPU 上下文)
+
+build.rs               # 构建元数据 (日期/rustc 版本, 供启动横幅使用)
 ```
 
 文件系统算法位于独立的 `no_std` workspace crate：
 
 ```text
 crates/littlefs/  # 块设备/磁盘格式 + 文件/目录/原子快照操作
+```
+
+## 堆布局与主机测试
+
+`heap.rs` 在每个返回 payload 前保存所属分配块的地址，因此即使高对齐请求
+在块头后产生 padding，释放时仍能准确找回边界标记。地址、大小、padding
+和块尾计算均使用 checked 算术；布局无法完整落入空闲块时返回 null。
+
+硬件无关的布局规划位于 `src/heap_layout.rs`，主机测试覆盖 1B 到 4096B
+的代表性二次幂对齐、高对齐 padding、空间不足/整数溢出以及零大小布局。
+它验证的是布局算法，不替代目标板上对完整链表分配器和临界区的测试：
+
+```bash
+cargo test --workspace --target x86_64-unknown-linux-gnu
 ```
 
 ## 时钟管理 (clk, CMU 模块)
@@ -124,8 +146,8 @@ crates/littlefs/  # 块设备/磁盘格式 + 文件/目录/原子快照操作
   `pclk4_hz` / `exclk_hz` (对齐 DDL `CLK_GetBusClockFreq`);
 - MCO1 时钟输出 (PA8): `mco1_config(source, div)` + `mco1_cmd`,
   用于示波器/频率计测量 (对齐 DDL `CLK_MCOConfig`/`CLK_MCOCmd`);
-- MPLL 参数编译期校验: 寄存器位宽 + 有效倍频/分频范围 + XTAL 源下
-  VCO 输入 (1~25MHz) 与输出 (240~480MHz) 范围;
+- MPLL 参数编译期校验: 寄存器位宽 + 有效倍频/分频范围 + XTAL/HRC
+  两种源下的 VCO 输入 (1~25MHz) 与输出 (240~480MHz) 范围;
 - 所有 CMU 寄存器偏移已与 DDL v3.3.0 头文件逐项核对一致。
 
 ## 中断系统 (intc + vector_table)
@@ -138,7 +160,7 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
   共 144 条) → ISER/IPR 使能/优先级;
 - **注册 API** (`src/intc.rs`): `intc::register(源, 线, 优先级, 回调)`
   一步完成 路由+装回调+清挂起+设优先级+使能 (对齐 DDL 例程流程);
-  失败返回 `IrqError::LineTaken` (线被其他源占用); `unregister` 逆操作;
+  失败返回占用、事件源范围或 NVIC 优先级错误，且不留下半注册状态;
 - **事件源常量** `intc::src::*`: USART1~4 全部事件 (EI/RI/TI/TCI/RTO,
   USART1=278~282, 每单元 +5)、EIRQ0~15、TIM0/TIM6_1~3/TMRA、DMA、RTC、
   USBFS、I2C、CMP、LVD、ADC、TRNG、EFM、WDT 等;
@@ -289,8 +311,10 @@ PE/FE/ORE，编辑器会锁存 `INPUT LOST` 并禁止本会话保存，避免缺
 - **错误检测**: 奇偶/ECC 错误经 NMI 上报 (CKCR.PYOAD/ECCOAD 可改复位),
   `error()` 查询 / `clear_status()` 清除 / `set_fault_action()` 配置动作 /
   `set_ecc_mode()` 配置 SRAM3 ECC 模式;
-- 启动阶段 (`startup.rs`) 的 SRAM3 配置保持**内联** (栈未建立不能调用
-  函数), 与 DDL `SetSRAM3Wait` 逐字节一致;
+- 启动阶段 (`startup.rs`) 先进入无函数序言、无栈访问的汇编入口，配置
+  SRAM3 等待周期、回读确认并执行 `DSB`/`ISB`，随后才启用 FPU/惰性
+  上下文并跳入 Rust；回读失败会在使用 SRAM3 栈前 fail-stop。该寄存器
+  序列与 DDL `SetSRAM3Wait` 一致;
 - 寄存器写保护: WTPR/CKPR 键值 0x77 解锁 / 0x76 锁定。
 
 ## CRC 硬件加速器 (crc)
@@ -317,7 +341,8 @@ PE/FE/ORE，编辑器会锁存 `INPUT LOST` 并禁止本会话保存，避免缺
 - 时钟源: **LRC** (内部 32.768kHz, 无外部器件, 默认; JEUA 48pin 无
   XTAL32 引脚对) / XTAL32 (需自行启动晶振);
 - 时间/日期寄存器 **BCD** 编码, 24/12 小时制可配; 读/写自动进出
-  **RW 模式** (CR2.RWREQ/RWEN); `set_time`/`get_time`/`set_date`/`get_date`;
+  **RW 模式** (CR2.RWREQ/RWEN); `set_time`/`get_time`/`set_date`/`get_date`
+  返回 `Result`，硬件状态切换超时不会被静默忽略；完整事务由临界区串行化;
 - 周期中断: 0.5s/1s/1min/1hour/1day/1month (CR1.PRDS);
 - 闹钟: 时+分匹配 + 星期位掩码 (0x7F=每天), 事件源 `intc::src::RTC_ALM`
   (81) / `RTC_PRD` (82);
@@ -331,17 +356,32 @@ PE/FE/ORE，编辑器会锁存 `INPUT LOST` 并禁止本会话保存，避免缺
 
 ```
 reset_handler (startup.rs)
- ├─ SRAMC 等待周期 / FLASH 等待周期 / FPU 使能
- ├─ .data 拷贝 / .bss 清零
- └─ main
-     ├─ Board::init()              # 时钟/MPU/GPIO/SysTick/UART/RTC
-     ├─ rtos::init()               # PendSV/SysTick 优先级 + 空闲线程
-     ├─ rtos::thread_create(...)   # 创建 LED / Shell 线程
-     └─ rtos::start()              # 首次切换, 永不返回
-         └─ shell_entry
-             ├─ filesystem::start  # 挂载；仅全擦除的新分区自动格式化
-             └─ login / 命令循环
+ ├─ 无栈汇编: SRAM3 等待周期 → DSB / ISB
+ └─ reset_handler_rust
+     ├─ FLASH 等待周期 / FPU 使能
+     ├─ .data 拷贝 / .bss 清零 / 主栈 canary
+     └─ main
+         ├─ Board::init()              # 时钟/MPU/GPIO/SysTick/UART/RTC
+         ├─ rtos::init()               # PendSV/SysTick 优先级 + 空闲线程
+         ├─ rtos::thread_create(...)   # 创建 LED / Shell 线程
+         └─ rtos::start()              # 首次切换, 永不返回
+             └─ shell_entry
+                 ├─ filesystem::start  # 挂载；仅全擦除的新分区自动格式化
+                 └─ login / 命令循环
 ```
+
+复位向量的第一阶段不能使用普通 Rust 函数：复位时 MSP 已位于 SRAM3，而
+SRAM3 的安全等待周期尚未建立，编译器生成的函数序言可能在第一条业务指令
+前压栈。只有完成寄存器配置和屏障后，第二阶段才允许使用栈及 Rust 代码。
+
+## Panic / Fault 诊断
+
+fault 汇编入口在生成任何 Rust 函数序言前捕获 `IPSR`、`EXC_RETURN` 和
+现场 `r7`，按 `EXC_RETURN.bit2` 选择 MSP 或 PSP，并按 bit4 定位基本帧
+或 FP 扩展帧后的基本寄存器区。读取前会验证 `EXC_RETURN` 编码、地址范围、
+对齐和加法溢出；CFSR 指示压栈/出栈错误时不读取不可信帧。帧指针回溯只沿
+向更高地址单调前进且完全位于 SRAM 的链继续，返回地址还必须落在 Flash
+Thumb 代码范围内。
 
 ## RTOS 内核
 
@@ -354,7 +394,7 @@ reset_handler (startup.rs)
 | `idle.c`/`defunct.c` | `idle` | 空闲线程 + 僵尸回收 |
 | `timer.c` | `timer` | 有序链表硬定时器 |
 | `ipc.c` | `ipc` | 信号量/互斥量/事件/邮箱/消息队列 |
-| `context_gcc.S` | `context` | PendSV 上下文切换 (PSP + FPU) |
+| `context_gcc.S` | `context` | PendSV 上下文切换 (PSP + M4F 惰性 FPU 上下文) |
 
 ### 使用流程
 
@@ -369,41 +409,69 @@ rtos::start();                      // 4. 启动调度器 (永不返回)
 extern "C" fn led_thread(_p: usize) {
     loop {
         board::BoardResources::get().toggle_led();
-        rtos::thread_delay_ms(500);
+        rtos::thread_delay_ms(500).expect("LED 延时必须在线程上下文");
     }
 }
 ```
 
 - 优先级:0(最高)~ 31(最低,空闲线程);时间片单位 = 节拍,实际时长由
   `CFG_TICKS_PER_SEC` 决定;
-- `thread_delay_ms` / `Timer::start_ms` 将非零毫秒向上取整到至少 1 tick;
-  `Timer::start` 等原始接口仍以 tick 为单位;
+- `thread_delay` / `thread_delay_ms` / `yield_now` 返回 `Result<(), Error>`：
+  调度器启动前返回 `KernelNotStarted`，中断上下文返回 `InterruptContext`；
+  `thread_delay_ms` / `Timer::start_ms` 将非零毫秒向上取整到至少 1 tick，
+  `Timer::start` 等原始接口仍以 tick 为单位；零延时定时器在下一 tick
+  触发，所有有限延时钳位到回绕安全的 `i32::MAX` tick;
 - 线程栈由堆分配,打印线程建议 ≥2KB (debug 构建下格式化打印栈消耗较大),
   调度器在每次切换时检测栈溢出;
-- 阻塞 API:线程上下文使用;中断上下文仅可用非阻塞调用
-  (`Timeout::Ticks(0)` 探测、`release`/`send`/`unlock`、`Timer::start/stop`);
-- 内核对象 (`Semaphore`/`Mutex`/`Event`/`Mailbox`/`MessageQueue`/`Timer`)
-  可作 `static` 常量构造,启动后不可移动。
+- 带 `Timeout` 且返回 `Result` 的 IPC 操作要求调度器已经启动，否则返回
+  `KernelNotStarted`；ISR 中只允许 `Timeout::Ticks(0)` 非阻塞探测，任何
+  可能阻塞的 timeout 返回 `InterruptContext`。`release`/事件 `send` 等
+  唤醒操作及 `Timer::start/stop` 可在 ISR 使用，定时器回调本身也不得阻塞;
+- `Thread` 是不可变 `Arc` 外壳加唯一的 `UnsafeCell<ThreadInner>` 可变存储。
+  TCB 字段和侵入式链表只在单核关中断临界区访问，公共句柄不暴露内部引用；
+  `kernel_self` 在原始指针、链表节点和线程内建定时器仍活动时维持 TCB 存活。
+  `unsafe Thread::force_delete` 会跳过目标 Rust 栈析构，仅能用于已证明无
+  活动借用、守卫或待析构资源的线程；常规停止应由入口协作返回;
+- `Timer` 的节点会进入全局侵入式链表，因此类型为 `!Unpin`，公开
+  `start/start_ms/stop/is_active` 均要求 `Pin<&Timer>`。静态对象使用
+  `pin_static()`，堆对象使用 `Box::pin`；`Drop` 会在临界区内自动摘链，
+  防止释放后遗留悬垂节点。其他 IPC 对象可按普通 Rust 所有权规则使用;
+- PendSV 逐线程保存 `r4-r11` 和 `EXC_RETURN`；bit4 为 0 时再保存
+  `d8-d15`，硬件扩展帧负责 `s0-s15/FPSCR`。新线程以
+  `0xffff_fffd` 基本帧启动，未使用 FPU 的线程不承担浮点保存开销。
 
 ### IPC 速查
 
-- **阻塞语义对齐 RT-Thread**: 所有阻塞等待 (take/lock/send/recv) 在唤醒后
-  **回到临界区重新检查条件**再完成操作 —— 满邮箱的发送者被取走后不丢
-  消息, 空队列的接收者被发送后不假超时 (selftest 含阻塞唤醒回归项);
+- **阻塞语义对齐 RT-Thread**：Semaphore 唤醒即转移 token，Mutex 唤醒即
+  转移所有权；Mailbox/MessageQueue 的发送与接收在唤醒后回到临界区重查
+  环形缓冲或空闲块，避免满队列发送丢消息和空队列接收假超时;
+- `Timeout::Forever` 使用独立枚举分支，不再与 `u32::MAX` 共用哨兵；
+  `Ticks(u32::MAX)` 仍是有限等待，并钳位到定时器半周期;
 
 ```rust
 static SEM: Semaphore = Semaphore::new(0, 1);
-static MUT: Mutex = Mutex::new();                 // 优先级继承
+static MUT: Mutex<u32> = Mutex::new(0);           // 优先级继承 + RAII guard
 static EVT: Event = Event::new();
-static MB: Mailbox = Mailbox::new(4);             // 机器字消息
+static MB: Mailbox<usize> = Mailbox::new(4);      // 类型安全的机器字消息
 static MQ: MessageQueue = MessageQueue::new(32, 4);
 
-SEM.take(Timeout::Forever);    SEM.release();
-MUT.lock(Timeout::Forever);    MUT.unlock();
-EVT.send(0x01);
-EVT.recv(0x01, EventOpt::OrClear, Timeout::Ticks(3000));
-MB.send(42usize, Timeout::Forever);  MB.recv(Timeout::Forever);
-MQ.send(b"hi", Timeout::Forever);    MQ.recv(&mut buf, Timeout::Forever);
+fn use_ipc() -> Result<(), Error> {
+    SEM.take(Timeout::Forever)?;
+    SEM.release();
+
+    let mut guard = MUT.lock(Timeout::Forever)?;
+    *guard += 1;
+    drop(guard); // 自动解锁；不能跨线程移动或重复解锁
+
+    EVT.send(0x01);
+    let _flags = EVT.recv(0x01, EventOpt::OrClear, Timeout::Ticks(3000))?;
+    MB.send(42, Timeout::Forever)?;
+    let _message = MB.recv(Timeout::Forever)?;
+    MQ.send(b"hi", Timeout::Forever)?;
+    let mut buf = [0u8; 32];
+    let _len = MQ.recv(&mut buf, Timeout::Forever)?;
+    Ok(())
+}
 ```
 
 ### 打印系统 (console)
@@ -428,13 +496,18 @@ MQ.send(b"hi", Timeout::Forever);    MQ.recv(&mut buf, Timeout::Forever);
 ```bash
 cargo build                          # debug 构建
 cargo build --release                # release 构建
+SOURCE_DATE_EPOCH=1767225600 cargo build --release # 固定横幅 UTC 构建日期
 cargo run                            # 构建 + 烧录 (pyocd, 见 scripts/flash.sh)
 ```
 
+`SOURCE_DATE_EPOCH` 只固定 `build.rs` 注入的横幅日期；完整 bit-for-bit
+可复现构建仍要求相同的 Rust 工具链、目标、链接器、配置和其他构建输入。
+
 `debug` 构建默认已启用 `opt-level = 1` (见 `Cargo.toml` `[profile.dev]`):
-保持可调试性 (debuginfo/帧指针/栈回溯不变) 的同时, 固件 flash 占用约为
-无优化时的 60% (~61KB, 可换 `"s"` 再降 ~8%); `release` 构建采用
-`opt-level = "z"` (体积优先), 固件 ~37KB。
+保留 debuginfo、帧指针和 panic 栈回溯所需信息；`release` 构建采用
+`opt-level = "z"` (体积优先)。当前工具链下 `arm-none-eabi-size` 测得
+`text + data` 分别约为 153.3KiB (debug) 和 96.5KiB (release)；具体结果会随
+Rust/LLVM 版本与功能增减而变化。
 
 ### 烧录 (pyocd)
 
@@ -612,15 +685,15 @@ python3 -m venv .venv && .venv/bin/pip install pyocd
 
 - banner 移出 `rtos` 内核 (应用层 `src/banner.rs`), 内核不再依赖
   `clk`/`heap` 等应用模块;
-- `klist.rs` 新增 `container_of!` 宏与 `KCell::get_mut`, 统一 5 处
-  "链表节点 → 内核对象" 转换 (thread/timer/ipc/idle);
+- `klist.rs` 新增 `container_of!` 宏，统一链表节点到内核对象的受审计转换；
+  链表遍历在临界区内只保留一个可变访问路径，避免重叠借用;
 - `thread.rs` 提取公共辅助: `wakeup_thread` (唤醒统一路径) /
   `resched_needed` (优先级抢占判定) / `blocked_wait` (阻塞恢复判定),
   消除 `ipc.rs` 6 处重复的"调度 + 超时检查"模式与 3 处唤醒序列;
 - `timer::check` 在临界区内完成摘链与状态迁移,退出临界区后执行 ISR
   回调;回调返回后不再解引用定时器,兼顾对象生命周期与中断延迟;
-- RTOS 的 idle/context-switch 静态 hook 将 WDT/MPU 策略移到 BSP,
-  内核调度路径不再反向依赖具体设备;
+- RTOS 的 context-switch hook 将 MPU 栈守卫策略移到 BSP；WDT 则由 BSP
+  创建最高优先级 supervisor 周期喂狗，二者均不让内核反向依赖设备;
 - `context.rs` 统一寄存器写入辅助; 全项目修复历史 clippy 警告,
   当前 0 警告 0 错误。
 
@@ -629,8 +702,8 @@ python3 -m venv .venv && .venv/bin/pip install pyocd
 - **浮点格式化崩溃**: `core` 的浮点格式化 (flt2dec/dragon) 在
   no_std 裸机环境下导致内存破坏 (表现为系统崩溃/输出垃圾字节)。
   `free` 命令改用整数百分比计算, 完全规避浮点格式化;
-- **静态链表写入被消除**: 静态对象的 `KCell` 链表写入 (thread_create
-  的线程登记) 曾因"写后无读"被编译器判定为死存储而消除 (ps 列表为空),
-  通过 `get_mut` + volatile 读屏障强制保留;
+- **线程内部可变性收敛**：`Arc<Thread>` 只公开不可变外壳，全部 TCB
+  可变字段集中在唯一 `UnsafeCell<ThreadInner>`，并由单核关中断临界区
+  串行化；不再依赖 volatile 读屏障维持静态链表写入;
 - **RX 输入中断驱动化**: read_line 从 5ms 轮询改为信号量阻塞等待;
   UART ISR 经 OS 无关 notifier 唤醒 RTOS adapter,消除裸驱动对内核的依赖。

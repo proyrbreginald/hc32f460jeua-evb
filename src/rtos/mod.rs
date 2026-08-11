@@ -106,7 +106,6 @@ pub fn start() -> ! {
     let first = critical_section::with(|cs| unsafe {
         let first = sched::highest_ready_thread(cs).expect("rtos::start: 没有可运行的线程");
         sched::set_current(first);
-        hooks::run_context_switch_hook(first, cs);
         first
     });
     unsafe {
@@ -135,7 +134,9 @@ pub use hooks::{
     ContextSwitchHook, ContextSwitchInfo, IdleHook, set_context_switch_hook, set_idle_hook,
 };
 #[allow(unused_imports)]
-pub use ipc::{Error, Event, EventOpt, Mailbox, MessageQueue, Mutex, MutexGuard, Semaphore, Timeout};
+pub use ipc::{
+    Error, Event, EventOpt, Mailbox, MessageQueue, Mutex, MutexGuard, Semaphore, Timeout,
+};
 #[allow(unused_imports)]
 pub use thread::{
     Thread, ThreadInfo, thread_create, thread_delay, thread_delay_ms, thread_info_list,

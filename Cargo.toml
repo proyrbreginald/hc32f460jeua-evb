@@ -18,16 +18,13 @@ bench = false        # 禁用基准测试
 littlefs = { package = "hc32-littlefs", path = "crates/littlefs" }
 
 [profile.dev]
-# 默认 opt-level=0 时无任何优化, debug 固件 flash 占用约 2 倍于 release
-# (格式化/字符串/泛型单态化等代码全部原样保留)。
-# opt-level=1 在保持可调试性 (debuginfo 不变, 帧指针由 rustflags 强制保留,
-# panic 栈回溯仍有效) 的前提下, 固件从 ~104KB 降到 ~61KB。
-opt-level = 1 # "s" 可再降到 ~56KB, 但调试跳步/变量可见性略差
+# 轻量优化，同时保留 debuginfo、帧指针和 panic 栈回溯所需信息。
+# 当前 `arm-none-eabi-size` 的 text+data 约为 153.3KiB；结果会随工具链变化。
+opt-level = 1
 panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开
 
 [profile.release]
-# 体积优先 (对串口/RTOS 类负载无感): ~53KB → ~39KB (-28%)。
-# 实测本工程 (单 crate, 无外部依赖): LTO 无收益甚至更差, cgu=1 仅 -3% 且拖慢编译,
-# 均不启用。opt-level="s" 反而更大 (~57KB, 内联策略差异), 保持 "z"。
-opt-level = "z" # 若需兼顾速度可改 "s" (~57KB, 更大)
+# 体积优先；当前 `arm-none-eabi-size` 的 text+data 约为 96.5KiB。
+# 对性能敏感的版本应在真机基准后再改用 opt-level=2/3。
+opt-level = "z"
 panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开

@@ -13,7 +13,6 @@ const TAB_WIDTH: usize = 4;
 const ESCAPE_TIMEOUT_MS: u32 = 25;
 const CRLF_TIMEOUT_MS: u32 = super::INPUT_CRLF_TIMEOUT_MS;
 const INPUT_BATCH_TIMEOUT_MS: u32 = 10;
-const INPUT_YIELD_INTERVAL: usize = 128;
 const TERMINAL_PROBE_TIMEOUT_MS: u32 = 200;
 const TERMINAL_PROBE_MAX_BYTES: usize = 128;
 const CURSOR_REPORT_CAPACITY: usize = 32;
@@ -176,7 +175,6 @@ pub(super) fn run(state: &mut ShellState, name: &str) {
         print!("{}", Frame { editor: &editor });
 
         let mut key = keys.read();
-        let mut processed = 0usize;
         loop {
             if uart_input_lost(uart) {
                 editor.input_lost = true;
@@ -207,10 +205,6 @@ pub(super) fn run(state: &mut ShellState, name: &str) {
 
             if uart_input_lost(uart) {
                 editor.input_lost = true;
-            }
-            processed += 1;
-            if crate::config::WDT_ENABLE && processed.is_multiple_of(INPUT_YIELD_INTERVAL) {
-                crate::rtos::thread_delay_ms(1);
             }
             let Some(next) = keys.read_timeout(INPUT_BATCH_TIMEOUT_MS) else {
                 break;

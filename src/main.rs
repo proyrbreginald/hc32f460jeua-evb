@@ -19,6 +19,7 @@ mod board;
 mod arch; // CPU 架构原语 facade (PRIMASK / WFI / DSB / 系统复位)
 mod critical_section; // PRIMASK 临界区 + 中断上下文检测 (ISR 误用防护)
 mod heap; // 全局堆分配器 (边界标记 + 首次适配)
+mod heap_layout; // 堆分配布局规划 (纯逻辑, 可在主机测试)
 mod panic; // panic/fault 诊断: 寄存器解码 + 栈回溯 + 停机/复位策略
 mod startup; // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
 mod vector_table; // 复位/异常/144 外设中断向量表 (原子回调槽)
@@ -32,7 +33,7 @@ mod intc; // 中断控制器: 事件源→SEL→NVIC 路由 + 注册 API
 mod mpu; // 内存保护单元: FLASH 只读 + SRAM/外设 XN + 线程栈守卫
 mod rtc; // 实时时钟 (RTC): LRC 源/时间日期/闹钟, 日志时间戳
 mod sram; // 片内 SRAM (SRAMC): 等待周期/奇偶·ECC 错误检测
-mod wdt; // 硬件看门狗 (WDT): 空闲线程喂狗, 溢出复位
+mod wdt; // 硬件看门狗 (WDT): 高优先级 supervisor 周期喂狗
 
 // ---- 外设驱动 ----
 mod can; // CAN 控制器: CAN2.0B, 位时间计算, 回环自测支持
@@ -103,7 +104,7 @@ pub(crate) fn main() -> ! {
 
     // 周期定时器 (回调在中断上下文执行)
     static TIMER: rtos::Timer = rtos::Timer::new();
-    TIMER.start_ms(
+    TIMER.pin_static().start_ms(
         config::APP_TIMER_PERIOD_MS,
         config::APP_TIMER_PERIOD_MS,
         timer_cb,
@@ -113,8 +114,8 @@ pub(crate) fn main() -> ! {
     // 使能控制台 UART 接收中断 (NVIC 线/优先级来自 .cargo/config.toml)
     resources.enable_console_rx_interrupt();
 
-    // 硬件看门狗 (CFG_WDT_ENABLE): 立即启动计数, 由空闲线程每节拍喂狗;
-    // 任意线程死循环/死锁 → ~2.7s 后硬件复位
+    // 硬件看门狗 (CFG_WDT_ENABLE): 启动计数并创建最高优先级 supervisor;
+    // 合法长输出不会因 idle 饥饿误复位，调度/节拍停滞仍会触发硬件复位。
     resources.start_watchdog();
 
     // 内核启动横幅 (创建线程后、启动前, 就绪统计包含所有线程;
@@ -141,7 +142,7 @@ extern "C" fn led_thread(_param: usize) {
         board::BoardResources::get().toggle_led();
         // debug 级: 默认阈值 (info) 不输出, 可经 `log level debug` 打开
         log_debug!("LED 翻转, uptime = {} ms", rtos::uptime_ms());
-        rtos::thread_delay_ms(config::APP_LED_BLINK_MS);
+        rtos::thread_delay_ms(config::APP_LED_BLINK_MS).expect("LED 延时必须在线程上下文");
     }
 }
 

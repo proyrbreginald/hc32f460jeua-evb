@@ -43,12 +43,9 @@ impl Board {
     ///
     /// 顺序保持为：时钟 -> MPU -> GPIO -> SysTick -> UART -> RTC。
     pub fn init(self) -> &'static BoardResources {
-        let _ = crate::clk::init();
-        crate::log_debug!(
-            "时钟: {} Hz (源 {:?})",
-            crate::clk::system_clock_hz(),
-            crate::config::CLOCK_SOURCE
-        );
+        // 振荡器/PLL 失败时硬件仍保持或回退到可用源。先保存结果，等
+        // UART 就绪后报告，后续外设一律按实际时钟计算分频。
+        let clock_error = crate::clk::init().err();
 
         if crate::config::MPU_ENABLE {
             crate::mpu::init();
@@ -88,6 +85,31 @@ impl Board {
             })
             .expect("UART 初始化失败!");
         crate::console::mark_ready();
+        let active_clock = crate::clk::active_clock_source();
+        let active_name = active_clock
+            .map(crate::clk::ClockSource::name)
+            .unwrap_or("unknown");
+        if let Some(error) = clock_error {
+            crate::log_warn!(
+                "系统时钟初始化失败 ({:?})，继续使用实际源 {} @ {} Hz",
+                error,
+                active_name,
+                crate::clk::system_clock_hz()
+            );
+        } else if active_clock != Some(crate::config::CLOCK_SOURCE) {
+            crate::log_warn!(
+                "系统时钟已从配置源 {} 回退到 {} @ {} Hz",
+                crate::config::CLOCK_SOURCE.name(),
+                active_name,
+                crate::clk::system_clock_hz()
+            );
+        } else {
+            crate::log_debug!(
+                "时钟: {} Hz (实际源 {})",
+                crate::clk::system_clock_hz(),
+                active_name
+            );
+        }
         crate::log_debug!(
             "控制台 UART: USART{} {} bps (过采样 {:?}, 分频 {:?})",
             crate::config::UART_UNIT,
@@ -101,20 +123,23 @@ impl Board {
                 clock_src: crate::rtc::ClockSource::Lrc,
                 hour_format: crate::rtc::HourFormat::H24,
                 int_period: crate::rtc::IntPeriod::Sec,
-            });
+            })
+            .expect("RTC 初始化超时");
             crate::rtc::set_date(crate::rtc::Date {
                 year: 0,
                 month: 1,
                 day: 1,
                 weekday: 6,
-            });
+            })
+            .expect("RTC 日期写入超时");
             crate::rtc::set_time(crate::rtc::Time {
                 hour: 0,
                 minute: 0,
                 second: 0,
                 pm: false,
-            });
-            crate::rtc::start();
+            })
+            .expect("RTC 时间写入超时");
+            crate::rtc::start().expect("RTC 启动超时");
             crate::log_info!("RTC 已启动 (LRC 源, 24H), 日志时间戳生效 [天:时:分:秒]");
         }
 
@@ -170,20 +195,54 @@ impl BoardResources {
     /// 按编译期配置启动硬件看门狗。
     pub fn start_watchdog(&self) {
         if crate::config::WDT_ENABLE {
+            assert!(
+                !crate::rtos::scheduler_started(),
+                "WDT supervisor 必须在调度器启动前创建"
+            );
+
+            let pclk3_hz = crate::clk::pclk3_hz();
+            let timeout_us = crate::wdt::DEFAULT
+                .timeout_us(pclk3_hz)
+                .expect("WDT 配置非法或 PCLK3 未运行");
+            let feed_us = u64::from(crate::config::WDT_FEED_INTERVAL_MS) * 1_000;
+            assert!(
+                feed_us * 4 <= timeout_us,
+                "WDT 喂狗周期必须至少保留 4 倍超时余量"
+            );
+
+            // 先确保 supervisor 的全部内存资源可用。线程在 rtos::start
+            // 前不会运行，因此随后配置硬件并首次喂狗不存在并发窗口。
+            let _ = crate::rtos::thread_create(
+                "watchdog",
+                crate::config::WDT_STACK_SIZE,
+                crate::config::WDT_PRIORITY,
+                0,
+                watchdog_supervisor,
+                0,
+            );
             crate::wdt::init(crate::wdt::DEFAULT);
             crate::wdt::feed();
-            crate::rtos::set_idle_hook(Some(feed_watchdog));
-            crate::log_debug!("WDT: 已启动 (溢出 ≈2.7s, 空闲线程喂狗)");
+            crate::log_debug!(
+                "WDT: 已启动 (PCLK3 {} Hz, 超时 {}ms, supervisor 每 {}ms 喂狗)",
+                pclk3_hz,
+                timeout_us / 1_000,
+                crate::config::WDT_FEED_INTERVAL_MS
+            );
         }
     }
 }
 
-/// RTOS 上下文切换 hook：将 MPU 栈守卫切换到即将运行的线程。
+/// PendSV 上下文切换 hook：旧 PSP 保存后切换即将运行线程的 MPU 守卫。
 fn apply_thread_memory_protection(next: crate::rtos::ContextSwitchInfo) {
     crate::mpu::set_thread_guard(next.guard_base);
 }
 
-/// RTOS idle hook：证明调度器仍可运行后喂硬件看门狗。
-fn feed_watchdog() {
-    crate::wdt::feed();
+/// 最高优先级 WDT supervisor：周期休眠，避免合法的长时间轮询输出因
+/// idle 无法运行而误触发复位，同时验证 SysTick/PendSV 仍可调度线程。
+extern "C" fn watchdog_supervisor(_param: usize) {
+    loop {
+        crate::wdt::feed();
+        crate::rtos::thread_delay_ms(crate::config::WDT_FEED_INTERVAL_MS)
+            .expect("WDT supervisor 必须在线程上下文运行");
+    }
 }

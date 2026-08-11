@@ -13,7 +13,7 @@ use crate::rtos::{EventOpt, Timeout};
 /// 被删除的线程: 空转等待删除
 extern "C" fn victim_thread(_param: usize) {
     loop {
-        crate::rtos::thread_delay_ms(50);
+        crate::rtos::thread_delay_ms(50).expect("selftest 延时必须在线程上下文");
     }
 }
 
@@ -179,7 +179,11 @@ pub(crate) fn run() {
     check(
         g3.is_ok() && val == Ok(0x5A5A_5A5A),
         "互斥量: 释放后可重新获取且数据保留",
-        format_args!("释放后 lock(0) = {:?}, data = {:#010X}", g3, val.unwrap_or(0)),
+        format_args!(
+            "释放后 lock(0) = {:?}, data = {:#010X}",
+            g3,
+            val.unwrap_or(0)
+        ),
     );
     drop(g3);
 
@@ -277,7 +281,7 @@ pub(crate) fn run() {
 
     // 延时: uptime 前进
     let t0 = crate::rtos::uptime_ms();
-    crate::rtos::thread_delay_ms(20);
+    crate::rtos::thread_delay_ms(20).expect("selftest 延时必须在线程上下文");
     let t1 = crate::rtos::uptime_ms();
     check(
         t1 >= t0 + 20,
@@ -285,18 +289,22 @@ pub(crate) fn run() {
         format_args!("延时 20ms, 实际 {}ms", t1 - t0),
     );
 
-    // 线程删除 (delete API) 与自然退出 (defunct 回收)
+    // 线程强制删除与自然退出 (defunct 回收)
     if !aborted.get() {
         crate::log_debug!("[selftest] 创建 victim 线程");
         let victim = crate::rtos::thread_create("victim", 1024, 24, 0, victim_thread, 0);
         crate::log_debug!("[selftest] victim 已创建, 延时 50ms");
-        crate::rtos::thread_delay_ms(50);
-        crate::log_debug!("[selftest] 调用 victim.delete()");
-        victim.delete();
-        crate::log_debug!("[selftest] delete() 已返回, 延时 50ms");
-        crate::rtos::thread_delay_ms(50);
+        crate::rtos::thread_delay_ms(50).expect("selftest 延时必须在线程上下文");
+        crate::log_debug!("[selftest] 调用 victim.force_delete()");
+        // victim 入口只执行延时循环，不持有借用、守卫或需析构资源，
+        // 满足强制删除跳过栈析构的安全前提。
+        unsafe { victim.force_delete() }.expect("selftest 只能在线程上下文强制删除 victim");
+        crate::log_debug!("[selftest] force_delete() 已返回, 延时 50ms");
+        crate::rtos::thread_delay_ms(50).expect("selftest 延时必须在线程上下文");
         // 可观测断言: victim 已从线程列表消失
-        let gone = !crate::rtos::thread_info_list().iter().any(|t| t.name == "victim");
+        let gone = !crate::rtos::thread_info_list()
+            .iter()
+            .any(|t| t.name == "victim");
         check(
             gone,
             "线程删除: victim 已删除并从列表消失",
@@ -304,8 +312,10 @@ pub(crate) fn run() {
         );
         crate::log_debug!("[selftest] 创建 exit-me 线程");
         crate::rtos::thread_create("exit-me", 1024, 25, 0, exit_thread, 0);
-        crate::rtos::thread_delay_ms(100);
-        let gone = !crate::rtos::thread_info_list().iter().any(|t| t.name == "exit-me");
+        crate::rtos::thread_delay_ms(100).expect("selftest 延时必须在线程上下文");
+        let gone = !crate::rtos::thread_info_list()
+            .iter()
+            .any(|t| t.name == "exit-me");
         check(
             gone,
             "线程退出: 入口返回后经 defunct 回收",
@@ -321,7 +331,7 @@ pub(crate) fn run() {
         for slot in &mut got {
             *slot = BLK_MB.recv(Timeout::Forever).unwrap_or(usize::MAX);
         }
-        crate::rtos::thread_delay_ms(20); // 让发送者线程退出并回收
+        crate::rtos::thread_delay_ms(20).expect("selftest 延时必须在线程上下文"); // 让发送者线程退出并回收
         let _ = sender;
         check(
             got == [1000, 1001, 1002],
@@ -346,7 +356,7 @@ pub(crate) fn run() {
         }
         if ok {
             for (i, &b) in data.iter().enumerate() {
-                if crate::efm::read_byte(FLASH_TEST_ADDR + i as u32) != b {
+                if crate::efm::read_byte(FLASH_TEST_ADDR + i as u32) != Ok(b) {
                     ok = false;
                     break;
                 }
@@ -366,10 +376,23 @@ pub(crate) fn run() {
     // CRC 硬件加速器: 标准测试向量 "123456789" (四个标准配置)
     if !aborted.get() {
         let data: &[u8] = b"123456789";
-        let x25 = crate::crc::calculate(data, crate::crc::DataWidth::Byte, crate::crc::Config::x25());
-        let ccitt = crate::crc::calculate(data, crate::crc::DataWidth::Byte, crate::crc::Config::ccitt_false());
-        let ieee = crate::crc::calculate(data, crate::crc::DataWidth::Byte, crate::crc::Config::crc32());
-        let mpeg2 = crate::crc::calculate(data, crate::crc::DataWidth::Byte, crate::crc::Config::crc32_mpeg2());
+        let x25 =
+            crate::crc::calculate(data, crate::crc::DataWidth::Byte, crate::crc::Config::x25());
+        let ccitt = crate::crc::calculate(
+            data,
+            crate::crc::DataWidth::Byte,
+            crate::crc::Config::ccitt_false(),
+        );
+        let ieee = crate::crc::calculate(
+            data,
+            crate::crc::DataWidth::Byte,
+            crate::crc::Config::crc32(),
+        );
+        let mpeg2 = crate::crc::calculate(
+            data,
+            crate::crc::DataWidth::Byte,
+            crate::crc::Config::crc32_mpeg2(),
+        );
         check(
             x25 == 0x906E && ccitt == 0x29B1 && ieee == 0xCBF4_3926 && mpeg2 == 0x0376_E6E7,
             "CRC: 标准向量 X25/CCITT/CRC32/MPEG2",

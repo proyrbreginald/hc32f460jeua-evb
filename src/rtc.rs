@@ -21,16 +21,20 @@
 //! # 使用
 //!
 //! ```no_run
-//! rtc::init(rtc::Config::default());
-//! rtc::set_date(rtc::Date { year: 26, month: 1, day: 1, weekday: 4 });
-//! rtc::set_time(rtc::Time { hour: 0, minute: 0, second: 0 });
-//! rtc::start();
+//! rtc::init(rtc::Config::default()).expect("RTC 初始化超时");
+//! rtc::set_date(rtc::Date { year: 26, month: 1, day: 1, weekday: 4 })
+//!     .expect("RTC 日期写入超时");
+//! rtc::set_time(rtc::Time { hour: 0, minute: 0, second: 0, pm: false })
+//!     .expect("RTC 时间写入超时");
+//! rtc::start().expect("RTC 启动超时");
 //! // 周期中断 (1s, 需 intc 线) 与闹钟中断的事件源:
 //! // intc::src::RTC_PRD (82) / intc::src::RTC_ALM (81)
 //! ```
 //!
 //! 部分 API (闹钟/周期中断/12H 制) 供应用按需选用, 忽略未使用项的死代码警告。
 #![allow(dead_code)]
+
+use crate::critical_section::CriticalSection;
 
 /// RTC 基址
 const RTC_BASE: usize = 0x4004_C000;
@@ -171,6 +175,13 @@ pub struct Alarm {
     pub pm: bool,
 }
 
+/// RTC hardware operation failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RtcError {
+    /// The hardware did not complete reset or a read/write mode transition.
+    Timeout,
+}
+
 // ============================== 底层访问 ==============================
 
 fn read8(offset: usize) -> u8 {
@@ -181,7 +192,7 @@ fn write8(offset: usize, value: u8) {
     unsafe { core::ptr::write_volatile((RTC_BASE + offset) as *mut u8, value) };
 }
 
-fn modify8(offset: usize, f: impl FnOnce(u8) -> u8) {
+fn modify8(offset: usize, f: impl FnOnce(u8) -> u8, _cs: CriticalSection<'_>) {
     write8(offset, f(read8(offset)));
 }
 
@@ -199,23 +210,29 @@ const fn bcd2dec(x: u8) -> u8 {
 
 /// 初始化 RTC (对齐 DDL `RTC_Init`): 时钟源 → 小时制/周期 → 启动 LRC。
 /// 不启动计数 (需 [`start`]), 不写时间日期。
-pub fn init(cfg: Config) {
-    deinit();
-    // CR3: 时钟源 (LRC 时同时使能内部 LRC 振荡器)
-    let cr3 = match cfg.clock_src {
-        ClockSource::Lrc => CR3_LRCEN | CR3_RCKSEL,
-        ClockSource::Xtal32 => 0,
-    };
-    write8(CR3, cr3);
-    // CR1: 小时制 + 周期节拍 (START 保持 0; 读-改-写保留
-    // ONEHZOE/ONEHZSEL/ALMFCLR, 对齐 DDL RTC_Init 的 MODIFY)
-    let amp = match cfg.hour_format {
-        HourFormat::H24 => CR1_AMPM,
-        HourFormat::H12 => 0,
-    };
-    modify8(CR1, |v| {
-        (v & !(CR1_PRDS | CR1_AMPM)) | amp | (cfg.int_period as u8)
-    });
+pub fn init(cfg: Config) -> Result<(), RtcError> {
+    crate::critical_section::with(|cs| {
+        deinit_locked(cs)?;
+        // CR3: 时钟源 (LRC 时同时使能内部 LRC 振荡器)
+        let cr3 = match cfg.clock_src {
+            ClockSource::Lrc => CR3_LRCEN | CR3_RCKSEL,
+            ClockSource::Xtal32 => 0,
+        };
+        write8(CR3, cr3);
+        // CR1: 小时制 + 周期节拍 (START 保持 0; 读-改-写保留
+        // ONEHZOE/ONEHZSEL/ALMFCLR, 对齐 DDL RTC_Init 的 MODIFY)
+        let amp = match cfg.hour_format {
+            HourFormat::H24 => CR1_AMPM,
+            HourFormat::H12 => 0,
+        };
+        modify8(
+            CR1,
+            |v| (v & !(CR1_PRDS | CR1_AMPM)) | amp | (cfg.int_period as u8),
+            cs,
+        );
+        CACHE_SEC.store(0xFF, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    })
 }
 
 /// 软件复位 (对齐 DDL `RTC_DeInit`)
@@ -224,34 +241,43 @@ pub fn init(cfg: Config) {
 /// 每步等待完成 —— 复位未完成时对 CR1/CR3 等寄存器的写入会被硬件
 /// 忽略, 导致 RTC 无法启动。等待超时按 HCLK 折算 (~100ms, 对齐 DDL
 /// `RTC_SW_RST_TIMEOUT × HCLK/20000`)。
-pub fn deinit() {
+pub fn deinit() -> Result<(), RtcError> {
+    crate::critical_section::with(deinit_locked)
+}
+
+fn deinit_locked(_cs: CriticalSection<'_>) -> Result<(), RtcError> {
     write8(CR0, 0);
-    wait_reset_clear();
+    wait_reset_clear()?;
     write8(CR0, CR0_RESET);
-    wait_reset_clear();
+    wait_reset_clear()?;
+    CACHE_SEC.store(0xFF, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 /// 等待 CR0.RESET 清零 (超时按 HCLK 折算, 对齐 DDL)
-fn wait_reset_clear() {
+fn wait_reset_clear() -> Result<(), RtcError> {
     let timeout = 100 * (crate::clk::hclk_hz() / 20_000);
     for _ in 0..timeout {
         if read8(CR0) & CR0_RESET == 0 {
-            return;
+            return Ok(());
         }
     }
+    Err(RtcError::Timeout)
 }
 
 /// 启动计数 (CR1.START=1, 对齐 DDL `RTC_Cmd(ENABLE)`)
 ///
 /// 记录基准日期/时间 (由 [`elapsed_dhms`] 计算运行时长)。
-pub fn start() {
-    write8(CR1, read8(CR1) | CR1_START);
-    record_base();
+pub fn start() -> Result<(), RtcError> {
+    crate::critical_section::with(|cs| {
+        modify8(CR1, |v| v | CR1_START, cs);
+        record_base(cs)
+    })
 }
 
 /// 停止计数
 pub fn stop() {
-    write8(CR1, read8(CR1) & !CR1_START);
+    crate::critical_section::with(|cs| modify8(CR1, |v| v & !CR1_START, cs));
 }
 
 /// RTC 是否在计数 (CR1.START)
@@ -265,22 +291,27 @@ pub fn running() -> bool {
 ///
 /// 注意: 以**读-改-写**置 RWREQ 并写 1 清 ALMF 标志 —— 完整写入会
 /// 清掉 CR2 的 PRDIE/ALMIE/ALME 中断配置 (DDL 用 SET_REG8_BIT)。
-fn enter_rw() {
+fn enter_rw(cs: CriticalSection<'_>) -> Result<(), RtcError> {
     if read8(CR1) & CR1_START != 0 && read8(CR2) & CR2_RWEN == 0 {
-        modify8(CR2, |v| v | CR2_RWREQ | CR2_ALMF);
-        wait_rw_en();
+        modify8(CR2, |v| v | CR2_RWREQ | CR2_ALMF, cs);
+        wait_rw_en()?;
     }
+    Ok(())
 }
 
 /// 退出读写模式 (清 RWREQ 并写 1 清闹钟标志, 等 RWEN 清 0;
 /// 对齐 DDL `RTC_ExitRwMode` 的 MODIFY(CR2, RWREQ|ALMF, ~RWREQ))
-fn exit_rw() {
-    modify8(CR2, |v| (v & !CR2_RWREQ) | CR2_ALMF);
-    for _ in 0..wait_timeout() {
-        if read8(CR2) & CR2_RWEN == 0 {
-            break;
+fn exit_rw(cs: CriticalSection<'_>) -> Result<(), RtcError> {
+    if read8(CR1) & CR1_START != 0 && read8(CR2) & CR2_RWEN != 0 {
+        modify8(CR2, |v| (v & !CR2_RWREQ) | CR2_ALMF, cs);
+        for _ in 0..wait_timeout() {
+            if read8(CR2) & CR2_RWEN == 0 {
+                return Ok(());
+            }
         }
+        return Err(RtcError::Timeout);
     }
+    Ok(())
 }
 
 /// RW 模式切换等待次数 (按 HCLK 折算, 对齐 DDL `RTC_MD_SWITCH_TIMEOUT`)
@@ -289,39 +320,55 @@ fn wait_timeout() -> u32 {
 }
 
 /// 等 RWEN 置位 (对齐 DDL EnterRwMode 的等待循环)
-fn wait_rw_en() {
+fn wait_rw_en() -> Result<(), RtcError> {
     for _ in 0..wait_timeout() {
         if read8(CR2) & CR2_RWEN != 0 {
-            break;
+            return Ok(());
         }
     }
+    Err(RtcError::Timeout)
+}
+
+/// Run one complete RTC register transaction without allowing another thread
+/// or ISR to enter/exit RW mode in the middle of it.
+fn with_rw<R>(f: impl FnOnce(CriticalSection<'_>) -> R) -> Result<R, RtcError> {
+    crate::critical_section::with(|cs| {
+        enter_rw(cs)?;
+        let result = f(cs);
+        exit_rw(cs)?;
+        Ok(result)
+    })
 }
 
 // ============================== 时间/日期 ==============================
 
 /// 设置时间 (对齐 DDL `RTC_SetTime`; 内部自动进出 RW 模式)
-pub fn set_time(t: Time) {
-    let (hour, pm) = match hour_format() {
-        HourFormat::H24 => (t.hour, false),
-        HourFormat::H12 => (t.hour, t.pm),
-    };
-    enter_rw();
-    write8(HOUR, dec2bcd(hour) | if pm { HOUR_12H_PM } else { 0 });
-    write8(MIN, dec2bcd(t.minute));
-    write8(SEC, dec2bcd(t.second));
-    exit_rw();
+pub fn set_time(t: Time) -> Result<(), RtcError> {
+    with_rw(|_| {
+        let (hour, pm) = if read8(CR1) & CR1_AMPM != 0 {
+            (t.hour, false)
+        } else {
+            (t.hour, t.pm)
+        };
+        write8(HOUR, dec2bcd(hour) | if pm { HOUR_12H_PM } else { 0 });
+        write8(MIN, dec2bcd(t.minute));
+        write8(SEC, dec2bcd(t.second));
+        CACHE_SEC.store(0xFF, core::sync::atomic::Ordering::Relaxed);
+    })
 }
 
 /// 读取时间 (对齐 DDL `RTC_GetTime`)
-pub fn get_time() -> Time {
-    enter_rw();
+pub fn get_time() -> Result<Time, RtcError> {
+    with_rw(read_time_locked)
+}
+
+fn read_time_locked(_cs: CriticalSection<'_>) -> Time {
     // 掩 0x1F: 清除 12H 制 PM 位 (bit5), 否则 bcd2dec 会把 PM 位算进数值
     // (对齐 DDL 的 CLR_REG8_BIT(HOUR, RTC_HOUR_12H_PM))
     let hour = bcd2dec(read8(HOUR) & 0x1F);
     let pm = read8(HOUR) & HOUR_12H_PM != 0;
     let minute = bcd2dec(read8(MIN));
     let second = bcd2dec(read8(SEC));
-    exit_rw();
     Time {
         hour,
         minute,
@@ -331,26 +378,36 @@ pub fn get_time() -> Time {
 }
 
 /// 设置日期 (对齐 DDL `RTC_SetDate`)
-pub fn set_date(d: Date) {
-    enter_rw();
-    write8(YEAR, dec2bcd(d.year));
-    write8(MON, dec2bcd(d.month));
-    write8(DAY, dec2bcd(d.day));
-    write8(WEEK, d.weekday & 0x07);
-    exit_rw();
+pub fn set_date(d: Date) -> Result<(), RtcError> {
+    with_rw(|_| {
+        write8(YEAR, dec2bcd(d.year));
+        write8(MON, dec2bcd(d.month));
+        write8(DAY, dec2bcd(d.day));
+        write8(WEEK, d.weekday & 0x07);
+        CACHE_SEC.store(0xFF, core::sync::atomic::Ordering::Relaxed);
+    })
 }
 
 /// 读取日期 (对齐 DDL `RTC_GetDate`)
-pub fn get_date() -> Date {
-    enter_rw();
-    let d = Date {
+pub fn get_date() -> Result<Date, RtcError> {
+    with_rw(read_date_locked)
+}
+
+fn read_date_locked(_cs: CriticalSection<'_>) -> Date {
+    Date {
         year: bcd2dec(read8(YEAR)),
         month: bcd2dec(read8(MON)),
         day: bcd2dec(read8(DAY)),
         weekday: read8(WEEK) & 0x07,
-    };
-    exit_rw();
-    d
+    }
+}
+
+fn read_calendar_locked(cs: CriticalSection<'_>) -> Result<(Date, Time), RtcError> {
+    enter_rw(cs)?;
+    let date = read_date_locked(cs);
+    let time = read_time_locked(cs);
+    exit_rw(cs)?;
+    Ok((date, time))
 }
 
 /// 当前小时制 (CR1.AMPM)
@@ -366,30 +423,42 @@ pub fn hour_format() -> HourFormat {
 
 /// 设置闹钟 (对齐 DDL `RTC_SetAlarm`; 无需 RW 模式)
 pub fn set_alarm(a: Alarm) {
-    let (hour, pm) = match hour_format() {
-        HourFormat::H24 => (a.hour, false),
-        HourFormat::H12 => (a.hour, a.pm),
-    };
-    write8(ALMHOUR, dec2bcd(hour) | if pm { HOUR_12H_PM } else { 0 });
-    write8(ALMMIN, dec2bcd(a.minute));
-    write8(ALMWEEK, a.weekday_mask & 0x7F);
+    crate::critical_section::with(|_| {
+        let (hour, pm) = if read8(CR1) & CR1_AMPM != 0 {
+            (a.hour, false)
+        } else {
+            (a.hour, a.pm)
+        };
+        write8(ALMHOUR, dec2bcd(hour) | if pm { HOUR_12H_PM } else { 0 });
+        write8(ALMMIN, dec2bcd(a.minute));
+        write8(ALMWEEK, a.weekday_mask & 0x7F);
+    });
 }
 
 /// 读取闹钟
 pub fn get_alarm() -> Alarm {
-    Alarm {
-        hour: bcd2dec(read8(ALMHOUR) & 0x1F), // 掩 0x1F: 清除 12H 制 PM 位
-        minute: bcd2dec(read8(ALMMIN)),
-        weekday_mask: read8(ALMWEEK) & 0x7F,
-        pm: read8(ALMHOUR) & HOUR_12H_PM != 0,
-    }
+    crate::critical_section::with(|_| {
+        let hour = read8(ALMHOUR);
+        Alarm {
+            hour: bcd2dec(hour & 0x1F), // 掩 0x1F: 清除 12H 制 PM 位
+            minute: bcd2dec(read8(ALMMIN)),
+            weekday_mask: read8(ALMWEEK) & 0x7F,
+            pm: hour & HOUR_12H_PM != 0,
+        }
+    })
 }
 
 /// 使能/失能闹钟功能 (对齐 DDL `RTC_AlarmCmd`; 同时清闹钟标志)
 pub fn alarm_enable(enable: bool) {
-    modify8(CR2, |v| {
-        let v = if enable { v | CR2_ALME } else { v & !CR2_ALME };
-        v | CR2_ALMF // 写 1 清标志
+    crate::critical_section::with(|cs| {
+        modify8(
+            CR2,
+            |v| {
+                let v = if enable { v | CR2_ALME } else { v & !CR2_ALME };
+                v | CR2_ALMF // 写 1 清标志
+            },
+            cs,
+        );
     });
 }
 
@@ -398,15 +467,21 @@ pub fn alarm_enable(enable: bool) {
 /// 使能中断的同时写 1 清 ALMF (对齐 DDL 的 `u32IntTemp | FLAG_MASK`
 /// 写入), 避免使能瞬间残留的闹钟标志立即触发中断。
 pub fn int_enable(period: bool, alarm: bool) {
-    modify8(CR2, |v| {
-        let v = if period { v | CR2_PRDIE } else { v & !CR2_PRDIE };
-        let v = if alarm { v | CR2_ALMIE } else { v & !CR2_ALMIE };
-        // 任一中断使能时顺带清闹钟标志 (写 1 清除, 对齐 DDL)
-        if period || alarm {
-            v | CR2_ALMF
-        } else {
-            v
-        }
+    crate::critical_section::with(|cs| {
+        modify8(
+            CR2,
+            |v| {
+                let v = if period {
+                    v | CR2_PRDIE
+                } else {
+                    v & !CR2_PRDIE
+                };
+                let v = if alarm { v | CR2_ALMIE } else { v & !CR2_ALMIE };
+                // 任一中断使能时顺带清闹钟标志 (写 1 清除, 对齐 DDL)
+                if period || alarm { v | CR2_ALMF } else { v }
+            },
+            cs,
+        );
     });
 }
 
@@ -421,7 +496,7 @@ pub fn alarm_flag() -> bool {
 /// `RTC_ClearStatus` 的 CLR_REG8_BIT(CR1, ALMFCLR); 与 CR2.ALMF
 /// 的写 1 清除是两套机制)。
 pub fn clear_alarm_flag() {
-    modify8(CR1, |v| v & !CR1_ALMFCLR);
+    crate::critical_section::with(|cs| modify8(CR1, |v| v & !CR1_ALMFCLR, cs));
 }
 
 // ============================== 运行时长 (日志时间戳) ==============================
@@ -430,21 +505,24 @@ pub fn clear_alarm_flag() {
 static BASE_DAYS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static BASE_SECS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// 运行时长缓存 (键 = SEC 寄存器值; 秒未变则复用, 避免每次读全部寄存器)。
-/// 注: thumbv7em 无 64 位原子, 天/时分秒分存两个 u32。
+/// 运行时长缓存。SEC 相同且缓存年龄小于一个 RTOS 秒时才复用，避免
+/// 秒字段每分钟回绕后命中旧 payload。thumbv7em 无 64 位原子，因此
+/// 天/时分秒分存两个 u32；访问由同一 PRIMASK 临界区串行化。
 static CACHE_SEC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
+static CACHE_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static CACHE_DAYS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static CACHE_HMS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// 记录基准 (由 [`start`] 调用; 未设置日期时按 2000-01-01)
-fn record_base() {
-    let d = get_date();
-    let t = get_time();
+fn record_base(cs: CriticalSection<'_>) -> Result<(), RtcError> {
+    let (d, t) = read_calendar_locked(cs)?;
     BASE_DAYS.store(
         days_from_civil(2000 + d.year as i64, d.month as u32, d.day as u32) as u32,
         core::sync::atomic::Ordering::Relaxed,
     );
     BASE_SECS.store(secs_of_day(t), core::sync::atomic::Ordering::Relaxed);
+    CACHE_SEC.store(0xFF, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 /// 当日秒数
@@ -461,34 +539,48 @@ fn secs_of_day(t: Time) -> u32 {
 /// 都进出 RW 模式读全部时间寄存器; 运行期改时间导致回退时按 0 计
 /// (下溢保护)。
 pub fn elapsed_dhms() -> Option<(u32, u32, u32, u32)> {
-    if !running() {
-        return None;
-    }
     use core::sync::atomic::Ordering;
-    // 快速路径: 秒未变 → 复用上次结果 (日志高频场景仅 2 次寄存器读)
-    let sec_reg = read8(SEC);
-    if CACHE_SEC.load(Ordering::Relaxed) == sec_reg {
-        let days = CACHE_DAYS.load(Ordering::Relaxed);
-        let v = CACHE_HMS.load(Ordering::Relaxed);
-        return Some((days, v >> 16, (v >> 8) & 0xFF, v & 0xFF));
-    }
-    // 全量计算 (每秒至多一次)
-    let d = get_date();
-    let t = get_time();
-    let now_days = days_from_civil(2000 + d.year as i64, d.month as u32, d.day as u32) as u32;
-    let now_secs = secs_of_day(t);
-    let base_days = BASE_DAYS.load(Ordering::Relaxed);
-    let base_secs = BASE_SECS.load(Ordering::Relaxed);
+    crate::critical_section::with(|cs| {
+        if read8(CR1) & CR1_START == 0 {
+            return None;
+        }
+        // 快速路径：秒未变且缓存仍新鲜。单看 SEC 会在每分钟回绕时
+        // 产生别名；RTOS tick 年龄把复用窗口限制在一个 RTC 秒以内。
+        let sec_reg = read8(SEC);
+        let now_tick = crate::rtos::tick();
+        let cache_age = now_tick.wrapping_sub(CACHE_TICK.load(Ordering::Relaxed));
+        if CACHE_SEC.load(Ordering::Relaxed) == sec_reg && cache_age < crate::rtos::TICKS_PER_SEC {
+            let days = CACHE_DAYS.load(Ordering::Relaxed);
+            let v = CACHE_HMS.load(Ordering::Relaxed);
+            return Some((days, v >> 16, (v >> 8) & 0xFF, v & 0xFF));
+        }
 
-    // 下溢保护: 运行期回拨时间/日期使 now < base 时按 0 计
-    let total = (now_days as i64 - base_days as i64) * 86_400 + now_secs as i64 - base_secs as i64;
-    let total = total.max(0) as u32;
-    let dhms = (total / 86_400, (total / 3600) % 24, (total / 60) % 60, total % 60);
+        // 同一个 RW 模式窗口读取日期和时间，避免午夜/秒边界撕裂。
+        let (d, t) = read_calendar_locked(cs).ok()?;
+        let now_days = days_from_civil(2000 + d.year as i64, d.month as u32, d.day as u32) as u32;
+        let now_secs = secs_of_day(t);
+        let base_days = BASE_DAYS.load(Ordering::Relaxed);
+        let base_secs = BASE_SECS.load(Ordering::Relaxed);
 
-    CACHE_SEC.store(sec_reg, Ordering::Relaxed);
-    CACHE_DAYS.store(dhms.0, Ordering::Relaxed);
-    CACHE_HMS.store((dhms.1 << 16) | (dhms.2 << 8) | dhms.3, Ordering::Relaxed);
-    Some(dhms)
+        // 下溢保护: 运行期回拨时间/日期使 now < base 时按 0 计
+        let total =
+            (now_days as i64 - base_days as i64) * 86_400 + now_secs as i64 - base_secs as i64;
+        let total = total.max(0) as u32;
+        let dhms = (
+            total / 86_400,
+            (total / 3600) % 24,
+            (total / 60) % 60,
+            total % 60,
+        );
+
+        CACHE_DAYS.store(dhms.0, Ordering::Relaxed);
+        CACHE_HMS.store((dhms.1 << 16) | (dhms.2 << 8) | dhms.3, Ordering::Relaxed);
+        CACHE_TICK.store(crate::rtos::tick(), Ordering::Relaxed);
+        // Key must come from the same frozen snapshot as the payload and is
+        // published last. The pre-snapshot SEC may straddle a tick edge.
+        CACHE_SEC.store(dec2bcd(t.second), Ordering::Relaxed);
+        Some(dhms)
+    })
 }
 
 /// 公历天数 (自 1970-01-01, Howard Hinnant 算法, const)

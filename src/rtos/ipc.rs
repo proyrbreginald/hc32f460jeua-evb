@@ -36,15 +36,14 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ptr;
 
-use alloc::alloc::alloc;
-use alloc::vec;
+use alloc::alloc::{alloc, dealloc};
 
 use crate::critical_section;
 use crate::critical_section::CriticalSection;
 use crate::rtos::klist::ListHead;
 use crate::rtos::sched;
 use crate::rtos::thread::{
-    TS_SUSPEND, Thread, blocked_wait, resched_needed, thread_from_suspend, thread_timer_cb,
+    TS_SUSPEND, ThreadInner, blocked_wait, resched_needed, thread_from_suspend, thread_timer_cb,
     wakeup_thread,
 };
 
@@ -53,31 +52,35 @@ use crate::rtos::thread::{
 pub enum Timeout {
     /// 无限等待
     Forever,
-    /// 等待指定 tick 数
+    /// 等待指定 tick 数；超过回绕安全半周期的值会钳位到 `i32::MAX`。
     Ticks(u32),
 }
 
 impl Timeout {
-    fn ticks(self) -> u32 {
+    /// 返回有限等待的定时器延时；`None` 只表示真正的永久等待。
+    ///
+    /// 不使用 `u32::MAX` 哨兵，保证 `Ticks(u32::MAX)` 仍是有限等待。
+    fn timer_delay(self) -> Option<u32> {
         match self {
-            Timeout::Forever => u32::MAX,
-            Timeout::Ticks(t) => t,
+            Timeout::Forever => None,
+            Timeout::Ticks(ticks) => Some(ticks.min(i32::MAX as u32)),
         }
     }
 }
 
-/// 断言当前为线程上下文 (阻塞调用入口使用)
+/// 验证 IPC 等待调用的运行上下文。
 ///
-/// 阻塞式等待 (`timeout != Ticks(0)`) 会挂起当前执行流并移交调度器,
-/// 在**中断上下文**调用将挂起被打断的线程, 破坏调度器状态。
-/// `debug_assert!` 使误用仅出现在 debug 构建 (release 零开销),
-/// 但足以在开发期拦截这类内核级 bug。
+/// IPC 获取/接收 API 依赖已启动的调度器。ISR 仅允许 `Ticks(0)` 的
+/// 非阻塞尝试；任何会挂起当前执行流的调用在所有构建配置下都被拒绝。
 #[inline]
-fn assert_thread_context(timeout: Timeout) {
-    debug_assert!(
-        timeout == Timeout::Ticks(0) || !crate::critical_section::in_isr(),
-        "阻塞式 IPC 调用 (超时非 0) 不能在中断上下文使用"
-    );
+fn ensure_ipc_context(timeout: Timeout) -> Result<(), Error> {
+    if !crate::rtos::scheduler_started() {
+        return Err(Error::KernelNotStarted);
+    }
+    if timeout != Timeout::Ticks(0) && crate::critical_section::in_isr() {
+        return Err(Error::InterruptContext);
+    }
+    Ok(())
 }
 
 /// 内核调用错误
@@ -89,6 +92,10 @@ pub enum Error {
     Full,
     /// 非法操作 (如挂起自身)
     Invalid,
+    /// 阻塞操作被错误地用于中断上下文
+    InterruptContext,
+    /// IPC 操作发生在调度器启动前
+    KernelNotStarted,
 }
 
 /// IPC 基类: 等待者挂起队列
@@ -111,13 +118,13 @@ impl IpcBase {
 
 /// 临界区内: 当前线程按 FIFO 挂入对象挂起队列, 启动线程定时器
 ///
-/// `ticks == u32::MAX` (无限等待) 时不启动定时器, 仅能由显式唤醒解除。
-unsafe fn suspend_current(list: *mut ListHead, ticks: u32, cs: CriticalSection<'_>) {
+/// `delay == None` (无限等待) 时不启动定时器, 仅能由显式唤醒解除。
+unsafe fn suspend_current(list: *mut ListHead, delay: Option<u32>, cs: CriticalSection<'_>) {
     let cur = sched::current();
     (*cur).error = 0;
     (*cur).suspend_node.remove();
     (*list).push_back(&mut (*cur).suspend_node);
-    if ticks != u32::MAX {
+    if let Some(ticks) = delay {
         (*cur)
             .thread_timer
             .start_internal(ticks, 0, thread_timer_cb, cur as usize, cs);
@@ -128,17 +135,29 @@ unsafe fn suspend_current(list: *mut ListHead, ticks: u32, cs: CriticalSection<'
 
 /// 临界区内: 当前线程按优先级 (数字小者靠前) 挂入对象挂起队列
 ///
-/// `ticks == u32::MAX` (无限等待) 时不启动定时器。
-unsafe fn suspend_prio(list: *mut ListHead, ticks: u32, cs: CriticalSection<'_>) {
+/// `delay == None` (无限等待) 时不启动定时器。
+unsafe fn suspend_prio(list: *mut ListHead, delay: Option<u32>, cs: CriticalSection<'_>) {
     let cur = sched::current();
     (*cur).error = 0;
     (*cur).suspend_node.remove();
+    insert_prio_waiter(list, cur);
+    if let Some(ticks) = delay {
+        (*cur)
+            .thread_timer
+            .start_internal(ticks, 0, thread_timer_cb, cur as usize, cs);
+    }
+    (*cur).state = TS_SUSPEND;
+    sched::ready_remove(cur, cs);
+}
+
+/// 临界区内：按线程当前优先级插入等待队列。
+unsafe fn insert_prio_waiter(list: *mut ListHead, thread: *mut ThreadInner) {
     // 找到第一个"优先级更低"的等待者, 插入其前
     let mut before: *mut ListHead = ptr::null_mut();
     let mut n = (*list).first();
     while let Some(node) = n {
         let w = thread_from_suspend(node);
-        if (*w).current_priority > (*cur).current_priority {
+        if (*w).current_priority > (*thread).current_priority {
             before = node;
             break;
         }
@@ -149,23 +168,16 @@ unsafe fn suspend_prio(list: *mut ListHead, ticks: u32, cs: CriticalSection<'_>)
         n = Some(nn);
     }
     if before.is_null() {
-        (*list).push_back(&mut (*cur).suspend_node);
+        (*list).push_back(&mut (*thread).suspend_node);
     } else {
-        (*before).insert_before(&mut (*cur).suspend_node);
+        (*before).insert_before(&mut (*thread).suspend_node);
     }
-    if ticks != u32::MAX {
-        (*cur)
-            .thread_timer
-            .start_internal(ticks, 0, thread_timer_cb, cur as usize, cs);
-    }
-    (*cur).state = TS_SUSPEND;
-    sched::ready_remove(cur, cs);
 }
 
 /// 临界区内: 唤醒挂起队列头部等待者
 ///
 /// 返回被唤醒线程 (由调用方决定是否需要重新调度)。
-unsafe fn wake_head(list: *mut ListHead, cs: CriticalSection<'_>) -> Option<*mut Thread> {
+unsafe fn wake_head(list: *mut ListHead, cs: CriticalSection<'_>) -> Option<*mut ThreadInner> {
     let node = (*list).pop_first()?;
     let w = thread_from_suspend(node);
     wakeup_thread(w, cs);
@@ -207,7 +219,7 @@ impl Semaphore {
     /// **唤醒即获得资源**: `release` 对等待者是"唤醒或计数+1"二选一,
     /// 被唤醒即代表资源已移交, 不得重查计数 (重查必为 0 导致再挂起死锁)。
     pub fn take(&self, timeout: Timeout) -> Result<(), Error> {
-        assert_thread_context(timeout);
+        ensure_ipc_context(timeout)?;
         let mut outcome = Ok(());
         let mut blocked = false;
         critical_section::with(|cs| unsafe {
@@ -217,7 +229,7 @@ impl Semaphore {
             } else if timeout == Timeout::Ticks(0) {
                 outcome = Err(Error::TimedOut);
             } else {
-                suspend_current(&mut s.base.suspend_list, timeout.ticks(), cs);
+                suspend_current(&mut s.base.suspend_list, timeout.timer_delay(), cs);
                 blocked = true;
             }
         });
@@ -337,7 +349,7 @@ impl<T: ?Sized> core::fmt::Debug for MutexGuard<'_, T> {
 /// 互斥量内部状态 (以 [`UnsafeCell`] 包裹)
 pub(crate) struct MutexInner {
     pub(crate) base: IpcBase,
-    pub(crate) owner: *mut Thread,
+    pub(crate) owner: *mut ThreadInner,
     pub(crate) hold: u8,
     pub(crate) taken_node: ListHead,
 }
@@ -368,7 +380,7 @@ impl<T: ?Sized> Mutex<T> {
     /// 时执行释放, 并把所有权转移给被唤醒的等待者, 唤醒后不得重查
     /// 持有权。
     pub fn lock(&self, timeout: Timeout) -> Result<MutexGuard<'_, T>, Error> {
-        assert_thread_context(timeout);
+        ensure_ipc_context(timeout)?;
         // 初始为 Ok: 阻塞唤醒 (所有权已由 release 转移) 亦属成功路径;
         // 仅立即超时/重复获取置 Err
         let mut outcome = Ok(());
@@ -392,7 +404,7 @@ impl<T: ?Sized> Mutex<T> {
                     priority_inherit(own, (*cur).current_priority, cs);
                 }
                 (*cur).pending_mutex = self.ptr();
-                suspend_prio(&mut m.base.suspend_list, timeout.ticks(), cs);
+                suspend_prio(&mut m.base.suspend_list, timeout.timer_delay(), cs);
                 blocked = true;
             }
         });
@@ -423,8 +435,8 @@ impl<T: ?Sized> Mutex<T> {
             // 释放所有权
             m.owner = ptr::null_mut();
             m.taken_node.remove();
-            // 取消优先级继承
-            sched::change_priority(cur, (*cur).init_priority, cs);
+            // 仅释放当前 mutex；仍持有的其他 mutex 可能继续要求继承。
+            recompute_priority_chain(cur, cs);
             // 所有权转移给最高优先级等待者
             if let Some(w) = wake_head(&mut m.base.suspend_list, cs) {
                 (*w).pending_mutex = ptr::null_mut();
@@ -447,13 +459,56 @@ impl<T: ?Sized> Mutex<T> {
     }
 
     /// 当前持有者 (诊断用)
-    pub(crate) fn owner(&self) -> *mut Thread {
+    pub(crate) fn owner(&self) -> *mut ThreadInner {
         critical_section::with(|_| unsafe { (*self.ptr()).owner })
     }
 }
 
-/// 优先级继承: 沿"等待互斥量 → 持有者"链提升优先级
-unsafe fn priority_inherit(mut chain: *mut Thread, prio: u8, cs: CriticalSection<'_>) {
+/// 线程在互斥量依赖图中的后继；自等待按链尾处理。
+unsafe fn inheritance_successor(thread: *mut ThreadInner) -> *mut ThreadInner {
+    if thread.is_null() {
+        return ptr::null_mut();
+    }
+    let pending = (*thread).pending_mutex;
+    if pending.is_null() {
+        return ptr::null_mut();
+    }
+    let owner = (*pending).owner;
+    if owner == thread {
+        ptr::null_mut()
+    } else {
+        owner
+    }
+}
+
+/// 用 Floyd 算法查找依赖链的环入口；不在临界区内分配辅助存储。
+unsafe fn inheritance_cycle_entry(start: *mut ThreadInner) -> *mut ThreadInner {
+    let mut slow = inheritance_successor(start);
+    let mut fast = inheritance_successor(inheritance_successor(start));
+
+    while !slow.is_null() && !fast.is_null() && slow != fast {
+        slow = inheritance_successor(slow);
+        fast = inheritance_successor(inheritance_successor(fast));
+    }
+    if slow.is_null() || fast.is_null() {
+        return ptr::null_mut();
+    }
+
+    slow = start;
+    while slow != fast {
+        slow = inheritance_successor(slow);
+        fast = inheritance_successor(fast);
+    }
+    slow
+}
+
+/// 优先级继承: 沿"等待互斥量 → 持有者"链提升优先级。
+///
+/// 链长度由实际线程关系决定，与优先级数量无关；若应用形成互斥量
+/// 死锁环，每个不同线程最多访问一次。
+unsafe fn priority_inherit(mut chain: *mut ThreadInner, prio: u8, cs: CriticalSection<'_>) {
+    let cycle_entry = inheritance_cycle_entry(chain);
+    let mut entered_cycle = chain == cycle_entry;
     loop {
         if unsafe { (*chain).current_priority } <= prio {
             return;
@@ -463,25 +518,99 @@ unsafe fn priority_inherit(mut chain: *mut Thread, prio: u8, cs: CriticalSection
         if pm.is_null() {
             return;
         }
-        let owner = unsafe { (*pm).owner };
-        if owner.is_null() || owner == chain {
+        // 被提升的线程本身可能正在等待另一把 mutex；重新按有效优先级
+        // 排队，保证 unlock 仍会唤醒真正最高优先级的等待者。
+        unsafe { (*chain).suspend_node.remove() };
+        let waiters = core::ptr::addr_of_mut!((*pm).base.suspend_list);
+        insert_prio_waiter(waiters, chain);
+        let owner = inheritance_successor(chain);
+        if owner.is_null() {
             return;
+        }
+        if owner == cycle_entry {
+            if entered_cycle {
+                return;
+            }
+            entered_cycle = true;
         }
         chain = owner;
     }
 }
 
+/// 根据线程仍持有的全部 mutex 计算有效优先级。
+unsafe fn effective_priority(t: *mut ThreadInner) -> u8 {
+    let mut priority = (*t).init_priority;
+    let head = &mut (*t).taken_list as *mut ListHead;
+    let mut node = (*head).next_node();
+    while !node.is_null() && node != head {
+        let mutex = mutex_from_taken(node);
+        if let Some(waiter_node) = (*mutex).base.suspend_list.first() {
+            let waiter = thread_from_suspend(waiter_node);
+            priority = priority.min((*waiter).current_priority);
+        }
+        node = (*node).next_node();
+    }
+    priority
+}
+
+/// 重算有效优先级，并沿“本线程等待的 mutex -> owner”链传播。
+unsafe fn recompute_priority_chain(mut thread: *mut ThreadInner, cs: CriticalSection<'_>) {
+    let cycle_entry = inheritance_cycle_entry(thread);
+    let mut entered_cycle = thread == cycle_entry;
+    loop {
+        let priority = effective_priority(thread);
+        if priority == (*thread).current_priority {
+            return;
+        }
+        sched::change_priority(thread, priority, cs);
+        let pending = (*thread).pending_mutex;
+        if pending.is_null() {
+            return;
+        }
+        (*thread).suspend_node.remove();
+        insert_prio_waiter(&mut (*pending).base.suspend_list, thread);
+        let owner = inheritance_successor(thread);
+        if owner.is_null() {
+            return;
+        }
+        if owner == cycle_entry {
+            if entered_cycle {
+                return;
+            }
+            entered_cycle = true;
+        }
+        thread = owner;
+    }
+}
+
+/// 在线程已从 mutex 等待队列摘除后，清理继承关系并回算 owner。
+pub(crate) unsafe fn mutex_waiter_removed(t: *mut ThreadInner, cs: CriticalSection<'_>) {
+    let pending = (*t).pending_mutex;
+    (*t).pending_mutex = ptr::null_mut();
+    if pending.is_null() {
+        return;
+    }
+    let owner = (*pending).owner;
+    if !owner.is_null() && owner != t {
+        recompute_priority_chain(owner, cs);
+    }
+}
+
 /// 临界区内: 线程退出时释放其持有的全部互斥量 (所有权转移给等待者)
-pub(crate) unsafe fn mutex_release_all_held(t: *mut Thread, cs: CriticalSection<'_>) {
+pub(crate) unsafe fn mutex_release_all_held(t: *mut ThreadInner, cs: CriticalSection<'_>) {
     while let Some(node) = unsafe { (*t).taken_list.first() } {
         let m = mutex_from_taken(node);
-        if let Some(w) = wake_head(&mut unsafe { (*m).base.suspend_list }, cs) {
+        // 必须先从旧 owner 的 taken_list 摘除；否则队首永远不变，线程
+        // 退出会在关中断状态下死循环。节点摘除后才能转移给新 owner。
+        unsafe { (*m).taken_node.remove() };
+        (*m).owner = ptr::null_mut();
+        (*m).hold = 0;
+        let waiters = core::ptr::addr_of_mut!((*m).base.suspend_list);
+        if let Some(w) = wake_head(waiters, cs) {
             (*w).pending_mutex = ptr::null_mut();
             (*m).owner = w;
             (*m).hold = 1;
             (*w).taken_list.insert_after(&mut (*m).taken_node);
-        } else {
-            (*m).owner = ptr::null_mut();
         }
     }
 }
@@ -599,7 +728,7 @@ impl Event {
 
     /// 等待事件 (可超时); 成功返回唤醒时的事件位
     pub fn recv(&self, wanted: u32, opt: EventOpt, timeout: Timeout) -> Result<u32, Error> {
-        assert_thread_context(timeout);
+        ensure_ipc_context(timeout)?;
         let mut outcome = Err(Error::TimedOut);
         let mut blocked = false;
         critical_section::with(|cs| unsafe {
@@ -627,7 +756,7 @@ impl Event {
                 let cur = sched::current();
                 (*cur).event_wanted = wanted;
                 (*cur).event_opt = opt;
-                suspend_current(&mut e.base.suspend_list, timeout.ticks(), cs);
+                suspend_current(&mut e.base.suspend_list, timeout.timer_delay(), cs);
                 blocked = true;
             }
         });
@@ -692,6 +821,11 @@ impl<T: Copy> Mailbox<T> {
     /// `static` 使用); 常量求值时仅检查容量合法性。
     pub const fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "Mailbox::new: 容量必须大于 0");
+        assert!(capacity <= u32::MAX as usize, "Mailbox::new: 容量超出 u32");
+        assert!(
+            core::mem::size_of::<T>() > 0,
+            "Mailbox::new: 不支持零大小消息类型"
+        );
         Self {
             inner: UnsafeCell::new(MailboxInner {
                 base: IpcBase::const_new(),
@@ -716,7 +850,7 @@ impl<T: Copy> Mailbox<T> {
     }
 
     fn send_impl(&self, msg: T, timeout: Timeout, urgent: bool) -> Result<(), Error> {
-        assert_thread_context(timeout);
+        ensure_ipc_context(timeout)?;
         loop {
             let mut outcome = Err(Error::Full);
             let mut need = false;
@@ -726,7 +860,11 @@ impl<T: Copy> Mailbox<T> {
                 mb.ensure_pool();
                 if mb.count < mb.size {
                     if urgent {
-                        mb.out_idx = (mb.out_idx + mb.size - 1) % mb.size;
+                        mb.out_idx = if mb.out_idx == 0 {
+                            mb.size - 1
+                        } else {
+                            mb.out_idx - 1
+                        };
                         ptr::write(mb.pool.add(mb.out_idx as usize), msg);
                     } else {
                         ptr::write(mb.pool.add(mb.in_idx as usize), msg);
@@ -740,7 +878,7 @@ impl<T: Copy> Mailbox<T> {
                 } else if timeout == Timeout::Ticks(0) {
                     outcome = Err(Error::Full);
                 } else {
-                    suspend_current(&mut mb.sender_list, timeout.ticks(), cs);
+                    suspend_current(&mut mb.sender_list, timeout.timer_delay(), cs);
                     blocked = true;
                 }
             });
@@ -763,7 +901,7 @@ impl<T: Copy> Mailbox<T> {
     /// 阻塞等待者被 [`Mailbox::send`] 唤醒后回到循环重新检查
     /// (对齐 RT-Thread 语义), 消息不会滞留。
     pub fn recv(&self, timeout: Timeout) -> Result<T, Error> {
-        assert_thread_context(timeout);
+        ensure_ipc_context(timeout)?;
         loop {
             let mut outcome = Err(Error::TimedOut);
             let mut need = false;
@@ -782,7 +920,7 @@ impl<T: Copy> Mailbox<T> {
                 } else if timeout == Timeout::Ticks(0) {
                     outcome = Err(Error::TimedOut);
                 } else {
-                    suspend_current(&mut mb.base.suspend_list, timeout.ticks(), cs);
+                    suspend_current(&mut mb.base.suspend_list, timeout.timer_delay(), cs);
                     blocked = true;
                 }
             });
@@ -803,6 +941,19 @@ impl<T: Copy> Mailbox<T> {
     #[inline]
     fn ptr(&self) -> *mut MailboxInner<T> {
         self.inner.get()
+    }
+}
+
+impl<T> Drop for Mailbox<T> {
+    fn drop(&mut self) {
+        let mb = self.inner.get_mut();
+        if mb.pool.is_null() {
+            return;
+        }
+        // `pool != null` 证明该布局已在 ensure_pool 中成功构造。
+        let layout = Layout::array::<T>(mb.size as usize).expect("邮箱消息池布局失效");
+        unsafe { dealloc(mb.pool.cast(), layout) };
+        mb.pool = ptr::null_mut();
     }
 }
 
@@ -862,13 +1013,34 @@ impl MessageQueue {
     /// 可作 `static` 使用); 常量求值时仅检查参数合法性。
     pub const fn new(msg_size: usize, max_msgs: usize) -> Self {
         assert!(msg_size > 0 && max_msgs > 0, "MessageQueue::new: 参数无效");
+        let with_header = match msg_size.checked_add(8) {
+            Some(value) => value,
+            None => panic!("MessageQueue::new: 块大小溢出"),
+        };
+        let with_padding = match with_header.checked_add(3) {
+            Some(value) => value,
+            None => panic!("MessageQueue::new: 块对齐溢出"),
+        };
+        let block_size = with_padding & !3;
+        assert!(
+            block_size <= u32::MAX as usize && max_msgs <= u32::MAX as usize,
+            "MessageQueue::new: 参数超出 u32"
+        );
+        let pool_size = match block_size.checked_mul(max_msgs) {
+            Some(value) => value,
+            None => panic!("MessageQueue::new: 消息池大小溢出"),
+        };
+        assert!(
+            pool_size <= isize::MAX as usize,
+            "MessageQueue::new: 消息池超出 Layout 上限"
+        );
         Self {
             inner: UnsafeCell::new(MessageQueueInner {
                 base: IpcBase::const_new(),
                 sender_list: ListHead::const_new(),
                 pool: ptr::null_mut(),
                 // 块大小 = 8 (next+len 头) + 消息大小, 4 字节对齐 (≥ 12)
-                block_size: ((8 + msg_size + 3) & !3) as u32,
+                block_size: block_size as u32,
                 msg_size: msg_size as u32,
                 max_msgs: max_msgs as u32,
                 head: BLOCK_END,
@@ -890,109 +1062,121 @@ impl MessageQueue {
     }
 
     fn send_impl(&self, buf: &[u8], timeout: Timeout, urgent: bool) -> Result<(), Error> {
-        assert_thread_context(timeout);
+        ensure_ipc_context(timeout)?;
         loop {
             let mut outcome = Err(Error::Full);
             let mut need = false;
             let mut blocked = false;
             critical_section::with(|cs| unsafe {
                 let q = &mut *self.ptr();
-            q.ensure_pool();
-            if q.free != BLOCK_END {
-                let b = q.free;
-                q.free = q.block_next(b);
-                let len = buf.len().min(q.msg_size as usize);
-                q.set_block_len(b, len);
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), q.block_data(b), len);
-                // 入队 (队首或队尾)
-                if urgent {
-                    q.set_block_next(b, q.head);
-                    q.head = b;
-                    if q.count == 0 {
+                q.ensure_pool();
+                if q.free != BLOCK_END {
+                    let b = q.free;
+                    q.free = q.block_next(b);
+                    let len = buf.len().min(q.msg_size as usize);
+                    q.set_block_len(b, len);
+                    core::ptr::copy_nonoverlapping(buf.as_ptr(), q.block_data(b), len);
+                    // 入队 (队首或队尾)
+                    if urgent {
+                        q.set_block_next(b, q.head);
+                        q.head = b;
+                        if q.count == 0 {
+                            q.tail = b;
+                        }
+                    } else if q.count == 0 {
+                        q.head = b;
                         q.tail = b;
+                        q.set_block_next(b, BLOCK_END);
+                    } else {
+                        q.set_block_next(q.tail, b);
+                        q.tail = b;
+                        q.set_block_next(b, BLOCK_END);
                     }
-                } else if q.count == 0 {
-                    q.head = b;
-                    q.tail = b;
-                    q.set_block_next(b, BLOCK_END);
+                    q.count += 1;
+                    outcome = Ok(());
+                    if let Some(w) = wake_head(&mut q.base.suspend_list, cs) {
+                        need = resched_needed(w);
+                    }
+                } else if timeout == Timeout::Ticks(0) {
+                    outcome = Err(Error::Full);
                 } else {
-                    q.set_block_next(q.tail, b);
-                    q.tail = b;
-                    q.set_block_next(b, BLOCK_END);
+                    suspend_current(&mut q.sender_list, timeout.timer_delay(), cs);
+                    blocked = true;
                 }
-                q.count += 1;
-                outcome = Ok(());
-                if let Some(w) = wake_head(&mut q.base.suspend_list, cs) {
-                    need = resched_needed(w);
+            });
+            if need {
+                sched::schedule();
+            }
+            if blocked {
+                // 唤醒后: 超时返回, 否则重试发送 (消息不得丢失)
+                if blocked_wait() {
+                    return Err(Error::TimedOut);
                 }
-            } else if timeout == Timeout::Ticks(0) {
-                outcome = Err(Error::Full);
-            } else {
-                suspend_current(&mut q.sender_list, timeout.ticks(), cs);
-                blocked = true;
+                continue;
             }
-        });
-        if need {
-            sched::schedule();
-        }
-        if blocked {
-            // 唤醒后: 超时返回, 否则重试发送 (消息不得丢失)
-            if blocked_wait() {
-                return Err(Error::TimedOut);
-            }
-            continue;
-        }
-        return outcome;
+            return outcome;
         }
     }
 
     /// 接收消息: 拷贝到 `buf`, 返回实际字节数 (空时按超时阻塞)
     pub fn recv(&self, buf: &mut [u8], timeout: Timeout) -> Result<usize, Error> {
-        assert_thread_context(timeout);
+        ensure_ipc_context(timeout)?;
         loop {
-        let mut outcome = Err(Error::TimedOut);
-        let mut need = false;
-        let mut blocked = false;
-        critical_section::with(|cs| unsafe {
-            let q = &mut *self.ptr();
-            q.ensure_pool();
-            if q.count > 0 {
-                let b = q.head;
-                q.head = q.block_next(b);
-                q.count -= 1;
-                let len = q.block_len(b).min(buf.len());
-                core::ptr::copy_nonoverlapping(q.block_data(b), buf.as_mut_ptr(), len);
-                // 归还空闲链表
-                q.set_block_next(b, q.free);
-                q.free = b;
-                outcome = Ok(len);
-                if let Some(w) = wake_head(&mut q.sender_list, cs) {
-                    need = resched_needed(w);
+            let mut outcome = Err(Error::TimedOut);
+            let mut need = false;
+            let mut blocked = false;
+            critical_section::with(|cs| unsafe {
+                let q = &mut *self.ptr();
+                q.ensure_pool();
+                if q.count > 0 {
+                    let b = q.head;
+                    q.head = q.block_next(b);
+                    q.count -= 1;
+                    let len = q.block_len(b).min(buf.len());
+                    core::ptr::copy_nonoverlapping(q.block_data(b), buf.as_mut_ptr(), len);
+                    // 归还空闲链表
+                    q.set_block_next(b, q.free);
+                    q.free = b;
+                    outcome = Ok(len);
+                    if let Some(w) = wake_head(&mut q.sender_list, cs) {
+                        need = resched_needed(w);
+                    }
+                } else if timeout == Timeout::Ticks(0) {
+                    outcome = Err(Error::TimedOut);
+                } else {
+                    suspend_current(&mut q.base.suspend_list, timeout.timer_delay(), cs);
+                    blocked = true;
                 }
-            } else if timeout == Timeout::Ticks(0) {
-                outcome = Err(Error::TimedOut);
-            } else {
-                suspend_current(&mut q.base.suspend_list, timeout.ticks(), cs);
-                blocked = true;
+            });
+            if need {
+                sched::schedule();
             }
-        });
-        if need {
-            sched::schedule();
-        }
-        if blocked {
-            // 唤醒后: 超时返回, 否则重试接收
-            if blocked_wait() {
-                return Err(Error::TimedOut);
+            if blocked {
+                // 唤醒后: 超时返回, 否则重试接收
+                if blocked_wait() {
+                    return Err(Error::TimedOut);
+                }
+                continue;
             }
-            continue;
-        }
-        return outcome;
+            return outcome;
         }
     }
 
     #[inline]
     fn ptr(&self) -> *mut MessageQueueInner {
         self.inner.get()
+    }
+}
+
+impl Drop for MessageQueue {
+    fn drop(&mut self) {
+        let q = self.inner.get_mut();
+        if q.pool.is_null() {
+            return;
+        }
+        let layout = q.pool_layout();
+        unsafe { dealloc(q.pool, layout) };
+        q.pool = ptr::null_mut();
     }
 }
 
@@ -1006,10 +1190,11 @@ impl MessageQueueInner {
         if !self.pool.is_null() {
             return;
         }
-        let block_size = self.block_size as usize;
         let max_msgs = self.max_msgs as usize;
-        let v = vec![0u8; block_size * max_msgs];
-        let (pool, _, _) = v.into_raw_parts();
+        let layout = self.pool_layout();
+        let pool = alloc(layout);
+        assert!(!pool.is_null(), "消息队列池分配失败");
+        core::ptr::write_bytes(pool, 0, layout.size());
         self.pool = pool;
         for i in 0..max_msgs {
             let next = if i + 1 < max_msgs {
@@ -1019,6 +1204,13 @@ impl MessageQueueInner {
             };
             self.set_block_next(i as u32, next);
         }
+    }
+
+    fn pool_layout(&self) -> Layout {
+        let bytes = (self.block_size as usize)
+            .checked_mul(self.max_msgs as usize)
+            .expect("消息队列池大小失效");
+        Layout::from_size_align(bytes, core::mem::align_of::<u32>()).expect("消息队列池布局失效")
     }
 
     #[inline]

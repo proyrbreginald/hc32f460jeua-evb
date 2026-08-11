@@ -66,6 +66,7 @@ struct InputLine {
     text: alloc::string::String,
     overflowed: bool,
     non_ascii: bool,
+    rx_corrupted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -395,14 +396,22 @@ fn login(state: &mut ShellState) {
         print!("{} login: ", HOSTNAME);
         let user = read_line(&mut state.pending_rx, false, LINE_BUF, None);
         println!();
-        if user.overflowed || user.non_ascii || user.text.trim() != SHELL_USERNAME {
+        if user.overflowed
+            || user.non_ascii
+            || user.rx_corrupted
+            || user.text.trim() != SHELL_USERNAME
+        {
             tries += 1;
             println!("Login incorrect");
         } else {
             print!("Password: ");
             let pass = read_line(&mut state.pending_rx, true, LINE_BUF, None);
             println!();
-            if !pass.overflowed && !pass.non_ascii && pass.text == SHELL_PASSWORD {
+            if !pass.overflowed
+                && !pass.non_ascii
+                && !pass.rx_corrupted
+                && pass.text == SHELL_PASSWORD
+            {
                 state.cwd = ShellPath::root();
                 println!(
                     "Welcome to RT-RUST {} ({} kernel, {}).",
@@ -420,7 +429,7 @@ fn login(state: &mut ShellState) {
         if tries >= SHELL_LOGIN_TRIES {
             println!();
             println!("Too many login failures; try again later.");
-            crate::rtos::thread_delay_ms(1000);
+            crate::rtos::thread_delay_ms(1000).expect("shell 延时必须在线程上下文");
             tries = 0;
         }
     }
@@ -438,6 +447,10 @@ fn command_loop(state: &mut ShellState) {
         }
         if line.non_ascii {
             println!("输入包含非 ASCII 字节，命令未执行");
+            continue;
+        }
+        if line.rx_corrupted {
+            println!("串口接收期间发生丢字节或校验错误，命令未执行");
             continue;
         }
         let cmd = line.text.trim();
@@ -1371,7 +1384,7 @@ fn cmd_whoami(_state: &mut ShellState, _rest: &str) -> CmdResult {
 /// 软复位 (AIRCR.SYSRESETREQ)
 fn cmd_reboot(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("rebooting...");
-    crate::rtos::thread_delay_ms(50);
+    crate::rtos::thread_delay_ms(50).expect("shell 延时必须在线程上下文");
     crate::arch::system_reset()
 }
 
@@ -1519,6 +1532,9 @@ fn read_line(
     history: Option<&CommandHistory>,
 ) -> InputLine {
     let uart = crate::board::BoardResources::get().console();
+    // 错误统计窗口从上一行结束延续到本行结束。这样即使用户在上一条
+    // 命令执行期间提前输入，期间发生的硬件错误或软件环溢出也不会在
+    // 新提示符出现时被清掉；受影响的下一行会被完整拒绝。
     let mut line = alloc::string::String::new();
     let mut overflow = 0usize;
     let mut non_ascii = false;
@@ -1606,9 +1622,12 @@ fn read_line(
             _ => {}
         }
     }
+    let dropped = uart.rx_dropped_count();
+    let (parity, framing, overrun) = uart.rx_error_counts();
     InputLine {
         text: line,
         overflowed: overflow != 0,
         non_ascii,
+        rx_corrupted: dropped != 0 || parity != 0 || framing != 0 || overrun != 0,
     }
 }

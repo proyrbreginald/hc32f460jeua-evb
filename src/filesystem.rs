@@ -96,7 +96,7 @@ impl InternalFlash {
         let base = Self::address(block, 0, BLOCK_SIZE as usize)?;
         let mut offset = 0;
         while offset < BLOCK_SIZE {
-            if crate::efm::read_word(base + offset) != u32::MAX {
+            if crate::efm::read_word(base + offset).map_err(FlashError::Controller)? != u32::MAX {
                 return Err(FlashError::VerifyFailed);
             }
             offset += 4;
@@ -108,7 +108,7 @@ impl InternalFlash {
         Self::check_thread_context()?;
         let mut address = PARTITION_START;
         while address < PARTITION_END {
-            if crate::efm::read_word(address) != u32::MAX {
+            if crate::efm::read_word(address).map_err(FlashError::Controller)? != u32::MAX {
                 return Ok(false);
             }
             address += 4;
@@ -138,7 +138,8 @@ impl BlockDevice for InternalFlash {
         Self::check_thread_context()?;
         let address = Self::address(block, offset, buffer.len())?;
         for (index, byte) in buffer.iter_mut().enumerate() {
-            *byte = crate::efm::read_byte(address + index as u32);
+            *byte =
+                crate::efm::read_byte(address + index as u32).map_err(FlashError::Controller)?;
         }
         Ok(())
     }
@@ -153,7 +154,9 @@ impl BlockDevice for InternalFlash {
         // HC32F460 does not guarantee repeated programming, even for 1 -> 0.
         // Every destination word must still be in its pristine erased state.
         for index in (0..data.len()).step_by(4) {
-            if crate::efm::read_word(address + index as u32) != u32::MAX {
+            if crate::efm::read_word(address + index as u32).map_err(FlashError::Controller)?
+                != u32::MAX
+            {
                 return Err(FlashError::NotErased);
             }
         }
@@ -161,7 +164,8 @@ impl BlockDevice for InternalFlash {
         crate::efm::program(address, data).map_err(FlashError::Controller)?;
 
         for (index, expected) in data.chunks_exact(4).enumerate() {
-            let actual = crate::efm::read_word(address + (index * 4) as u32);
+            let actual = crate::efm::read_word(address + (index * 4) as u32)
+                .map_err(FlashError::Controller)?;
             if actual.to_le_bytes() != expected {
                 return Err(FlashError::VerifyFailed);
             }

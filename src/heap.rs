@@ -1,69 +1,56 @@
 //! 堆内存分配器 (边界标记 + 首次适配)
 //!
-//! 实现 `GlobalAlloc`, 启用 Rust 标准堆数据结构 (Vec/Box/String 等)。
+//! 实现 [`GlobalAlloc`], 为 `Vec`/`Box`/`String` 等提供动态内存。
 //!
-//! # 设计
+//! # 块布局
 //!
-//! - **块格式**: `[header 8B | payload | footer 8B]`, 每块 16 字节元数据;
-//!   header 记录总大小与使用标志, footer 记录大小 —— 释放时可通过
-//!   footer O(1) 定位前块并合并;
-//! - **空闲链表**: 空闲块 payload 内嵌 next 指针, 首次适配 (first-fit);
-//! - **合并**: 释放时向前/向后合并相邻空闲块, 防碎片;
-//! - **对齐**: 8 字节 (ARM EABI); 最小块 24 字节;
-//! - **中断安全**: 分配/释放全程临界区 ([`crate::critical_section`]),
-//!   中断中可安全调用;
-//! - **惰性初始化**: 首次分配时把整个堆初始化为一个空闲块,
-//!   不依赖启动代码;
-//! - **堆边界**: 由 link.ld 的 `.heap` 段符号定义 (bss 之后, 栈预留
-//!   8KB 之前)。
+//! ```text
+//! [Block header | padding | owner prefix | aligned payload | padding | footer]
+//! ```
 //!
-//! # 限制
+//! 块头和块尾记录总长度，空闲块的 header 后内嵌 next 指针。已分配
+//! payload 前的 owner prefix 保存原始块地址，使任意 2 的幂对齐都可在
+//! 释放时 O(1) 找回块头。每个块的总长度始终按 8 字节对齐，因此相邻块
+//! 不会逐次偏移。所有来自 [`Layout`] 的尺寸运算均使用 checked arithmetic。
 //!
-//! - 仅支持对齐 ≤ 8 字节的 [`Layout`] (更大对齐返回 null, 应用会 panic);
-//! - 双重复用同一指针 (double-free) 与释放非法指针属于未定义行为;
-//! - 堆容量 = RAM 188KB - bss - 栈预留 8KB ≈ 180KB。
-//!
-//! `unsafe fn` 整体即 unsafe 契约 (不变量由调用方承担), 内部不再逐段
-//! 包裹 unsafe 块, 因此允许 `unsafe_op_in_unsafe_fn`。
+//! 分配与释放全程关闭中断，适用于单核线程/ISR 竞争；非法指针释放、
+//! double-free 与越界写仍属于 [`GlobalAlloc`] 调用方违反契约。
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// 块头 (8 字节): 总大小 (含 header+footer) + 使用标志
+use crate::heap_layout::{allocation_plan, checked_align_up};
+
+/// 块头：总大小 (含全部元数据) + 使用标志。
 #[repr(C)]
 struct Block {
     size: usize,
-    used: usize, // 0=空闲, 1=已分配
+    used: usize,
 }
 
-/// 块头大小 (payload 起始偏移)
 const HEADER: usize = core::mem::size_of::<Block>();
-/// footer 大小 (块尾的 size 字段)
 const FOOTER: usize = core::mem::size_of::<usize>();
-/// 每块元数据开销: header + footer
+const PREFIX: usize = core::mem::size_of::<usize>();
 const OVERHEAD: usize = HEADER + FOOTER;
-/// 最小块: 空闲块需容纳 next 指针
-const MIN_BLOCK: usize = OVERHEAD + core::mem::size_of::<usize>();
-/// 对齐 (ARM EABI)
-const ALIGN: usize = 8;
-/// 空闲链表结束标记 (地址 0 不在堆内)
+const BLOCK_ALIGN: usize = 8;
+const MIN_BLOCK: usize =
+    (OVERHEAD + core::mem::size_of::<usize>() + BLOCK_ALIGN - 1) & !(BLOCK_ALIGN - 1);
 const NULL_BLOCK: usize = 0;
 
-/// 空闲链表头
+const _: () = assert!(BLOCK_ALIGN.is_power_of_two());
+const _: () = assert!(BLOCK_ALIGN >= core::mem::align_of::<Block>());
+const _: () = assert!(BLOCK_ALIGN >= core::mem::align_of::<usize>());
+
 static FREE_HEAD: AtomicUsize = AtomicUsize::new(NULL_BLOCK);
-/// 惰性初始化标志 (堆整体已切分为空闲块)
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// 全局堆分配器 (注册为 `#[global_allocator]`)
+/// 全局堆分配器。
 pub struct HeapAllocator;
 
 unsafe impl GlobalAlloc for HeapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.align() > ALIGN {
-            return core::ptr::null_mut();
-        }
-        crate::critical_section::with(|_| unsafe { alloc_inner(layout.size()) })
+        crate::critical_section::with(|_| unsafe { alloc_inner(layout) })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
@@ -73,60 +60,57 @@ unsafe impl GlobalAlloc for HeapAllocator {
     }
 }
 
-// ---- 地址转换与块操作原语 (均为 8 字节对齐地址, 对齐访问安全) ----
-
-/// 堆边界 (link.ld `.heap` 段符号)
+/// 对链接脚本边界做防御性对齐。`_heap_end` 前方是主栈 canary，不能
+/// 向上扩展；最多舍弃首尾各 7 字节。
 #[inline]
 fn heap_bounds() -> (usize, usize) {
-    let start = core::ptr::addr_of!(_heap_start) as usize;
-    let end = core::ptr::addr_of!(_heap_end) as usize;
+    let raw_start = core::ptr::addr_of!(_heap_start) as usize;
+    let raw_end = core::ptr::addr_of!(_heap_end) as usize;
+    let end = raw_end & !(BLOCK_ALIGN - 1);
+    let start = checked_align_up(raw_start, BLOCK_ALIGN)
+        .unwrap_or(end)
+        .min(end);
     (start, end)
 }
 
-/// 堆容量 (字节, 诊断/启动横幅用)
+/// 堆可用容量 (字节)。
 pub fn capacity() -> usize {
     let (start, end) = heap_bounds();
     end.saturating_sub(start)
 }
 
-/// 已用堆内存 (字节, 诊断/终端 `free` 用)
-///
-/// 遍历空闲链表累加空闲字节, 容量减空闲即为已用 (含元数据开销)。
+/// 已占用堆空间 (包含已分配块的内部元数据/对齐填充)。
 pub fn used() -> usize {
     crate::critical_section::with(|_| {
         let (start, end) = heap_bounds();
         if !INITIALIZED.load(Ordering::Relaxed) {
             return 0;
         }
-        let mut free = 0;
+        let mut free = 0usize;
         let mut cur = FREE_HEAD.load(Ordering::Relaxed);
         while cur != NULL_BLOCK {
-            free += block_size(cur);
+            free = free.saturating_add(block_size(cur));
             cur = next_ptr(cur);
         }
-        (end - start).saturating_sub(free)
+        end.saturating_sub(start).saturating_sub(free)
     })
 }
 
-/// payload 指针 → 块头地址
 #[inline]
 fn block_of(payload: *mut u8) -> usize {
-    payload as usize - HEADER
+    unsafe { core::ptr::read((payload as usize - PREFIX) as *const usize) }
 }
 
-/// 块头地址 → payload 指针
 #[inline]
-fn payload_of(block: usize) -> *mut u8 {
-    (block + HEADER) as *mut u8
+unsafe fn write_prefix(payload: usize, block: usize) {
+    unsafe { core::ptr::write((payload - PREFIX) as *mut usize, block) };
 }
 
-/// 块总大小 (含 header+footer)
 #[inline]
 fn block_size(block: usize) -> usize {
     unsafe { (*(block as *const Block)).size }
 }
 
-/// 空闲块的 next 指针 (payload 开头)
 #[inline]
 fn next_ptr(block: usize) -> usize {
     unsafe { core::ptr::read_volatile((block + HEADER) as *const usize) }
@@ -134,12 +118,9 @@ fn next_ptr(block: usize) -> usize {
 
 #[inline]
 unsafe fn set_next(block: usize, next: usize) {
-    unsafe {
-        core::ptr::write_volatile((block + HEADER) as *mut usize, next);
-    }
+    unsafe { core::ptr::write_volatile((block + HEADER) as *mut usize, next) };
 }
 
-/// 读本块前的 footer (定位前块)
 #[inline]
 fn read_footer(block: usize) -> usize {
     unsafe { core::ptr::read_volatile((block - FOOTER) as *const usize) }
@@ -147,39 +128,38 @@ fn read_footer(block: usize) -> usize {
 
 #[inline]
 unsafe fn write_footer(block: usize, size: usize) {
-    unsafe {
-        core::ptr::write_volatile((block + size - FOOTER) as *mut usize, size);
-    }
+    unsafe { core::ptr::write_volatile((block + size - FOOTER) as *mut usize, size) };
 }
 
-/// 惰性初始化: 把整个堆切分为一个空闲块
 unsafe fn init_heap(heap_start: usize, heap_end: usize) {
-    if !INITIALIZED.load(Ordering::Relaxed) {
-        let total = heap_end - heap_start;
-        if total >= MIN_BLOCK {
-            unsafe {
-                (*(heap_start as *mut Block)) = Block {
-                    size: total,
-                    used: 0,
-                };
-                write_footer(heap_start, total);
-                set_next(heap_start, NULL_BLOCK);
-            }
-            FREE_HEAD.store(heap_start, Ordering::Relaxed);
-        }
-        INITIALIZED.store(true, Ordering::Relaxed);
+    if INITIALIZED.load(Ordering::Relaxed) {
+        return;
     }
+
+    let total = heap_end.saturating_sub(heap_start);
+    if total >= MIN_BLOCK {
+        unsafe {
+            (heap_start as *mut Block).write(Block {
+                size: total,
+                used: 0,
+            });
+            write_footer(heap_start, total);
+            set_next(heap_start, NULL_BLOCK);
+        }
+        FREE_HEAD.store(heap_start, Ordering::Relaxed);
+    }
+    INITIALIZED.store(true, Ordering::Relaxed);
 }
 
-/// 分裂块: 前 `need` 字节留作分配, 剩余成为新空闲块 (继承原 next)
+/// 前 `need` 字节用于当前分配，后段继承原空闲链表位置。
 unsafe fn split_block(block: usize, need: usize) -> usize {
     let new_block = block + need;
     let new_size = block_size(block) - need;
     unsafe {
-        (*(new_block as *mut Block)) = Block {
+        (new_block as *mut Block).write(Block {
             size: new_size,
             used: 0,
-        };
+        });
         write_footer(new_block, new_size);
         set_next(new_block, next_ptr(block));
         (*(block as *mut Block)).size = need;
@@ -187,88 +167,83 @@ unsafe fn split_block(block: usize, need: usize) -> usize {
     new_block
 }
 
-/// 首次适配分配 (调用方必须在临界区内)
-unsafe fn alloc_inner(size: usize) -> *mut u8 {
+unsafe fn alloc_inner(layout: Layout) -> *mut u8 {
     let (heap_start, heap_end) = heap_bounds();
     if heap_end <= heap_start {
         return core::ptr::null_mut();
     }
-    init_heap(heap_start, heap_end);
+    unsafe { init_heap(heap_start, heap_end) };
 
-    // 需求总大小 (8 字节对齐 + 元数据)
-    let need = ((size + ALIGN - 1) & !(ALIGN - 1)) + OVERHEAD;
-
-    let mut prev: usize = NULL_BLOCK;
+    let mut prev = NULL_BLOCK;
     let mut cur = FREE_HEAD.load(Ordering::Relaxed);
     while cur != NULL_BLOCK {
-        if block_size(cur) >= need {
-            if block_size(cur) - need >= MIN_BLOCK {
-                // 分裂: 前段分配, 后段入链表
-                let remainder = split_block(cur, need);
-                if prev == NULL_BLOCK {
-                    FREE_HEAD.store(remainder, Ordering::Relaxed);
-                } else {
-                    set_next(prev, remainder);
-                }
+        let available = block_size(cur);
+        let Some(plan) =
+            allocation_plan(cur, available, layout, HEADER, PREFIX, FOOTER, BLOCK_ALIGN)
+        else {
+            prev = cur;
+            cur = next_ptr(cur);
+            continue;
+        };
+
+        if available - plan.block_size >= MIN_BLOCK {
+            let remainder = unsafe { split_block(cur, plan.block_size) };
+            if prev == NULL_BLOCK {
+                FREE_HEAD.store(remainder, Ordering::Relaxed);
             } else {
-                // 整块分配: 从空闲链表移除
-                let next = next_ptr(cur);
-                if prev == NULL_BLOCK {
-                    FREE_HEAD.store(next, Ordering::Relaxed);
-                } else {
-                    set_next(prev, next);
-                }
+                unsafe { set_next(prev, remainder) };
             }
-            // 标记已分配
-            unsafe {
-                (*(cur as *mut Block)).used = 1;
-                write_footer(cur, block_size(cur));
+        } else {
+            let next = next_ptr(cur);
+            if prev == NULL_BLOCK {
+                FREE_HEAD.store(next, Ordering::Relaxed);
+            } else {
+                unsafe { set_next(prev, next) };
             }
-            return payload_of(cur);
         }
-        prev = cur;
-        cur = next_ptr(cur);
+
+        unsafe {
+            (*(cur as *mut Block)).used = 1;
+            write_footer(cur, block_size(cur));
+            write_prefix(plan.payload, cur);
+        }
+        return plan.payload as *mut u8;
     }
-    core::ptr::null_mut() // 堆耗尽
+    core::ptr::null_mut()
 }
 
-/// 释放并合并相邻空闲块 (调用方必须在临界区内)
 unsafe fn dealloc_inner(payload: *mut u8) {
     let (heap_start, heap_end) = heap_bounds();
-
     let mut block = block_of(payload);
     let mut total_size = block_size(block);
 
-    // 合并前块: 通过本块前的 footer 定位
     if block > heap_start {
         let prev_size = read_footer(block);
-        let prev = block - prev_size;
-        // 合法性: 前块起始在堆内, 大小与 header 一致, 且为空闲
-        if prev >= heap_start
-            && prev_size >= MIN_BLOCK
+        if prev_size >= MIN_BLOCK
+            && prev_size.is_multiple_of(BLOCK_ALIGN)
+            && let Some(prev) = block.checked_sub(prev_size)
+            && prev >= heap_start
             && prev_size == block_size(prev)
             && unsafe { (*(prev as *const Block)).used == 0 }
         {
-            remove_from_free_list(prev);
+            unsafe { remove_from_free_list(prev) };
             total_size += prev_size;
             block = prev;
         }
     }
 
-    // 标记本块空闲
-    unsafe {
-        (*(block as *mut Block)).used = 0;
-    }
+    unsafe { (*(block as *mut Block)).used = 0 };
 
-    // 合并后块: 通过 size 定位
-    let next = block + total_size;
-    if next + MIN_BLOCK <= heap_end && unsafe { (*(next as *const Block)).used == 0 } {
+    if let Some(next) = block.checked_add(total_size)
+        && let Some(next_min_end) = next.checked_add(MIN_BLOCK)
+        && next_min_end <= heap_end
+        && unsafe { (*(next as *const Block)).used == 0 }
+    {
         let next_size = block_size(next);
-        remove_from_free_list(next);
+        unsafe { remove_from_free_list(next) };
         total_size += next_size;
     }
 
-    // 写回大小/footer 并插入空闲链表头
     unsafe {
         (*(block as *mut Block)).size = total_size;
         write_footer(block, total_size);
@@ -277,9 +252,8 @@ unsafe fn dealloc_inner(payload: *mut u8) {
     FREE_HEAD.store(block, Ordering::Relaxed);
 }
 
-/// 从空闲链表移除指定块 (调用方必须在临界区内)
 unsafe fn remove_from_free_list(target: usize) {
-    let mut prev: usize = NULL_BLOCK;
+    let mut prev = NULL_BLOCK;
     let mut cur = FREE_HEAD.load(Ordering::Relaxed);
     while cur != NULL_BLOCK {
         if cur == target {
@@ -287,7 +261,7 @@ unsafe fn remove_from_free_list(target: usize) {
             if prev == NULL_BLOCK {
                 FREE_HEAD.store(next, Ordering::Relaxed);
             } else {
-                set_next(prev, next);
+                unsafe { set_next(prev, next) };
             }
             return;
         }
@@ -296,7 +270,6 @@ unsafe fn remove_from_free_list(target: usize) {
     }
 }
 
-// 堆区边界 (link.ld `.heap` 段)
 unsafe extern "C" {
     static _heap_start: u8;
     static _heap_end: u8;

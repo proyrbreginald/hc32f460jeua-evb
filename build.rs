@@ -4,18 +4,35 @@
 //! 段, 由 `src/config.rs` 编译期读取。
 
 fn main() {
-    // 构建日期 (UTC, 公历)
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    // 输出任意 rerun-if 指令后 Cargo 会关闭默认的整包变更追踪，因此显式
+    // 列出会改变固件内容的输入，避免开发构建横幅日期长期停留在旧值。
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=.cargo/config.toml");
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=crates/littlefs/Cargo.toml");
+    println!("cargo:rerun-if-changed=crates/littlefs/src");
+
+    // 构建日期 (UTC, 公历)。可复现构建由 SOURCE_DATE_EPOCH 固定时间；
+    // 未设置时保留开发固件显示实际构建日的便利行为。
+    let secs = match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => value
+            .parse::<u64>()
+            .expect("SOURCE_DATE_EPOCH 必须为非负 Unix 秒数"),
+        Err(std::env::VarError::NotPresent) => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        Err(std::env::VarError::NotUnicode(_)) => panic!("SOURCE_DATE_EPOCH 必须是 UTF-8"),
+    };
     let (y, m, d) = unix_to_ymd(secs);
     println!("cargo:rustc-env=RTOS_BUILD_DATE={:04}-{:02}-{:02}", y, m, d);
 
     // rustc 版本
-    if let Ok(out) = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    if let Ok(out) = std::process::Command::new(rustc).arg("--version").output()
         && let Ok(s) = String::from_utf8(out.stdout)
     {
         println!("cargo:rustc-env=RTOS_RUSTC={}", s.trim());
