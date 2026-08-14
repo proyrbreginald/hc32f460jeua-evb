@@ -7,7 +7,7 @@ MCU/CPU 架构时应继续抽象的接口。目标不是隐藏所有硬件差异
 ## 目标分层
 
 ```text
-application (main / shell / selftest)
+application (main / shell / selftest / soak)
                  |
                  v
 board/BSP -------+-------- OS adapters (uart_rtos)

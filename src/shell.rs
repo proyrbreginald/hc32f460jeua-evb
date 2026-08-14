@@ -24,7 +24,7 @@
 //! 当前命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) /
 //! `echo` / `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` /
 //! `write`(put) / `nano` / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` /
-//! `mount` / `mkfs` / `led` / `log` / `selftest` / `clear` / `whoami` /
+//! `mount` / `mkfs` / `led` / `log` / `selftest` / `soak` / `clear` / `whoami` /
 //! `reboot` / `logout`(exit)。
 //!
 //! # 输入处理
@@ -372,6 +372,7 @@ static COMMANDS: &[Command] = &[
     cmd("mkfs", &[], "清空文件系统: mkfs --force", cmd_mkfs),
     cmd("led", &[], "板载 LED on|off", cmd_led),
     cmd("selftest", &[], "自检: selftest [all|can]", cmd_selftest),
+    cmd("soak", &[], "长稳测试: soak [分钟] (0=直到ESC)", cmd_soak),
     cmd("log", &[], "日志开关/级别 (on|off|level <级>)", cmd_log),
     cmd("clear", &[], "清屏", cmd_clear),
     cmd("whoami", &[], "当前用户", cmd_whoami),
@@ -1369,6 +1370,28 @@ fn cmd_selftest(_state: &mut ShellState, rest: &str) -> CmdResult {
         }
     } else {
         println!("selftest 未启用 (CFG_APP_SELFTEST_ENABLE=false)");
+    }
+    CmdResult::Ok
+}
+
+/// 长期稳定性测试: **同步执行** (期间压力线程在后台运行,
+/// shell 线程兼任监控器, 可按 ESC 中断)
+/// (受 CFG_SOAK_ENABLE 控制)
+fn cmd_soak(_state: &mut ShellState, rest: &str) -> CmdResult {
+    if config::SOAK_ENABLE {
+        let minutes = match rest.trim() {
+            "" => config::SOAK_MINUTES,
+            s => match s.parse::<u32>() {
+                Ok(m) => m,
+                Err(_) => {
+                    println!("用法: soak [分钟] (0 = 直到 ESC)");
+                    return CmdResult::Ok;
+                }
+            },
+        };
+        crate::soak::run(minutes);
+    } else {
+        println!("soak 未启用 (CFG_SOAK_ENABLE=false)");
     }
     CmdResult::Ok
 }

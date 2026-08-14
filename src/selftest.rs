@@ -35,7 +35,7 @@ extern "C" fn blk_sender(_param: usize) {
 /// 检测用户是否按下 ESC (0x1B): 轮询并清空接收缓冲
 ///
 /// 自检期间终端输入一律丢弃 (ESC 除外); 返回 true 表示请求中断。
-fn abort_requested() -> bool {
+pub(crate) fn abort_requested() -> bool {
     let uart = crate::board::BoardResources::get().console();
     let mut esc = false;
     while let Some(b) = uart.read_rx() {

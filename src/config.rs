@@ -832,3 +832,33 @@ const _: () = assert!(
     APP_TIMER_PERIOD_MS > 0,
     "CFG_APP_TIMER_PERIOD_MS 必须大于 0"
 );
+
+// ============================== [soak] ==============================
+
+/// 是否启用长期稳定性测试 (CFG_SOAK_ENABLE = true/false)
+/// 启用后通过 shell 命令 `soak` 手动启动
+pub const SOAK_ENABLE: bool = parse_bool(env!("CFG_SOAK_ENABLE"));
+/// soak 无参数时的默认时长 (分钟; 0 = 直到 ESC)
+pub const SOAK_MINUTES: u32 = parse_u32(env!("CFG_SOAK_MINUTES"));
+const _: () = assert!(
+    SOAK_MINUTES <= 24 * 60 * 7,
+    "CFG_SOAK_MINUTES 不应超过 7 天 (10080 分钟)"
+);
+/// 进度报告间隔 (毫秒)
+pub const SOAK_REPORT_INTERVAL_MS: u32 = parse_u32(env!("CFG_SOAK_REPORT_INTERVAL_MS"));
+const _: () = assert!(
+    SOAK_REPORT_INTERVAL_MS >= 1000,
+    "CFG_SOAK_REPORT_INTERVAL_MS 应不小于 1000"
+);
+/// 压力线程心跳停滞判定: 超过该时长无进展即判挂起 (毫秒)
+pub const SOAK_HANG_GRACE_MS: u32 = parse_u32(env!("CFG_SOAK_HANG_GRACE_MS"));
+const _: () = assert!(
+    SOAK_HANG_GRACE_MS >= 1000,
+    "CFG_SOAK_HANG_GRACE_MS 应不小于 1000"
+);
+/// Flash 压力节流: 两次擦写循环的最小间隔 (毫秒, 保护 Flash 寿命)
+pub const SOAK_FLASH_INTERVAL_MS: u32 = parse_u32(env!("CFG_SOAK_FLASH_INTERVAL_MS"));
+const _: () = assert!(
+    SOAK_FLASH_INTERVAL_MS >= 1000,
+    "CFG_SOAK_FLASH_INTERVAL_MS 应不小于 1000"
+);

@@ -54,6 +54,7 @@ mod uart_rtos; // UART 的 RTOS 阻塞接收适配层
 // ---- 应用 ----
 mod banner; // 启动横幅 (依赖 clk/heap/rtos 公共状态)
 mod selftest; // 内核自检 (shell `selftest` 命令同步执行)
+mod soak; // 长期稳定性测试 (shell `soak` 命令同步执行)
 mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
 
 use core::sync::atomic::{AtomicU32, Ordering};

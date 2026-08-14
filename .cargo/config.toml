@@ -113,7 +113,7 @@ CFG_SHELL_LOGIN_TRIES = "3"    # 登录失败允许次数
 CFG_SHELL_LINE_BUF = "128"     # 输入行缓冲区 (字节)
 CFG_SHELL_HISTORY_SIZE = "8"   # RAM 中保留的历史命令条数 (重启后清空)
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
-CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,nano,rm,mv,stat,df,fsck,mount,mkfs,led,log,selftest,clear,whoami,reboot,logout"
+CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,nano,rm,mv,stat,df,fsck,mount,mkfs,led,log,selftest,soak,clear,whoami,reboot,logout"
 
 # [nano] 轻量全屏文本编辑器 (ASCII, ANSI 终端; 行列为自动探测失败时的回退值)
 CFG_NANO_COLUMNS = "80"
@@ -128,7 +128,7 @@ CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出
 CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
 
 # [wdt] 硬件看门狗 (最高优先级 supervisor 周期喂狗; 调试期建议关闭)
-CFG_WDT_ENABLE = "false"
+CFG_WDT_ENABLE = "true"
 CFG_WDT_STACK = "512"
 CFG_WDT_PRIORITY = "0"
 CFG_WDT_FEED_MS = "500"
@@ -148,6 +148,13 @@ CFG_APP_LED_STACK = "1024"
 CFG_APP_LED_PRIORITY = "2"
 CFG_APP_LED_TIMESLICE = "10"
 CFG_APP_LED_BLINK_MS = "500"
+
+# [soak] 长期稳定性测试 (shell `soak` 命令, 同步执行)
+CFG_SOAK_ENABLE = "true"             # 命令开关 (false 时提示未启用)
+CFG_SOAK_MINUTES = "10"              # soak 无参数时的默认时长 (分钟, 0 = 直到 ESC)
+CFG_SOAK_REPORT_INTERVAL_MS = "30000" # 进度报告间隔 (毫秒)
+CFG_SOAK_HANG_GRACE_MS = "5000"      # 压力线程心跳停滞判定 (毫秒)
+CFG_SOAK_FLASH_INTERVAL_MS = "10000" # Flash 压力节流: 两次擦写循环的最小间隔 (毫秒)
 
 [target.thumbv7em-none-eabihf]
 rustflags = [
