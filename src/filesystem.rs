@@ -117,24 +117,46 @@ impl InternalFlash {
 
     fn verify_erased(block: u32) -> Result<(), FlashError> {
         let base = Self::address(block, 0, BLOCK_SIZE as usize)?;
-        let mut offset = 0;
-        while offset < BLOCK_SIZE {
-            if crate::efm::read_word(base + offset).map_err(FlashError::Controller)? != u32::MAX {
-                return Err(FlashError::VerifyFailed);
-            }
-            offset += 4;
+        if !Self::region_erased(base, BLOCK_SIZE as usize)? {
+            return Err(FlashError::VerifyFailed);
         }
         Ok(())
     }
 
     fn partition_is_erased(&self) -> Result<bool, FlashError> {
         Self::check_thread_context()?;
-        let mut address = PARTITION_START;
-        while address < PARTITION_END {
-            if crate::efm::read_word(address).map_err(FlashError::Controller)? != u32::MAX {
-                return Ok(false);
+        Self::region_erased(PARTITION_START, PARTITION_SIZE as usize)
+    }
+
+    /// 校验 [address, address+len) 是否全部为擦除态 (0xFF)。
+    ///
+    /// 优先 DMA 整块读回 (Flash→RAM, 见 [`crate::dma::copy_try`]),
+    /// 回退逐字轮询; 逐 1KiB 分块, 栈缓冲零分配。
+    fn region_erased(address: u32, len: usize) -> Result<bool, FlashError> {
+        let mut scratch = [0xFFu8; 1024];
+        let mut offset = 0;
+        while offset < len {
+            let chunk = (len - offset).min(scratch.len());
+            if crate::dma::copy_try(
+                (address + offset as u32) as *const u8,
+                scratch.as_mut_ptr(),
+                chunk,
+            ) {
+                if scratch[..chunk].iter().any(|&b| b != 0xFF) {
+                    return Ok(false);
+                }
+            } else {
+                let mut i = 0;
+                while i < chunk {
+                    let actual = crate::efm::read_word(address + offset as u32 + i as u32)
+                        .map_err(FlashError::Controller)?;
+                    if actual != u32::MAX {
+                        return Ok(false);
+                    }
+                    i += 4;
+                }
             }
-            address += 4;
+            offset += chunk;
         }
         Ok(true)
     }
@@ -160,6 +182,11 @@ impl BlockDevice for InternalFlash {
     fn read(&mut self, block: u32, offset: u32, buffer: &mut [u8]) -> Result<(), Self::Error> {
         Self::check_thread_context()?;
         let address = Self::address(block, offset, buffer.len())?;
+        // 大块读取走 DMA 整块拷贝 (Flash→RAM, 比逐字节循环快约一个数量级);
+        // 未接管 (过短/通道忙) 时回退逐字节轮询。
+        if crate::dma::copy_try(address as *const u8, buffer.as_mut_ptr(), buffer.len()) {
+            return Ok(());
+        }
         for (index, byte) in buffer.iter_mut().enumerate() {
             *byte =
                 crate::efm::read_byte(address + index as u32).map_err(FlashError::Controller)?;
@@ -186,12 +213,30 @@ impl BlockDevice for InternalFlash {
 
         crate::efm::program(address, data).map_err(FlashError::Controller)?;
 
-        for (index, expected) in data.chunks_exact(4).enumerate() {
-            let actual = crate::efm::read_word(address + (index * 4) as u32)
-                .map_err(FlashError::Controller)?;
-            if actual.to_le_bytes() != expected {
-                return Err(FlashError::VerifyFailed);
+        // 写后回读校验: 优先 DMA 整块回读 (Flash→RAM) 后比较, 回退逐字。
+        let mut scratch = [0u8; 1024];
+        let mut offset = 0;
+        while offset < data.len() {
+            let chunk = (data.len() - offset).min(scratch.len());
+            if crate::dma::copy_try(
+                (address + offset as u32) as *const u8,
+                scratch.as_mut_ptr(),
+                chunk,
+            ) {
+                if scratch[..chunk] != data[offset..offset + chunk] {
+                    return Err(FlashError::VerifyFailed);
+                }
+            } else {
+                for (index, expected) in data[offset..offset + chunk].chunks_exact(4).enumerate() {
+                    let actual =
+                        crate::efm::read_word(address + offset as u32 + (index * 4) as u32)
+                            .map_err(FlashError::Controller)?;
+                    if actual.to_le_bytes() != expected {
+                        return Err(FlashError::VerifyFailed);
+                    }
+                }
             }
+            offset += chunk;
         }
         Ok(())
     }

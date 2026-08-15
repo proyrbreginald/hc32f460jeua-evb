@@ -73,6 +73,19 @@ CFG_UART_RX_BUF_SIZE = "512"    # 中断接收环形缓冲 (字节)
 CFG_UART_IRQ_CHANNEL = "1"      # INTC 通道 INT000~INT007
 CFG_UART_IRQ_PRIORITY = "8"     # NVIC 抢占优先级 0~15 (越小越高)
 
+# [dma] 直接内存访问 (DMA1/DMA2, 每单元 4 通道)
+# 控制台 UART 发送卸载: 输出长度 ≥ CFG_DMA_TX_MIN 时整块交给 DMA
+# (USART{CFG_UART_UNIT}_TI 事件触发), 发送期间 CPU 不再逐字节轮询 TXE,
+# 长输出 (zmodem sz / cat / soak 报告) 不再长时间占用 CPU 时间。
+# 通道忙 / 输出过短 / 中断上下文时自动回退逐字节轮询, 行为不变。
+CFG_DMA_ENABLE = "true"              # 启用 DMA 驱动与控制台 TX 卸载
+CFG_DMA_TX_UNIT = "2"                # 控制台 TX DMA 单元 (1/2)
+CFG_DMA_TX_CHANNEL = "0"             # 控制台 TX DMA 通道 (0~3)
+CFG_DMA_TX_MIN = "16"                # 触发 DMA 的最小输出长度 (字节)
+# 大块拷贝 (Flash→RAM 读/擦除校验/写后回读) 走 DMA1/CH0, 阈值以下的
+# 读取保持逐字节/逐字回退 (DMA 单次配置开销 ~10µs, 小块反而更慢)。
+CFG_DMA_COPY_MIN = "256"             # 触发 DMA 整块拷贝的最小长度 (字节)
+
 # [can] HC32F460 单路经典 CAN 2.0B
 # 本板仅将 PB7(TX)/PB6(RX) 引到 JP2，没有板载 CAN 收发器；正常模式需外接 PHY。
 # CANCLK 固定为 XTAL；编译期校验 EXCLK>=1.5*CANCLK、<=1Mbit/s 位时序，

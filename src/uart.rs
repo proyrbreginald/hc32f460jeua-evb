@@ -84,6 +84,11 @@ const USART_BASES: [usize; 4] = [0x4001_D000, 0x4001_D400, 0x4002_1000, 0x4002_1
 /// PWC 外设基址 (FCG 时钟门控)
 const PWC_BASE: usize = 0x4004_8000;
 
+/// TDR 绝对地址 (DMA 发送目的地址用, 见 [`crate::dma::uart_tx_init`])
+pub(crate) const fn tdr_addr(unit: u8) -> usize {
+    USART_BASES[unit as usize - 1] + 0x04
+}
+
 /// 单元 U 的接收中断事件源编号 (`en_int_src_t`, 见 [`crate::intc::src`])
 ///
 /// USART1~4 的 EI/RI/TI/TCI/RTO 编号连续: USART1=278~282, 每单元 +5,
@@ -433,7 +438,13 @@ impl<const U: u8> Uart<U> {
     }
 
     /// 轮询发送字节串
+    ///
+    /// 优先尝试 DMA 整块发送 (见 [`crate::dma::uart_tx_try`], 控制台 UART
+    /// 且长度达标时), 未接管时回退逐字节轮询, 行为与纯轮询一致。
     pub fn write(&self, bytes: &[u8]) {
+        if crate::dma::uart_tx_try::<U>(bytes) {
+            return;
+        }
         for &byte in bytes {
             self.write_byte(byte);
         }
@@ -474,6 +485,39 @@ impl<const U: u8> Uart<U> {
         while self.sr().read() & SR_TC == 0 {
             // 等待发送完成
         }
+    }
+
+    /// DMA 发送前的发射器停摆 (由 [`crate::dma::uart_tx_try`] 调用)。
+    ///
+    /// DMA 请求为**边沿捕获**: 仅 TXE 上升沿触发一次传输, 通道使能时若
+    /// TXE 已静默为高 (无新边沿) 传输不会开始。本方法等待上次发送完全
+    /// 结束 (SR.TC, 移位寄存器空) 后关闭发送器 (CR1.TE=0), 使 TXE 复位、
+    /// 清掉陈旧请求, 为 [`Uart::dma_tx_fire`] 的启动边沿做准备 —— 对齐
+    /// DDL 示例 usart_uart_dma 每次发送"先使能 DMA 通道, 再重新使能
+    /// USART_TX"的序列。
+    ///
+    /// 返回 false = 等待 TC 超时 (TE 未动, 调用方应回退轮询, 不会死锁)。
+    pub(crate) fn dma_tx_arm(&self, timeout_ms: u32) -> bool {
+        let start = crate::rtos::tick();
+        while self.sr().read() & SR_TC == 0 {
+            if crate::rtos::tick().wrapping_sub(start) >= timeout_ms {
+                return false;
+            }
+        }
+        // 临界区内写 TE: 防止与 RX 错误 ISR 的 CR1 读-改-写竞争
+        // (丢失本次 TE 位更新导致边沿未产生)。
+        crate::critical_section::with(|_| {
+            self.cr1().modify(|v| v & !CR1_TE);
+        });
+        true
+    }
+
+    /// DMA 发送启动: 重新使能发送器, TXE 上升沿触发 DMA 首字节
+    /// (由 [`crate::dma::uart_tx_try`] 在通道使能后调用)。
+    pub(crate) fn dma_tx_fire(&self) {
+        crate::critical_section::with(|_| {
+            self.cr1().modify(|v| v | CR1_TE);
+        });
     }
 
     /// 非阻塞读取一个字节 (SR.RXNE=1 时有数据)

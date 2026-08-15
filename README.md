@@ -8,7 +8,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 
 - 零依赖裸机 Rust (edition 2024, `thumbv7em-none-eabihf`),无 PAC/HAL crate;
 - 寄存器级外设驱动:时钟 (XTAL+MPLL→200MHz,失败自动回退)、GPIO、SysTick、
-  USART、经典 CAN 2.0B;
+  USART、经典 CAN 2.0B、DMA (DMA1/DMA2 各 4 通道, 控制台 UART 发送卸载);
 - 全局堆分配器 (边界标记 + 首次适配,中断安全),完整支持 `Layout` 的任意
   2 的幂对齐，并以 checked 算术拒绝越界布局，支持 `Vec`/`Box`/`String`;
 - **RTOS 内核**:32 级位图调度 + 时间片轮转、优先级继承互斥量、硬定时器、
@@ -34,6 +34,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_SYSTICK_HZ` / `CFG_TICKS_PER_SEC` | 节拍频率 (两者必须一致, 编译期校验) |
 | `CFG_PRIORITY_MAX` / `CFG_IDLE_*` | RTOS 优先级与空闲线程 |
 | `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 数据位 / 校验 / 停止位 / 过采样 / 流控 / 噪声滤波 / 缓冲 / 中断参数 |
+| `CFG_DMA_*` | DMA 开关 / 控制台 TX 卸载单元·通道 / 最小输出长度 / 大块拷贝最小长度 |
 | `CFG_CAN_*` | CAN 启用 / selftest / 引脚 / 位速率·采样点·SJW·误差 / 模式 / PTB·STB / RX / 过滤器 / 超时 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
@@ -87,6 +88,7 @@ src/
 ├── clk.rs             # 时钟链: MRC/XTAL/PLL → 200MHz, 回退与运行时查询
 ├── gpio.rs            # GPIO: 寄存器→端口→引脚→接口四层, const 泛型校验
 ├── systick.rs         # SysTick 1kHz 节拍 (RTOS 时钟源)
+├── dma.rs             # DMA1/DMA2: 外设触发/软件触发传输 + 控制台 TX 卸载
 ├── uart.rs            # USART1~4 驱动 (波特率/过采样) + 中断接收环形缓冲
 ├── uart_rtos.rs       # UART 非阻塞通知到 RTOS semaphore 的适配层
 ├── can.rs             # 经典 CAN 2.0B: 过滤器、PTB/STB、RX FIFO、状态/IRQ
@@ -855,6 +857,46 @@ continue
   向量表在 FLASH, 槽位预置分发入口, 回调运行时注册);
 - 真机验证 (115200, PC→板): ASCII/二进制/混合/连续数据均完整接收,
   500B 单包零丢失。
+
+### DMA 驱动 (DMA1/DMA2)
+
+对齐 DDL v3.3.0 `hc32_ll_dma.c/h` 与示例 `dmac_base` / `usart_uart_dma`,
+寄存器级实现 (`src/dma.rs`), 零依赖:
+
+- **硬件模型**: 外设事件 → AOS `DMAx_TRGSELy` 路由 → DMA 通道触发传输;
+  每请求移动一块 (BLKSIZE ≤ 1024 项), 计数 (CNT ≤ 65535) 归零 → TC 标志
+  + 通道自动失能; 软件触发 (SWREQ 解锁键 0xA1) 支持内存→内存搬运;
+- **Rust 安全边界**: 单元/通道编码在 `Dma<UNIT, CH>` const 泛型中
+  (越界编译期报错); `Dma::take()` 全系统唯一占用 (位图), 防止同一
+  通道被重复配置; 地址/计数写入经 MON 影子寄存器回读确认, 修改 CHEN
+  前等待其他通道空闲 (对齐 DDL `DMA_ChCmd` 的硬件约束);
+- **中断**: `install_tc_irq` / `install_err_irq` 经 `intc::register` 路由
+  DMA_TCx/DMA_ERR 事件, 回调通过原子槽位安装 (ISR 内清标志 + 通知);
+- **预留能力**: 外设→内存 (RX) 路由 `route()` + LLP 重配置
+  (`llp_enable` / `reconfig_llp` / `reconfig_cmd` / `sw_reconfig`) 可实现
+  循环接收 (对齐 DDL 示例的 reconfig 流程); `copy_blocking` 阻塞式大块
+  拷贝 (32 位宽度自动分块);
+- **当前集成 — 控制台 UART 发送卸载**: `Uart::write` 对长度 ≥
+  `CFG_DMA_TX_MIN` 的输出自动改用 DMA 整块发送, 长输出 (zmodem `sz` /
+  `cat` / soak 报告 / 日志) 不再长时间占用 CPU; 通道忙 / 输出过短 /
+  中断上下文 (panic 诊断) 时自动回退逐字节轮询, 行为与原来一致。
+  **触发机制 (关键)**: DMA 请求为边沿捕获, 每次发送按 DDL 示例
+  `usart_uart_dma` 的序列执行 —— 等待上次发送完全结束 (SR.TC) →
+  `TE=0` (TXE 复位, 清陈旧请求) → 使能 DMA 通道 → `TE=1` (新的 TXE
+  上升沿触发首字节) → 后续字节由每次 TXE 上升沿自然驱动;
+- **当前集成 — Flash→RAM 大块读取加速**: 文件系统读 (`read`) / 擦除
+  校验 (`verify_erased` / `partition_is_erased`) / 写后回读校验
+  (`program` 回读) 对长度 ≥ `CFG_DMA_COPY_MIN` 的请求改用 DMA 整块
+  拷贝 (`copy_try`, DMA1/CH0, 32 位宽度自动分块), 比逐字节/逐字循环
+  快约一个数量级; 未接管时回退原路径, 行为不变;
+- **暂不采用 DMA 的位置**: UART 接收 (每字节中断在 115200 下 <5% CPU,
+  未知帧长需 RTO+reconfig 重写输入路径, 收益小于风险, 原语已预留);
+  Flash 编程/擦除 (写地址触发 + 逐字等待 OPTEND, bus-hold 使 DMA 同样
+  被 stall, 无法替代); CAN (无 DMA 请求线);
+- **MPU/缓存说明**: DMA 是独立总线主设备, MPU 限制 (SRAM XN 等) 不作用于
+  DMA; SRAM 无缓存、Flash 经 EFM 缓存读取对 DMA 一致, 无脏数据问题;
+- **时钟**: FCG0 门控位 (DMA1=bit14/DMA2=bit15/AOS=bit17) 受写保护,
+  经 FCG0PC 键 0xA5A5 解锁后使能 (`dma::init`, board 初始化调用)。
 
 ### GPIO 驱动 (寄存器→端口→引脚)
 

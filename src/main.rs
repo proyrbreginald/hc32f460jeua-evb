@@ -27,6 +27,7 @@ mod vector_table; // 复位/异常/144 外设中断向量表 (原子回调槽)
 
 // ---- 片内资源驱动 (寄存器级, 零依赖) ----
 mod crc; // CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
+mod dma; // DMA1/DMA2: 外设触发/软件触发传输 + 控制台 UART 发送卸载
 mod efm; // 片内 Flash (EFM): 擦除/编程/读等待/缓存/引导交换
 mod filesystem; // 断电安全的精简文件系统 + 片内 Flash 分区适配
 mod icg; // ICG 硬件配置段 (flash 0x400, 复位时硬件载入)

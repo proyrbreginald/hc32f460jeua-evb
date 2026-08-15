@@ -128,6 +128,21 @@ impl Board {
             crate::config::UART_CLOCK_DIV
         );
 
+        // DMA: 外设时钟使能 + 控制台 UART 发送卸载 (USART_TI 事件触发)。
+        // 输出达标时 `Uart::write` 自动改用 DMA 整块发送, 长输出不再
+        // 逐字节轮询 TXE。
+        if crate::config::DMA_ENABLE {
+            crate::dma::init();
+            crate::dma::uart_tx_init();
+            crate::log_debug!(
+                "DMA: 控制台 TX 卸载到 DMA{} CH{} (USART{} TI 事件, 阈值 {}B)",
+                crate::config::DMA_TX_UNIT,
+                crate::config::DMA_TX_CHANNEL,
+                crate::config::UART_UNIT,
+                crate::config::DMA_TX_MIN
+            );
+        }
+
         if crate::config::CAN_ENABLE {
             let timing = RESOURCES
                 .can

@@ -426,6 +426,47 @@ const _: () = assert!(
     "CFG_UART_IRQ_PRIORITY 非法 (可用 0~15)"
 );
 
+// ============================== [dma] ==============================
+
+/// 是否启用 DMA 驱动与控制台 UART 发送卸载 (CFG_DMA_ENABLE)
+///
+/// 启用时 board 初始化路由 USART{`UART_UNIT`}_TI 事件到 TX 通道,
+/// `Uart::write` 对达标长度的输出自动改用 DMA 整块发送。
+pub const DMA_ENABLE: bool = if eq_str(env!("CFG_DMA_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_DMA_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_DMA_ENABLE 非法 (可用 true/false)")
+};
+/// 控制台 TX DMA 单元 (CFG_DMA_TX_UNIT = 1/2)
+pub const DMA_TX_UNIT: u8 = parse_u8(env!("CFG_DMA_TX_UNIT"));
+const _: () = assert!(
+    DMA_TX_UNIT == 1 || DMA_TX_UNIT == 2,
+    "CFG_DMA_TX_UNIT 非法 (可用 1/2)"
+);
+/// 控制台 TX DMA 通道 (CFG_DMA_TX_CHANNEL = 0~3)
+pub const DMA_TX_CHANNEL: u8 = parse_u8(env!("CFG_DMA_TX_CHANNEL"));
+const _: () = assert!(DMA_TX_CHANNEL <= 3, "CFG_DMA_TX_CHANNEL 非法 (可用 0~3)");
+/// 触发 DMA 发送的最小输出长度 (字节) (CFG_DMA_TX_MIN)
+///
+/// 低于该阈值的输出 (逐字节轮询开销更小) 保持原轮询路径; 阈值同时
+/// 保证 DMA 传输计数 (16 位) 的合理余量。
+pub const DMA_TX_MIN: usize = parse_u32(env!("CFG_DMA_TX_MIN")) as usize;
+const _: () = assert!(
+    DMA_TX_MIN >= 4 && DMA_TX_MIN <= 512,
+    "CFG_DMA_TX_MIN 应为 4~512"
+);
+/// 触发 DMA 整块拷贝 (Flash→RAM / RAM→RAM) 的最小长度 (字节)
+/// (CFG_DMA_COPY_MIN)
+///
+/// 低于该阈值的读取 (单次 DMA 配置开销反而更大) 保持逐字节/逐字回退。
+pub const DMA_COPY_MIN: usize = parse_u32(env!("CFG_DMA_COPY_MIN")) as usize;
+const _: () = assert!(
+    DMA_COPY_MIN >= 16 && DMA_COPY_MIN <= 1024,
+    "CFG_DMA_COPY_MIN 应为 16~1024"
+);
+
 // ============================== [can] ==============================
 
 /// 是否在板级启动阶段初始化 CAN。默认关闭，因为本板仅引出 PB6/PB7，
