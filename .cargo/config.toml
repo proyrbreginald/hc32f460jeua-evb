@@ -139,7 +139,7 @@ CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出
 CFG_LOG_FILE_ENABLE = "true"   # 落盘开关
 CFG_LOG_RING = "4096"          # RAM 日志缓冲 (字节; 满时丢最旧, 掉电丢失)
 CFG_LOG_FILE_MAX = "4096"      # 单个日志文件上限 (字节; 超出则写入下一段文件)
-CFG_LOG_FILE_SLOTS = "4"       # 保留的日志文件数 (boot_<序号>[_<段号>].log)
+CFG_LOG_FILE_SLOTS = "10"       # 保留的日志文件数 (boot_<序号>[_<段号>].log)
 CFG_LOG_FLUSH_MS = "2000"      # 落盘线程刷新间隔 (毫秒; 越小越费 Flash)
 CFG_APP_LOGFILE_STACK = "8192" # 落盘线程栈 (与 shell 同级: 文件系统写 + 格式化较深)
 CFG_APP_LOGFILE_PRIORITY = "3" # 低于 shell(1)/led(2), 高于 idle(31)
@@ -149,7 +149,7 @@ CFG_APP_LOGFILE_TIMESLICE = "10"
 CFG_CONSOLE_LINE_GAP_MS = "8"  # 每行输出后的间隙 (毫秒; 0=不节流)
 
 # [soak_report] soak 测试报告 (/test/ 目录保留文件数)
-CFG_TEST_REPORT_SLOTS = "6"
+CFG_TEST_REPORT_SLOTS = "1"
 
 # [rtc] 实时时钟 (LRC 源), 同时作为日志时间戳 (天:时:分:秒)
 CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
