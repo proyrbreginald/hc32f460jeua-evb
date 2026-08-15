@@ -113,12 +113,17 @@ CFG_SHELL_LOGIN_TRIES = "3"    # 登录失败允许次数
 CFG_SHELL_LINE_BUF = "128"     # 输入行缓冲区 (字节)
 CFG_SHELL_HISTORY_SIZE = "8"   # RAM 中保留的历史命令条数 (重启后清空)
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
-CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,nano,rm,mv,stat,df,fsck,mount,mkfs,led,log,selftest,soak,clear,whoami,reboot,logout"
+CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,nano,rm,mv,stat,df,fsck,mount,mkfs,led,log,selftest,soak,sz,rz,clear,whoami,reboot,logout"
 
 # [nano] 轻量全屏文本编辑器 (ASCII, ANSI 终端; 行列为自动探测失败时的回退值)
 CFG_NANO_COLUMNS = "80"
 CFG_NANO_ROWS = "24"
 CFG_NANO_MAX_BYTES = "16384"
+
+# [zmodem] ZMODEM 文件传输 (shell `sz` 发送 / `rz` 接收)
+CFG_ZMODEM_TIMEOUT_MS = "10000"   # 帧/字节间等待超时 (毫秒, 对齐 lrzsz 默认 10s)
+CFG_ZMODEM_SUBPACKET = "1024"     # 发送子包长度 (字节, 32~1024)
+CFG_ZMODEM_RX_MAX = "32704"       # 接收文件大小上限 (字节, 快照文件系统整文件缓存)
 
 # [log] 应用日志 (可开关+分级+彩色, 与内核打印分离)
 CFG_LOG_ENABLE = "true" # 日志默认开关 (运行时可用 shell `log on|off` 切换)

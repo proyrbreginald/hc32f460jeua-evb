@@ -45,6 +45,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_MPU_ENABLE` | FLASH/SRAM/外设属性与线程栈守卫开关 |
 | `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
 | `CFG_SOAK_*` | 长期稳定性测试开关 / 默认时长 / 进度间隔 / 停滞判定 / Flash 节流 |
+| `CFG_ZMODEM_*` | ZMODEM 帧超时 / 发送子包长度 / 接收文件大小上限 (`sz`/`rz` 命令) |
 
 约束:
 - 数值均为字符串, 编译期解析 (支持 `_` 分隔), 溢出/非法字符/非法枚举
@@ -90,9 +91,11 @@ src/
 ├── console.rs         # 控制台: 打印锁 (优先级继承) + 原子整行输出
 ├── log.rs             # 应用日志: 分级+彩色标签, 与内核打印分离 (可开关)
 ├── shell.rs           # 登录、命令注册与文件系统命令
+├── zmodem.rs          # ZMODEM 协议 (帧/FCS/转义/收发会话, 参考 lrzsz)
 ├── shell/
 │   ├── editor.rs      # nano 风格 ANSI 全屏文本编辑器
-│   └── path.rs        # 固定容量 Linux 风格路径解析与当前目录维护
+│   ├── path.rs        # 固定容量 Linux 风格路径解析与当前目录维护
+│   └── zmodem.rs      # ZMODEM 的 shell 集成: UART 端口 + sz/rz 命令
 └── rtos/              # RTOS 内核 (RT-Thread 架构移植, 不依赖应用模块)
     ├── mod.rs         # 公共 API: init/start/tick/thread_create 等
     ├── klist.rs       # 侵入式链表 + container_of 宏 (rt_list 移植)
@@ -122,8 +125,10 @@ crates/littlefs/  # 块设备/磁盘格式 + 文件/目录/原子快照操作
 硬件无关的布局规划位于 `src/heap_layout.rs`，主机测试覆盖 1B 到 4096B
 的代表性二次幂对齐、高对齐 padding、空间不足/整数溢出以及零大小布局。
 `src/can_timing.rs` 的主机测试覆盖常用位速率、DDL 边界、SBT 编码、误差
-上限及溢出输入。它们验证纯算法，不替代目标板上的寄存器路径、总线电气
-连接、完整链表分配器和临界区测试：
+上限及溢出输入。`src/zmodem.rs` 的主机测试覆盖 CRC 标准向量 (与 lrzsz
+实测一致)、转义/帧收发往返、收发双端内存回环 (多文件/空文件/跳过)，
+以及宿主机装有 lrzsz 时与真实 `sz`/`rz` 的互通测试。它们验证纯算法，
+不替代目标板上的寄存器路径、总线电气连接、完整链表分配器和临界区测试：
 
 ```bash
 cargo test --workspace --target x86_64-unknown-linux-gnu
@@ -274,6 +279,8 @@ mount                       # 丢弃内存状态并重新挂载，当前路径�
 mkfs --force                # 显式清空全部文件与目录
 history                     # 按编号查看 RAM 中的历史命令
 history -c                  # 清空命令历史
+sz /etc/config              # ZMODEM 发送文件到主机 (主机执行 rz -y 接收)
+rz                          # ZMODEM 接收主机文件 (主机执行 sz <文件>)
 ```
 
 Shell 当前路径默认为根目录 `/`；以 `/` 开头的是绝对路径，其余路径相对
@@ -303,6 +310,50 @@ UTF-8 或二进制内容会拒绝打开且不改原文件。进入编辑器时�
 持久内容，同时保留 RAM 中的编辑缓冲供再次保存。若串口环溢出或出现
 PE/FE/ORE，编辑器会锁存 `INPUT LOST` 并禁止本会话保存，避免缺字内容覆盖
 原文件；此时应退出并重新打开。
+
+## ZMODEM 文件传输 (sz / rz)
+
+协议核心 `src/zmodem.rs` 参考 lrzsz (`zm.c`/`lrz.c`/`lsz.c`) 移植为纯
+Rust 模块, 零硬件依赖; 与主机 lrzsz 工具经串口互通:
+
+- **发送** `sz <文件> [文件...]`: 板端发起 ZRQINIT → ZRINIT 握手后逐个
+  发送文件, 主机侧执行 `rz -y` 接收 (Windows 可用 Tera Term/SecureCRT
+  的 ZMODEM 接收); 支持多文件与 16/32 位 FCS 自动协商 (板端声明支持
+  CRC32, 兼容 `sz -o` 的 16 位模式);
+- **接收** `rz`: 板端周期性发送 ZRINIT 等待主机, 主机侧执行
+  `sz <文件>`; 整文件先缓存在 RAM (上限 `CFG_ZMODEM_RX_MAX`, 默认
+  32KiB, 快照文件系统要求整文件原子写入), 完整接收后经 CRC 校验与
+  FCS 残差校验后原子落盘; 超过上限或文件系统剩余容量不足的文件发送
+  ZSKIP 跳过, 会话继续;
+- **帧级实现与 lrzsz 逐条对齐**: 十六进制/二进制 (16/32 位 FCS) 头,
+  CRC-16 CCITT 与 CRC-32 (残差校验 0xDEBB20E3), ZDLE 转义 (XON/XOFF/
+  ^P/ZDLE 及 `@` 后 CR), 数据子包 ZCRCE/G/Q/W 语义, ZACK/ZRPOS 重传
+  与位置校验, 5×CAN 取消, ZFIN"OO"握手;
+- **流控**: 发送端每子包 (默认 1KiB, `CFG_ZMODEM_SUBPACKET`) 以 ZCRCW
+  结束并等待 ZACK (乒乓式), 适配板上 512B UART 接收环, 不做 ZCRCG
+  流水; 接收端对 FCS 错误以 ZRPOS 重新同步 (发送端从错误位置重传);
+- **中止**: 帧间等待时按 ESC 取消会话并发送 5×CAN 通知对端; 帧等待
+  超时 `CFG_ZMODEM_TIMEOUT_MS` (默认 10s, 对齐 lrzsz);
+- **输出纪律**: 协议字节与控制台文本共用 UART。接收端对帧前字节一律
+  按垃圾跳过, 因此状态文本只在帧间空闲点输出 (会话/文件开始/结束),
+  数据流中不打印, 避免干扰主机端流式发送;
+- 主机互通已在 `cargo test` 中自动化: 单测含 CRC 标准向量、转义/帧
+  往返与收发双端内存回环; 若宿主机装有 lrzsz (`/usr/bin/sz`/`rz`),
+  还会自动运行真实 `sz` → 板端接收、板端发送 → 真实 `rz -y` 的互通
+  测试 (含多文件与空文件)。
+
+常用流程 (115200 8N1 串口):
+
+```text
+# 板端发送 → 主机接收
+root@HC32F460JEUA:/$ sz /etc/config
+# 主机: rz -y
+
+# 主机发送 → 板端接收
+root@HC32F460JEUA:/$ rz
+# 主机: sz /path/to/file
+rz: 已接收 file.txt (2048 B)
+```
 
 ## 片内 SRAM (sram)
 
@@ -576,7 +627,7 @@ continue
   列表, 未列出的命令执行时提示 "未启用" 且不出现在 `help` 中;
 - 命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) / `echo` /
   `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` / `write`(put) /
-  `nano` / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` / `mount` /
+  `nano` / `sz` / `rz` / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` / `mount` /
   `mkfs --force` / `led` / `log` / `selftest` / `soak` / `clear` / `whoami` / `reboot` /
   `logout`(exit);
 - 输入: 回车提交, 退格删除, Ctrl+C 清行, 方向键上/下浏览历史；

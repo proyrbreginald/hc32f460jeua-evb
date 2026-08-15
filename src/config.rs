@@ -612,8 +612,31 @@ pub const LED_INITIAL_LEVEL: gpio::Level = if eq_str(env!("CFG_LED_LEVEL"), "hig
     panic!("CFG_LED_LEVEL 非法 (可用 high/low)")
 };
 
-// ============================== [shell] ==============================
+// ============================== [zmodem] ==============================
 
+/// ZMODEM 帧/字节间等待超时 (毫秒) (CFG_ZMODEM_TIMEOUT_MS)
+pub const ZMODEM_TIMEOUT_MS: u32 = parse_u32(env!("CFG_ZMODEM_TIMEOUT_MS"));
+const _: () = assert!(
+    ZMODEM_TIMEOUT_MS >= 100 && ZMODEM_TIMEOUT_MS <= 60000,
+    "CFG_ZMODEM_TIMEOUT_MS 应为 100~60000"
+);
+/// ZMODEM 发送子包长度 (字节) (CFG_ZMODEM_SUBPACKET)
+pub const ZMODEM_SUBPACKET: usize = parse_u32(env!("CFG_ZMODEM_SUBPACKET")) as usize;
+const _: () = assert!(
+    ZMODEM_SUBPACKET >= 32 && ZMODEM_SUBPACKET <= 1024,
+    "CFG_ZMODEM_SUBPACKET 应为 32~1024"
+);
+/// 接收缓冲上限 = 单个接收文件大小上限 (字节) (CFG_ZMODEM_RX_MAX)
+///
+/// 快照文件系统整文件原子写入, 接收文件必须先完整缓存在 RAM;
+/// 上限同时约束堆分配, 超过该大小的远端文件会被跳过。
+pub const ZMODEM_RX_MAX: usize = parse_u32(env!("CFG_ZMODEM_RX_MAX")) as usize;
+const _: () = assert!(
+    ZMODEM_RX_MAX >= 1024 && ZMODEM_RX_MAX <= 32704,
+    "CFG_ZMODEM_RX_MAX 应为 1024~32704 (快照容量上限)"
+);
+
+// ============================== [shell] ==============================
 /// 登录用户名 / 密码 (CFG_SHELL_USERNAME / CFG_SHELL_PASSWORD)
 pub const SHELL_USERNAME: &str = env!("CFG_SHELL_USERNAME");
 pub const SHELL_PASSWORD: &str = env!("CFG_SHELL_PASSWORD");

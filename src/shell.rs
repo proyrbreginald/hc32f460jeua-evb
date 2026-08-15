@@ -23,9 +23,9 @@
 //!
 //! 当前命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) /
 //! `echo` / `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` /
-//! `write`(put) / `nano` / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` /
-//! `mount` / `mkfs` / `led` / `log` / `selftest` / `soak` / `clear` / `whoami` /
-//! `reboot` / `logout`(exit)。
+//! `write`(put) / `nano` / `sz` / `rz` / `rm` / `mv` / `stat` / `df`(fsinfo) /
+//! `fsck` / `mount` / `mkfs` / `led` / `log` / `selftest` / `soak` / `clear` /
+//! `whoami` / `reboot` / `logout`(exit)。
 //!
 //! # 输入处理
 //!
@@ -35,6 +35,7 @@
 
 mod editor;
 mod path;
+mod zmodem;
 
 use crate::config;
 use crate::heap;
@@ -363,6 +364,8 @@ static COMMANDS: &[Command] = &[
         cmd_write,
     ),
     cmd("nano", &[], "全屏编辑: nano <文件>", cmd_nano),
+    cmd("sz", &[], "发送文件 (ZMODEM): sz <文件> [文件...]", zmodem::cmd_sz),
+    cmd("rz", &[], "接收文件 (ZMODEM): rz (主机执行 sz)", zmodem::cmd_rz),
     cmd("rm", &[], "删除文件: rm <文件>", cmd_rm),
     cmd("mv", &[], "原子移动: mv <旧路径> <新路径>", cmd_mv),
     cmd("stat", &[], "路径信息: stat <路径>", cmd_stat),

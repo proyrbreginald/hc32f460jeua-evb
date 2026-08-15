@@ -4,3 +4,4 @@
 
 pub mod can_timing;
 pub mod heap_layout;
+pub mod zmodem;

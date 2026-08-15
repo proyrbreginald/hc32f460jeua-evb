@@ -56,6 +56,7 @@ mod banner; // 启动横幅 (依赖 clk/heap/rtos 公共状态)
 mod selftest; // 内核自检 (shell `selftest` 命令同步执行)
 mod soak; // 长期稳定性测试 (shell `soak` 命令同步执行)
 mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
+mod zmodem; // ZMODEM 文件传输协议 (纯逻辑, 主机单测与真实 lrzsz 互通)
 
 use core::sync::atomic::{AtomicU32, Ordering};
 /// 全局堆分配器 (边界标记 + 首次适配, 见 heap 模块)
