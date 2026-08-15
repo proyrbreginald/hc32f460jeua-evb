@@ -1222,6 +1222,11 @@ const BAR_BLOCKS: usize = 18;
 /// 内容缩短时 `\r` 原位刷新不会残留旧行尾
 const BAR_CELLS: usize = 76;
 
+/// 堆占用 "X.YK" 整数化 (避免拖入浮点格式化与软浮点库)
+fn fmt_kib(used: usize) -> (usize, usize) {
+    (used / 1024, (used % 1024) * 10 / 1024)
+}
+
 /// 原位刷新单行进度条 (不换行, 不进入日志环; soak 运行期间控制台
 /// 唯一的持续输出)。`total_ms == 0` 表示"直到 ESC"模式, 无百分比。
 fn render_bar(elapsed_ms: u32, total_ms: u32, used: usize, threads: usize, errors: u32) {
@@ -1242,14 +1247,16 @@ fn render_bar(elapsed_ms: u32, total_ms: u32, used: usize, threads: usize, error
             (total_ms / 60_000) % 60,
             (total_ms / 1000) % 60,
         );
+        let (ki, kf) = fmt_kib(used);
         alloc::format!(
-            "\r[soak] {h}:{m:02}:{s:02}/{th}:{tm:02}:{ts:02} [{bar}] {pct:3}%  堆 {:.1}K  线程 {threads}  错误 {errors}",
-            used as f64 / 1024.0
+            "\r[soak] {h}:{m:02}:{s:02}/{th}:{tm:02}:{ts:02} [{bar}] {pct:3}%  堆 {}.{}K  线程 {threads}  错误 {errors}",
+            ki, kf
         )
     } else {
+        let (ki, kf) = fmt_kib(used);
         alloc::format!(
-            "\r[soak] {h}:{m:02}:{s:02} (直到 ESC)  堆 {:.1}K  线程 {threads}  错误 {errors}",
-            used as f64 / 1024.0
+            "\r[soak] {h}:{m:02}:{s:02} (直到 ESC)  堆 {}.{}K  线程 {threads}  错误 {errors}",
+            ki, kf
         )
     };
     // 定宽补齐 (字符数): 行缩短时覆盖旧内容
@@ -1351,10 +1358,6 @@ fn delay_percentile(pct: u32) -> u32 {
 ///
 /// 参数: `[分钟] [压力项|场景]...` (见模块文档用法说明)。
 pub(crate) fn run(args: &str) {
-    if !crate::config::SOAK_ENABLE {
-        crate::println!("[soak] 未启用 (CFG_SOAK_ENABLE=false)");
-        return;
-    }
     let Some((minutes, selection)) = parse_args(args) else {
         crate::println!("[soak] 用法: soak [分钟] [压力项|场景]...");
         crate::println!("[soak]   压力项: {}", {
@@ -1489,7 +1492,7 @@ pub(crate) fn run(args: &str) {
         }
 
         // ESC 中断
-        if crate::selftest::abort_requested() {
+        if crate::board::abort_requested() {
             stop_reason = "ESC 中断";
             break 'monitor;
         }

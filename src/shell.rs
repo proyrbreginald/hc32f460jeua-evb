@@ -33,8 +33,10 @@
 //! 上下键浏览历史。输入缓冲区大小来自配置 (`CFG_SHELL_LINE_BUF`), 非 ASCII
 //! 或超长命令整行拒绝执行。
 
+#[cfg(shell_nano)]
 mod editor;
 mod path;
+#[cfg(shell_zmodem)]
 mod zmodem;
 
 use crate::config;
@@ -190,6 +192,7 @@ impl PendingRx {
         true
     }
 
+    #[cfg(shell_nano)]
     fn push_back(&mut self, byte: u8) -> bool {
         if self.len == PENDING_RX_CAPACITY {
             return false;
@@ -200,10 +203,12 @@ impl PendingRx {
         true
     }
 
+    #[cfg(shell_nano)]
     const fn is_full(&self) -> bool {
         self.len == PENDING_RX_CAPACITY
     }
 
+    #[cfg(shell_nano)]
     const fn remaining_capacity(&self) -> usize {
         PENDING_RX_CAPACITY - self.len
     }
@@ -367,13 +372,16 @@ static COMMANDS: &[Command] = &[
         "原子创建/覆盖: write <文件> [文本]",
         cmd_write,
     ),
+    #[cfg(shell_nano)]
     cmd("nano", &[], "全屏编辑: nano <文件>", cmd_nano),
+    #[cfg(shell_zmodem)]
     cmd(
         "sz",
         &[],
         "发送文件 (ZMODEM): sz <文件> [文件...]",
         zmodem::cmd_sz,
     ),
+    #[cfg(shell_zmodem)]
     cmd(
         "rz",
         &[],
@@ -388,7 +396,9 @@ static COMMANDS: &[Command] = &[
     cmd("mount", &[], "重新挂载文件系统", cmd_mount),
     cmd("mkfs", &[], "清空文件系统: mkfs --force", cmd_mkfs),
     cmd("led", &[], "板载 LED on|off", cmd_led),
+    #[cfg(shell_selftest)]
     cmd("selftest", &[], "自检: selftest [all|can]", cmd_selftest),
+    #[cfg(shell_soak)]
     cmd(
         "soak",
         &[],
@@ -1190,6 +1200,8 @@ fn cmd_write(state: &mut ShellState, rest: &str) -> CmdResult {
     CmdResult::Ok
 }
 
+/// 全屏编辑 (编译期开关 CFG_SHELL_NANO_ENABLE 控制, 关闭时命令不注册)
+#[cfg(shell_nano)]
 fn cmd_nano(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(input) = one_argument(rest) else {
         println!("用法: nano <文件>");
@@ -1397,29 +1409,23 @@ fn cmd_led(_state: &mut ShellState, rest: &str) -> CmdResult {
 }
 
 /// 内核自检: **同步执行** (完成后才出下一提示符, 可按 ESC 中断)
-/// (受 CFG_APP_SELFTEST_ENABLE 控制)
+/// (编译期开关 CFG_APP_SELFTEST_ENABLE 控制, 关闭时命令不注册)
+#[cfg(shell_selftest)]
 fn cmd_selftest(_state: &mut ShellState, rest: &str) -> CmdResult {
-    if config::APP_SELFTEST_ENABLE {
-        match rest.trim() {
-            "" | "all" => crate::selftest::run(),
-            "can" => crate::selftest::run_can(),
-            _ => println!("用法: selftest [all|can]"),
-        }
-    } else {
-        println!("selftest 未启用 (CFG_APP_SELFTEST_ENABLE=false)");
+    match rest.trim() {
+        "" | "all" => crate::selftest::run(),
+        "can" => crate::selftest::run_can(),
+        _ => println!("用法: selftest [all|can]"),
     }
     CmdResult::Ok
 }
 
 /// 长期稳定性测试: **同步执行** (期间压力线程在后台运行,
 /// shell 线程兼任监控器, 可按 ESC 中断)
-/// (受 CFG_SOAK_ENABLE 控制; 参数解析与压力项选择见 soak 模块)
+/// (编译期开关 CFG_SOAK_ENABLE 控制, 关闭时命令不注册)
+#[cfg(shell_soak)]
 fn cmd_soak(_state: &mut ShellState, rest: &str) -> CmdResult {
-    if config::SOAK_ENABLE {
-        crate::soak::run(rest);
-    } else {
-        println!("soak 未启用 (CFG_SOAK_ENABLE=false)");
-    }
+    crate::soak::run(rest);
     CmdResult::Ok
 }
 

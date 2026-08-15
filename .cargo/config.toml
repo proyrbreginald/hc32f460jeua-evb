@@ -115,6 +115,12 @@ CFG_SHELL_HISTORY_SIZE = "8"   # RAM 中保留的历史命令条数 (重启后�
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
 CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,nano,rm,mv,stat,df,fsck,mount,mkfs,led,log,selftest,soak,sz,rz,clear,whoami,reboot,logout"
 
+# 功能编译期开关 (true/false): false 时对应命令与其全部代码不编译, 直接省
+# FLASH。注意: soak 依赖 selftest 的 ESC 中断支持, soak=true 时 selftest
+# 自动随带编译 (build.rs 强制), 与 CFG_APP_SELFTEST_ENABLE 取值无关。
+CFG_SHELL_NANO_ENABLE = "true"       # nano 全屏编辑器 (省 ~3 KiB)
+CFG_SHELL_ZMODEM_ENABLE = "true"     # sz/rz 文件传输 (省 ~7 KiB + CRC 表)
+
 # [nano] 轻量全屏文本编辑器 (ASCII, ANSI 终端; 行列为自动探测失败时的回退值)
 CFG_NANO_COLUMNS = "80"
 CFG_NANO_ROWS = "24"
@@ -158,8 +164,8 @@ CFG_WDT_FEED_MS = "500"
 CFG_MPU_ENABLE = "true"
 
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
-# 是否启用内核自检 (true/false); 启用后通过 shell 命令 `selftest` 手动启动,
-# 不再开机自动运行; false 时命令提示未启用
+# 是否启用内核自检 (true/false); 编译期开关: false 时 selftest 命令与其
+# 全部代码不编译, 直接省 FLASH (soak 开启时自动随带编译, 见 build.rs)
 CFG_APP_SELFTEST_ENABLE = "true"
 CFG_APP_SHELL_STACK = "8192"     # 自检在 shell 线程内同步执行, 需更大栈 (调试格式化机器栈较深)
 CFG_APP_SHELL_PRIORITY = "1"
@@ -171,7 +177,9 @@ CFG_APP_LED_TIMESLICE = "10"
 CFG_APP_LED_BLINK_MS = "500"
 
 # [soak] 长期稳定性测试 (shell `soak` 命令, 同步执行)
-CFG_SOAK_ENABLE = "true"             # 命令开关 (false 时提示未启用)
+# 编译期开关: false 时 soak 命令与其全部代码 (含 HTML 报告模板) 不编译,
+# 直接省 FLASH
+CFG_SOAK_ENABLE = "true"             # 命令开关 (false 时命令不注册)
 CFG_SOAK_MINUTES = "10"              # soak 无参数时的默认时长 (分钟, 0 = 直到 ESC)
 CFG_SOAK_REPORT_INTERVAL_MS = "30000" # 进度报告间隔 (毫秒)
 CFG_SOAK_HANG_GRACE_MS = "5000"      # 压力线程心跳停滞判定 (毫秒)

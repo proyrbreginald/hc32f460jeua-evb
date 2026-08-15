@@ -125,12 +125,12 @@ const HEAD: &str = r#"<!DOCTYPE html>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--fg);font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
 line-height:1.6;padding:28px 16px;max-width:960px;margin:0 auto}
-h1{font-size:1.5rem;letter-spacing:.5px}
+h1{font-size:1.5rem}
 h2{font-size:1.05rem;margin-bottom:14px;color:var(--acc)}
 .hero{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:22px}
 .meta{display:flex;flex-wrap:wrap;gap:6px 20px;color:var(--dim);font-size:.85rem;margin-top:6px;flex-basis:100%}
-.meta .mi{white-space:nowrap}
-.meta .mi.long{flex-basis:100%;white-space:normal;word-break:break-all}
+.mi{white-space:nowrap}
+.mi.long{flex-basis:100%;white-space:normal;word-break:break-all}
 .meta b{color:var(--fg);font-weight:600}
 .badge{padding:6px 18px;border-radius:999px;font-weight:700;font-size:.95rem;
 letter-spacing:2px;border:1px solid transparent}
@@ -140,7 +140,9 @@ letter-spacing:2px;border:1px solid transparent}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
 .card .k{font-size:.75rem;color:var(--dim);margin-bottom:4px}
 .card .v{font-size:1.25rem;font-weight:700}
-.card .v.ok{color:var(--ok)}.card .v.bad{color:var(--bad)}.card .v.dim{color:var(--dim)}
+.v.ok{color:var(--ok)}
+.v.bad{color:var(--bad)}
+.v.dim{color:var(--dim)}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:22px}
 table{width:100%;border-collapse:collapse;font-size:.85rem}
 th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--line)}
@@ -153,8 +155,9 @@ tr.err td{background:rgba(248,113,113,.07)}
 .bar .track{flex:1;display:block;background:var(--panel2);border-radius:4px;height:14px;overflow:hidden}
 .bar .fill{display:block;height:100%;background:linear-gradient(90deg,#0ea5e9,#38bdf8);border-radius:4px;min-width:2px}
 .bar .cnt{width:72px;font-size:.75rem;color:var(--dim);flex:none}
-.bar .cnt{width:72px;font-size:.75rem;color:var(--dim);flex:none}
 .samples{color:var(--dim);font-size:.8rem;margin-top:8px;word-break:break-all}
+.sub{color:var(--dim);font-size:.75rem}
+.warn{color:var(--warn)}
 footer{color:var(--dim);font-size:.75rem;text-align:center;margin-top:8px}
 </style>
 </head>
@@ -165,6 +168,18 @@ const FOOT: &str = r#"<footer>HC32F460JEUA · soak 长期稳定性测试 · 报�
 </body>
 </html>
 "#;
+
+/// 面板公共片段 (独立常量, 编译后字符串可合并, 避免每个渲染点重复存储)
+const PANEL_OPEN: &str = "<section class=\"panel\"><h2>";
+const PANEL_END: &str = "</section>";
+/// 弱提示文案类 (替代重复的内联 style)
+const WARN_OPEN: &str = "<div class=\"samples warn\">";
+
+fn panel(html: &mut String, title: &str) {
+    html.push_str(PANEL_OPEN);
+    html.push_str(title);
+    html.push_str("</h2>");
+}
 
 fn render_hero(html: &mut String, data: &Data<'_>) {
     let verdict = if data.pass { "PASS" } else { "FAIL" };
@@ -183,9 +198,7 @@ fn render_hero(html: &mut String, data: &Data<'_>) {
             );
         }
         None => {
-            html.push_str(
-                "<span class=\"mi\">生成时间 <b style=\"color:var(--warn)\">RTC 未设置</b></span>",
-            );
+            html.push_str("<span class=\"mi\">生成时间 <b class=\"warn\">RTC 未设置</b></span>");
         }
     }
     let _ = writeln!(
@@ -286,7 +299,7 @@ fn card(html: &mut String, key: &str, value: &str, cls: &str, note: &str) {
 }
 
 fn render_heap(html: &mut String, data: &Data<'_>) {
-    html.push_str("<section class=\"panel\"><h2>堆用量</h2>");
+    panel(html, "堆用量");
     // 视觉条: 各阶段占比 = 用量/堆容量
     let capacity = data.heap_capacity;
     let pct = |v: usize| {
@@ -301,9 +314,8 @@ fn render_heap(html: &mut String, data: &Data<'_>) {
     let spread = data.end_samples.iter().max().unwrap() - data.end_samples.iter().min().unwrap();
     let _ = writeln!(
         html,
-        "<div class=\"samples\">结束采样: {:?} (波动 {} B, 判定取最小值) · 堆容量 {} B · \
-         最大连续空闲块: 结束 {} B / 运行期最差 {} B (碎片化程度, 越接近堆容量越健康) · \
-         分配失败 {} 次 (allocator 在极限下优雅拒绝, 未崩溃)</div></section>",
+        "<div class=\"samples\">结束采样: {:?} (波动 {} B) · 堆容量 {} B · \
+         最大连续空闲块: 结束 {} B / 最差 {} B · 分配失败 {} 次</div>",
         data.end_samples,
         spread,
         capacity,
@@ -311,6 +323,7 @@ fn render_heap(html: &mut String, data: &Data<'_>) {
         data.heap_largest_free_min,
         data.heap_alloc_failures
     );
+    html.push_str(PANEL_END);
 }
 
 fn bar_row(html: &mut String, label: &str, value: usize, pct: usize) {
@@ -321,7 +334,8 @@ fn bar_row(html: &mut String, label: &str, value: usize, pct: usize) {
 }
 
 fn render_workers(html: &mut String, data: &Data<'_>) {
-    html.push_str("<section class=\"panel\"><h2>压力线程明细</h2><table>");
+    panel(html, "压力线程明细");
+    html.push_str("<table>");
     html.push_str(
         "<tr><th>线程</th><th>分组</th><th class=\"num\">优先级</th><th class=\"num\">栈(B)</th>\
          <th class=\"num\">循环数</th><th class=\"num\">错误</th><th class=\"num\">栈峰值(B)</th><th>状态</th></tr>",
@@ -333,13 +347,17 @@ fn render_workers(html: &mut String, data: &Data<'_>) {
             None if row.cycles == 0 => "从未调度 (饥饿)",
             None => "正常",
         };
-        let pct = row.stack_peak as f64 * 100.0 / row.stack as f64;
+        let pct = if row.stack > 0 {
+            (row.stack_peak as u64 * 1000 / row.stack as u64 + 5) / 10
+        } else {
+            0
+        };
         let _ = writeln!(
             html,
-            "<tr{err_cls}><td><b>{}</b> <span style=\"color:var(--dim);font-size:.75rem\">{}</span></td>\
+            "<tr{err_cls}><td><b>{}</b> <span class=\"sub\">{}</span></td>\
              <td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td>\
-             <td class=\"num\">{} ({:.0}%)</td><td>{}</td></tr>",
+             <td class=\"num\">{} ({}%)</td><td>{}</td></tr>",
             row.name,
             row.short,
             row.group,
@@ -352,11 +370,12 @@ fn render_workers(html: &mut String, data: &Data<'_>) {
             state
         );
     }
-    html.push_str("</table></section>");
+    html.push_str("</table>");
+    html.push_str(PANEL_END);
 }
 
 fn render_latency(html: &mut String, data: &Data<'_>) {
-    html.push_str("<section class=\"panel\"><h2>调度延迟</h2>");
+    panel(html, "调度延迟");
     if data.delay_samples == 0 {
         html.push_str("<div class=\"samples\">无样本 (delay 压力未选择)</div>");
     } else {
@@ -386,11 +405,11 @@ fn render_latency(html: &mut String, data: &Data<'_>) {
             );
         }
     }
-    html.push_str("</section>");
+    html.push_str(PANEL_END);
 }
 
 fn render_watchdog(html: &mut String, data: &Data<'_>) {
-    html.push_str("<section class=\"panel\"><h2>看门狗</h2>");
+    panel(html, "看门狗");
     if data.wdt_enabled {
         let gap = data.wdt_feed_gap_ms;
         let timeout = data.wdt_timeout_ms;
@@ -401,22 +420,21 @@ fn render_watchdog(html: &mut String, data: &Data<'_>) {
              实测最大喂狗间隔 <b>{gap} ms</b> · 余量 <b>{margin}×</b> — 调度停滞会被硬件复位, 复位即失败证据</div>",
         );
         if margin < 2 {
-            html.push_str(
-                "<div class=\"samples\" style=\"color:var(--warn)\">喂狗余量不足 2 倍, 建议检查 CFG_WDT_FEED_MS</div>",
-            );
+            html.push_str(WARN_OPEN);
+            html.push_str("喂狗余量不足 2 倍, 建议检查 CFG_WDT_FEED_MS</div>");
         }
     } else {
-        html.push_str(
-            "<div class=\"samples\" style=\"color:var(--warn)\">未启用 (CFG_WDT_ENABLE=false) — 建议正式部署时开启</div>",
-        );
+        html.push_str(WARN_OPEN);
+        html.push_str("未启用 (CFG_WDT_ENABLE=false) — 建议正式部署时开启</div>");
     }
-    html.push_str("</section>");
+    html.push_str(PANEL_END);
 }
 
 /// 判定准则表: 每条判定的通过阈值 + 本次结果, 让"为什么 PASS/FAIL"
 /// 可审计
 fn render_criteria(html: &mut String, data: &Data<'_>) {
-    html.push_str("<section class=\"panel\"><h2>判定准则 (可审计)</h2><table>");
+    panel(html, "判定准则 (可审计)");
+    html.push_str("<table>");
     html.push_str(
         "<tr><th>判定项</th><th>通过准则</th><th class=\"num\">本次结果</th><th>判定</th></tr>",
     );
@@ -485,30 +503,31 @@ fn render_criteria(html: &mut String, data: &Data<'_>) {
             "<tr><td><b>{name}</b></td><td>{criterion}</td><td class=\"num\">{value}</td><td>{mark}</td></tr>"
         );
     }
-    html.push_str("</table></section>");
+    html.push_str("</table>");
+    html.push_str(PANEL_END);
 }
 
 /// 结论区: 本次测试证明了什么 / 未覆盖什么 (诚实声明, 增强可信度)
 fn render_conclusion(html: &mut String, data: &Data<'_>) {
-    html.push_str("<section class=\"panel\"><h2>结论</h2>");
+    panel(html, "结论");
     let ok = if data.pass { "可放心长期运行" } else { "存在缺陷, 不建议部署" };
     let _ = writeln!(
         html,
         "<div class=\"samples\">在 {} 个压力线程 × {} 的满载运行下, 调度器无死锁/饥饿, \
          IPC (信号量/事件/邮箱/队列) 有序无丢失, 互斥量无丢失更新且优先级继承生效, \
          堆无泄漏、碎片有界且分配失败被优雅拒绝, 定时器/中断路径稳定, 看门狗喂狗余量充足。 \
-         结论: <b style=\"color:var(--fg)\">{}</b>。</div>",
+         结论: <b>{}</b>。</div>",
         data.spawned_count,
         fmt_duration(data.elapsed_ms),
         ok
     );
+    html.push_str(WARN_OPEN);
     html.push_str(
-        "<div class=\"samples\" style=\"color:var(--warn);margin-top:8px\">测试局限 (未覆盖): \
-         掉电/欠压与复位恢复时序、外部总线故障注入、看门狗触发路径本身 (触发即复位, \
-         属硬件行为)、真实外设链路 (本板无 CAN PHY, CAN 为内部回环)、以及文件系统掉电一致性 \
+        "测试局限 (未覆盖): 掉电/欠压与复位恢复时序、外部总线故障注入、看门狗触发路径本身 \
+         (触发即复位, 属硬件行为)、真实外设链路 (本板无 CAN PHY)、文件系统掉电一致性 \
          (另有 powerloss 测试覆盖)。本测试以 1 kHz 节拍与 115200 UART 为基准环境。</div>",
     );
-    html.push_str("</section>");
+    html.push_str(PANEL_END);
 }
 
 /// 运行时长 `H:MM:SS`

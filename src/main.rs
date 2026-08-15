@@ -56,11 +56,16 @@ mod uart_rtos; // UART 的 RTOS 阻塞接收适配层
 
 // ---- 应用 ----
 mod banner; // 启动横幅 (依赖 clk/heap/rtos 公共状态)
+#[cfg(shell_selftest)]
 mod selftest; // 内核自检 (shell `selftest` 命令同步执行)
 mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
+#[cfg(shell_soak)]
 mod soak; // 长期稳定性测试 (shell `soak` 命令同步执行)
+#[cfg(shell_soak)]
 mod soak_report; // soak 测试结果 → /test/ 单文件 HTML 报告
+#[cfg(shell_soak)]
 mod soak_report_core; // soak 报告纯逻辑 (HTML 构建/文件名, 与 lib 同源, 主机单测)
+#[cfg(shell_zmodem)]
 mod zmodem; // ZMODEM 文件传输协议 (纯逻辑, 主机单测与真实 lrzsz 互通)
 
 use core::sync::atomic::{AtomicU32, Ordering};

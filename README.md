@@ -575,9 +575,23 @@ cargo run                            # 构建 + 烧录 (pyocd, 见 scripts/flash
 
 `debug` 构建默认已启用 `opt-level = 1` (见 `Cargo.toml` `[profile.dev]`):
 保留 debuginfo、帧指针和 panic 栈回溯所需信息；`release` 构建采用
-`opt-level = "z"` (体积优先)。当前工具链下 `arm-none-eabi-size` 测得
-`text + data` 分别约为 153.3KiB (debug) 和 96.5KiB (release)；具体结果会随
-Rust/LLVM 版本与功能增减而变化。
+`opt-level = "z"` + `lto = "thin"` + `codegen-units = 1` (体积优先)。
+当前工具链与全功能配置下 `arm-none-eabi-size` 测得 `text + data`
+约为 150.6KiB (release)；具体结果会随 Rust/LLVM 版本与功能增减而变化。
+
+**体积优化与功能裁剪**: 除 `CFG_*` 运行时配置外, 大体积功能均为
+**编译期开关** (`build.rs` 把配置翻译为 `#[cfg]`, 关闭时连代码一起
+不编译):
+
+| 开关 | 功能 | 全关相比全开约省 |
+|---|---|---|
+| `CFG_SOAK_ENABLE` | soak 长稳测试 + HTML 报告模板 | ~54 KiB (含依赖) |
+| `CFG_APP_SELFTEST_ENABLE` | selftest 内核自检 | ~19 KiB |
+| `CFG_SHELL_ZMODEM_ENABLE` | sz/rz 文件传输 | ~12 KiB |
+| `CFG_SHELL_NANO_ENABLE` | nano 全屏编辑器 | ~9 KiB |
+
+四项全部关闭时 `text + data` 约 75.7KiB (相比全开省 ~75 KiB)。
+注: soak 依赖 selftest 的 ESC 中断, soak 开启时 selftest 自动随带编译。
 
 ### 烧录 (pyocd)
 
@@ -681,6 +695,10 @@ continue
   + 加入 `CFG_SHELL_COMMANDS` 启用列表**, 无需修改分发/帮助逻辑;
 - **每个命令可单独启用/禁用**: `CFG_SHELL_COMMANDS` 为逗号分隔的命令名
   列表, 未列出的命令执行时提示 "未启用" 且不出现在 `help` 中;
+- **大功能另有编译期开关**: `nano` / `sz` / `rz` / `selftest` / `soak`
+  除受 `CFG_SHELL_COMMANDS` 控制外, 还受各自的 `CFG_SHELL_NANO_ENABLE` /
+  `CFG_SHELL_ZMODEM_ENABLE` / `CFG_APP_SELFTEST_ENABLE` / `CFG_SOAK_ENABLE`
+  编译期开关约束 — 关闭时命令与代码整体不编译 (见"体积优化"一节);
 - 命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) / `echo` /
   `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` / `write`(put) /
   `nano` / `sz` / `rz` / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` / `mount` /
@@ -700,7 +718,8 @@ continue
 - 测试对象 (信号量/互斥量/事件/邮箱/队列) 每次运行**全新创建** (局部
   变量), 多次执行结果确定; 自检在 shell 线程内同步运行, shell 线程
   栈因此配置为 8KB (`CFG_APP_SHELL_STACK`);
-- `CFG_APP_SELFTEST_ENABLE = false` 时命令提示 "未启用"；
+- `CFG_APP_SELFTEST_ENABLE = false` 时 selftest 命令与其代码**不编译**
+  (编译期开关, 省 ~19 KiB; soak 开启时自动随带编译);
   `CFG_CAN_SELFTEST_ENABLE = false` 时 CAN 项显示为跳过;
 - 全量自检依次验证信号量 / 互斥量 (非递归) / 事件 (AND/OR/清除) / 邮箱 (含紧急
   插队) / 消息队列 (含二进制) / 线程延时 / 线程删除 (delete) / 线程自然
@@ -770,7 +789,8 @@ continue
   看门狗是否生效); 建议连续运行至少 **8 小时** (如 `soak 480`) 或过夜
   (如 `soak 720`), Flash 压力默认 10s 一次擦写循环, 24 小时约 8.6k 次,
   远低于片内 Flash 寿命上限;
-- `CFG_SOAK_ENABLE = false` 时命令提示"未启用"; 失败日志由压力线程
+- `CFG_SOAK_ENABLE = false` 时 soak 命令与其代码 (含 HTML 报告模板)
+  **不编译** (编译期开关, 省 ~54 KiB); 失败日志由压力线程
   即时输出 (console 整行原子, 不与其他线程输出交错), 运行期间控制台
   仅保留进度条, 其余信息 (含各线程启动明细) 均进报告与 debug 级日志。
 

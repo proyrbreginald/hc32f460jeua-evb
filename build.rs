@@ -1,7 +1,6 @@
-//! 构建脚本: 仅注入启动横幅所需的构建日期与 rustc 版本。
-//!
-//! 工程配置不在本脚本中 — 全部集中在 `.cargo/config.toml` 的 `[env]`
-//! 段, 由 `src/config.rs` 编译期读取。
+//! 构建脚本: 注入启动横幅所需的构建日期与 rustc 版本, 并把
+//! `.cargo/config.toml [env]` 中的功能开关翻译为 `#[cfg]` 条件
+//! (实现**编译期裁剪**: 关闭的功能连代码一起不编译, 直接省 FLASH)。
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
@@ -14,6 +13,31 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=crates/littlefs/Cargo.toml");
     println!("cargo:rerun-if-changed=crates/littlefs/src");
+
+    // 功能开关: 布尔 env → `cargo:rustc-cfg=<flag>`, 非法值直接编译报错。
+    // 每次开关变化都会触发 build.rs 重跑 (rerun-if-env-changed 追踪), 并
+    // 因 cfg 变化导致相关代码重新编译。
+    for (env, flag) in [
+        ("CFG_SHELL_NANO_ENABLE", "shell_nano"),
+        ("CFG_SHELL_ZMODEM_ENABLE", "shell_zmodem"),
+        ("CFG_APP_SELFTEST_ENABLE", "shell_selftest"),
+        ("CFG_SOAK_ENABLE", "shell_soak"),
+    ] {
+        match std::env::var(env).as_deref() {
+            Ok("true") => println!("cargo:rustc-cfg={flag}"),
+            Ok("false") => {}
+            _ => panic!("{env} 必须为 true/false"),
+        }
+        println!("cargo:rerun-if-env-changed={env}");
+    }
+    // soak 依赖 selftest 的 ESC 中断支持: soak 开启时强制 selftest 一并编译
+    if std::env::var("CFG_SOAK_ENABLE").as_deref() == Ok("true") {
+        println!("cargo:rustc-cfg=shell_selftest");
+    }
+    // 声明本工程自定义的 cfg 名, 避免 rustc 的 unexpected cfg 警告
+    for flag in ["shell_nano", "shell_zmodem", "shell_selftest", "shell_soak"] {
+        println!("cargo:rustc-check-cfg=cfg({flag})");
+    }
 
     // 构建日期 (UTC, 公历)。可复现构建由 SOURCE_DATE_EPOCH 固定时间；
     // 未设置时保留开发固件显示实际构建日的便利行为。

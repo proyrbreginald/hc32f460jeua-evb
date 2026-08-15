@@ -36,14 +36,7 @@ extern "C" fn blk_sender(_param: usize) {
 ///
 /// 自检期间终端输入一律丢弃 (ESC 除外); 返回 true 表示请求中断。
 pub(crate) fn abort_requested() -> bool {
-    let uart = crate::board::BoardResources::get().console();
-    let mut esc = false;
-    while let Some(b) = uart.read_rx() {
-        if b == 0x1B {
-            esc = true;
-        }
-    }
-    esc
+    crate::board::abort_requested()
 }
 
 static CAN_SELFTEST_FILTERS: [crate::can::Filter; 4] = [

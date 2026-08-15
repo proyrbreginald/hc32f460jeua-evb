@@ -101,6 +101,7 @@ pub fn used() -> usize {
 /// 碎片化最直接的度量: 用量相同, 碎片越严重最大连续空闲块越小,
 /// 越难满足大块分配。压力测试周期采样可证明长期运行不会因碎片
 /// 耗尽可用大块。
+#[cfg(shell_soak)]
 pub fn largest_free_block() -> usize {
     crate::critical_section::with(|_| {
         if !INITIALIZED.load(Ordering::Relaxed) {

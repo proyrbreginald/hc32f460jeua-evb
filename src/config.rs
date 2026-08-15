@@ -885,15 +885,6 @@ pub const APP_LED_STACK: usize = parse_u32(env!("CFG_APP_LED_STACK")) as usize;
 pub const APP_LED_PRIORITY: u8 = parse_u8(env!("CFG_APP_LED_PRIORITY"));
 pub const APP_LED_TIMESLICE: u32 = parse_u32(env!("CFG_APP_LED_TIMESLICE"));
 pub const APP_LED_BLINK_MS: u32 = parse_u32(env!("CFG_APP_LED_BLINK_MS"));
-/// 是否启用内核自检 (CFG_APP_SELFTEST_ENABLE = true/false)
-/// 启用后通过 shell 命令 `selftest` 手动启动, 不再开机自动运行
-pub const APP_SELFTEST_ENABLE: bool = if eq_str(env!("CFG_APP_SELFTEST_ENABLE"), "true") {
-    true
-} else if eq_str(env!("CFG_APP_SELFTEST_ENABLE"), "false") {
-    false
-} else {
-    panic!("CFG_APP_SELFTEST_ENABLE 非法 (可用 true/false)")
-};
 pub const APP_SHELL_STACK: usize = parse_u32(env!("CFG_APP_SHELL_STACK")) as usize;
 pub const APP_SHELL_PRIORITY: u8 = parse_u8(env!("CFG_APP_SHELL_PRIORITY"));
 pub const APP_SHELL_TIMESLICE: u32 = parse_u32(env!("CFG_APP_SHELL_TIMESLICE"));
@@ -924,9 +915,6 @@ const _: () = assert!(
 
 // ============================== [soak] ==============================
 
-/// 是否启用长期稳定性测试 (CFG_SOAK_ENABLE = true/false)
-/// 启用后通过 shell 命令 `soak` 手动启动
-pub const SOAK_ENABLE: bool = parse_bool(env!("CFG_SOAK_ENABLE"));
 /// soak 无参数时的默认时长 (分钟; 0 = 直到 ESC)
 pub const SOAK_MINUTES: u32 = parse_u32(env!("CFG_SOAK_MINUTES"));
 const _: () = assert!(

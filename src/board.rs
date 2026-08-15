@@ -218,7 +218,23 @@ impl BoardResources {
         &self.console
     }
 
+    /// 检测用户是否按下 ESC (0x1B): 轮询并清空接收缓冲。
+    ///
+    /// 长时间运行的测试 (自检/soak) 期间终端输入一律丢弃 (ESC 除外);
+    /// 返回 true 表示请求中断。放在本模块以便 selftest 与 soak 共享。
+    #[cfg(shell_selftest)]
+    pub(crate) fn abort_requested(&self) -> bool {
+        let mut esc = false;
+        while let Some(b) = self.console.read_rx() {
+            if b == 0x1B {
+                esc = true;
+            }
+        }
+        esc
+    }
+
     /// 板级唯一 CAN 控制器句柄。
+    #[cfg(shell_selftest)]
     pub(crate) fn can(&self) -> &crate::can::Can {
         &self.can
     }
@@ -276,6 +292,15 @@ fn apply_thread_memory_protection(next: crate::rtos::ContextSwitchInfo) {
     crate::mpu::set_thread_guard(next.guard_base);
 }
 
+/// 检测用户是否按下 ESC (0x1B): 轮询并清空接收缓冲。
+///
+/// 长时间运行的测试 (自检/soak) 期间终端输入一律丢弃 (ESC 除外);
+/// 返回 true 表示请求中断。selftest 与 soak 均通过本函数共享。
+#[cfg(shell_selftest)]
+pub(crate) fn abort_requested() -> bool {
+    BoardResources::get().abort_requested()
+}
+
 /// 最高优先级 WDT supervisor：周期休眠，避免合法的长时间轮询输出因
 /// idle 无法运行而误触发复位，同时验证 SysTick/PendSV 仍可调度线程。
 extern "C" fn watchdog_supervisor(_param: usize) {
@@ -294,6 +319,7 @@ extern "C" fn watchdog_supervisor(_param: usize) {
 }
 
 /// 实测最大喂狗间隔 (毫秒; supervisor 运行后累计的最大值)
+#[cfg(shell_soak)]
 pub fn wdt_feed_max_gap_ms() -> u32 {
     WDT_FEED_MAX_GAP.load(Ordering::Relaxed)
 }
