@@ -21,6 +21,8 @@ mod arch; // CPU 架构原语 facade (PRIMASK / WFI / DSB / 系统复位)
 mod critical_section; // PRIMASK 临界区 + 中断上下文检测 (ISR 误用防护)
 mod heap; // 全局堆分配器 (边界标记 + 首次适配)
 mod heap_layout; // 堆分配布局规划 (纯逻辑, 可在主机测试)
+mod mmio; // 内存映射寄存器访问原语 (各外设驱动共用)
+mod notify; // 原子回调槽: ISR → 应用无锁通知 (可在主机测试)
 mod panic; // panic/fault 诊断: 寄存器解码 + 栈回溯 + 停机/复位策略
 mod startup; // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
 mod vector_table; // 复位/异常/144 外设中断向量表 (原子回调槽)

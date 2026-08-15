@@ -48,41 +48,10 @@
 //! 因此忽略未使用项的死代码警告。
 #![allow(dead_code)]
 
-/// 内存映射寄存器 (绝对地址)
-struct Reg {
-    addr: usize,
-}
-
-impl Reg {
-    const fn new(addr: usize) -> Self {
-        Self { addr }
-    }
-
-    fn read(&self) -> u32 {
-        unsafe { core::ptr::read_volatile(self.addr as *mut u32) }
-    }
-
-    fn write(&self, value: u32) {
-        unsafe { core::ptr::write_volatile(self.addr as *mut u32, value) }
-    }
-
-    fn modify(&self, f: impl FnOnce(u32) -> u32) {
-        self.write(f(self.read()));
-    }
-
-    fn read_u16(&self) -> u16 {
-        unsafe { core::ptr::read_volatile(self.addr as *mut u16) }
-    }
-
-    fn write_u16(&self, value: u16) {
-        unsafe { core::ptr::write_volatile(self.addr as *mut u16, value) }
-    }
-}
+use crate::mmio::Reg;
 
 /// USART 单元基址表 (CM_USART1_BASE 等)
 const USART_BASES: [usize; 4] = [0x4001_D000, 0x4001_D400, 0x4002_1000, 0x4002_1400];
-/// PWC 外设基址 (FCG 时钟门控)
-const PWC_BASE: usize = 0x4004_8000;
 
 /// TDR 绝对地址 (DMA 发送目的地址用, 见 [`crate::dma::uart_tx_init`])
 pub(crate) const fn tdr_addr(unit: u8) -> usize {
@@ -369,9 +338,8 @@ impl<const U: u8> Uart<U> {
             return Err(UartError::InvalidBaudrate);
         }
 
-        // 1. 使能 USARTn 时钟 (FCG1 清位)
-        let fcg1 = Reg::new(PWC_BASE + 0x04);
-        fcg1.modify(|v| v & !fcg1_usart_bit(U));
+        // 1. 使能 USARTn 时钟 (FCG1 清位, 经 clk 模块共用助手)
+        crate::clk::fcg1_enable(fcg1_usart_bit(U));
 
         // 2. 计算波特率 (USART 时钟 = PCLK1 / 预分频, PCLK1 运行时查询)
         let usart_clk = crate::clk::pclk1_hz() / config.clock_div.divisor();
@@ -634,36 +602,12 @@ static RX_RINGS: [RxRing; 4] = [RxRing::new(), RxRing::new(), RxRing::new(), RxR
 /// 不解释通知语义; RTOS/async/事件循环适配器可据此唤醒自己的等待者。
 pub(crate) type RxNotify = fn();
 
-/// 原子通知槽 (null = 未安装)。函数指针具有静态生命周期, ISR 并发读取安全。
-struct RxNotifySlot(core::sync::atomic::AtomicPtr<()>);
-
-impl RxNotifySlot {
-    const fn new() -> Self {
-        Self(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()))
-    }
-
-    fn store(&self, notify: RxNotify) {
-        self.0.store(
-            notify as *const () as *mut (),
-            core::sync::atomic::Ordering::Release,
-        );
-    }
-
-    fn call(&self) {
-        let ptr = self.0.load(core::sync::atomic::Ordering::Acquire);
-        if !ptr.is_null() {
-            // 槽位只接受 RxNotify, 存入的函数指针始终有效且与目标同宽。
-            let notify = unsafe { core::mem::transmute::<*mut (), RxNotify>(ptr) };
-            notify();
-        }
-    }
-}
-
-static RX_NOTIFIERS: [RxNotifySlot; 4] = [
-    RxNotifySlot::new(),
-    RxNotifySlot::new(),
-    RxNotifySlot::new(),
-    RxNotifySlot::new(),
+/// 各 USART 单元的通知槽 (原子回调槽, 见 [`crate::notify::NotifySlot`])
+static RX_NOTIFIERS: [crate::notify::NotifySlot; 4] = [
+    crate::notify::NotifySlot::new(),
+    crate::notify::NotifySlot::new(),
+    crate::notify::NotifySlot::new(),
+    crate::notify::NotifySlot::new(),
 ];
 
 /// 接收错误计数 (ISR 累加, 诊断串口噪声/接线/对端波特率用)
@@ -697,46 +641,41 @@ static RX_ERRORS: [RxErrorCounts; 4] = [
 ///
 /// 仅做缓冲写入、错误计数和 OS 无关通知, 不直接调用 RTOS/打印 API。
 unsafe extern "C" fn rx_irq_handler<const U: u8>() {
-    unsafe {
-        let base = USART_BASES[U as usize - 1];
-        let sr = core::ptr::read_volatile(base as *const u32);
-        if sr & (SR_RXNE | SR_PE | SR_FE | SR_ORE) != 0 {
-            // 读 RDR: 清 RXNE/ORE, 同时取出数据 (对齐示例先读再判错)
-            let byte = core::ptr::read_volatile((base + 0x06) as *const u16) as u8;
-            let ring = &RX_RINGS[U as usize - 1];
-            let errors = &RX_ERRORS[U as usize - 1];
-            let error_flags = sr & (SR_PE | SR_FE | SR_ORE);
-            if sr & SR_RXNE != 0 && error_flags == 0 {
-                // 先以 Release 发布 head, 再通知适配层。缓冲满时丢弃最新
-                // 字节且不通知, 避免没有新数据时产生虚假唤醒。
-                if ring.push(byte) {
-                    RX_NOTIFIERS[U as usize - 1].call();
-                }
+    let base = USART_BASES[U as usize - 1];
+    let sr = Reg::new(base).read();
+    if sr & (SR_RXNE | SR_PE | SR_FE | SR_ORE) != 0 {
+        // 读 RDR: 清 RXNE/ORE, 同时取出数据 (对齐示例先读再判错)
+        let byte = Reg::new(base + 0x06).read_u16() as u8;
+        let ring = &RX_RINGS[U as usize - 1];
+        let errors = &RX_ERRORS[U as usize - 1];
+        let error_flags = sr & (SR_PE | SR_FE | SR_ORE);
+        if sr & SR_RXNE != 0 && error_flags == 0 {
+            // 先以 Release 发布 head, 再通知适配层。缓冲满时丢弃最新
+            // 字节且不通知, 避免没有新数据时产生虚假唤醒。
+            if ring.push(byte) {
+                RX_NOTIFIERS[U as usize - 1].call();
             }
-            // 错误计数 (诊断用, 读 RDR 后仍可通过 SR 判断)
-            if sr & SR_PE != 0 {
-                errors
-                    .parity
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            if sr & SR_FE != 0 {
-                errors
-                    .frame
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            if sr & SR_ORE != 0 {
-                errors
-                    .overrun
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            if error_flags != 0 {
-                // 读-改-写 CR1 清除错误标志 (CPE/CFE/CORE, 对齐 USART_ClearStatus)
-                let cr1 = core::ptr::read_volatile((base + 0x0C) as *const u32);
-                core::ptr::write_volatile(
-                    (base + 0x0C) as *mut u32,
-                    cr1 | CR1_CPE | CR1_CFE | CR1_CORE,
-                );
-            }
+        }
+        // 错误计数 (诊断用, 读 RDR 后仍可通过 SR 判断)
+        if sr & SR_PE != 0 {
+            errors
+                .parity
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        if sr & SR_FE != 0 {
+            errors
+                .frame
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        if sr & SR_ORE != 0 {
+            errors
+                .overrun
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        if error_flags != 0 {
+            // 读-改-写 CR1 清除错误标志 (CPE/CFE/CORE, 对齐 USART_ClearStatus)
+            let cr1 = Reg::new(base + 0x0C);
+            cr1.write(cr1.read() | CR1_CPE | CR1_CFE | CR1_CORE);
         }
     }
 }

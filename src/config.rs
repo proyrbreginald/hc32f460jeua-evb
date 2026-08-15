@@ -457,6 +457,23 @@ const _: () = assert!(
     DMA_TX_MIN >= 4 && DMA_TX_MIN <= 512,
     "CFG_DMA_TX_MIN 应为 4~512"
 );
+/// 大块拷贝 (Flash→RAM / RAM→RAM) DMA 单元与通道 (CFG_DMA_COPY_UNIT /
+/// CFG_DMA_COPY_CHANNEL)
+pub const DMA_COPY_UNIT: u8 = parse_u8(env!("CFG_DMA_COPY_UNIT"));
+const _: () = assert!(
+    DMA_COPY_UNIT == 1 || DMA_COPY_UNIT == 2,
+    "CFG_DMA_COPY_UNIT 非法 (可用 1/2)"
+);
+pub const DMA_COPY_CHANNEL: u8 = parse_u8(env!("CFG_DMA_COPY_CHANNEL"));
+const _: () = assert!(
+    DMA_COPY_CHANNEL <= 3,
+    "CFG_DMA_COPY_CHANNEL 非法 (可用 0~3)"
+);
+/// TX 与 COPY 不得共用同一通道 (同一通道被两个功能同时配置会互相覆盖)
+const _: () = assert!(
+    !(DMA_ENABLE && DMA_TX_UNIT == DMA_COPY_UNIT && DMA_TX_CHANNEL == DMA_COPY_CHANNEL),
+    "CFG_DMA_TX_* 与 CFG_DMA_COPY_* 不能配置到同一通道"
+);
 /// 触发 DMA 整块拷贝 (Flash→RAM / RAM→RAM) 的最小长度 (字节)
 /// (CFG_DMA_COPY_MIN)
 ///
@@ -785,6 +802,22 @@ const _: () = assert!(
     "CFG_CONSOLE_LINE_GAP_MS 应为 0~50"
 );
 
+// ============================== [panic] ==============================
+
+/// panic/fault 后的行为策略 (CFG_PANIC_STRATEGY = halt/reset)
+///
+/// - `halt`: 屏蔽中断后 wfi 死循环 (调试期推荐, 便于 gdb 现场检查);
+/// - `reset`: 软复位重启 (产品部署推荐, 尽快恢复服务)。
+/// 见 [`crate::panic::PanicStrategy`]。
+pub const PANIC_STRATEGY: crate::panic::PanicStrategy =
+    if eq_str(env!("CFG_PANIC_STRATEGY"), "halt") {
+        crate::panic::PanicStrategy::Halt
+    } else if eq_str(env!("CFG_PANIC_STRATEGY"), "reset") {
+        crate::panic::PanicStrategy::Reset
+    } else {
+        panic!("CFG_PANIC_STRATEGY 非法 (可用 halt/reset)")
+    };
+
 // ============================== [rtc] ==============================
 
 /// 是否启用 RTC 并作为日志时间戳 (CFG_RTC_ENABLE = true/false)
@@ -809,6 +842,15 @@ pub const LOG_ENABLE: bool = if eq_str(env!("CFG_LOG_ENABLE"), "true") {
     false
 } else {
     panic!("CFG_LOG_ENABLE 非法 (可用 true/false)")
+};
+/// 控制台日志是否带 ANSI 颜色 (CFG_LOG_COLOR = true/false)。
+/// 落盘文件恒为无颜色纯文本, 与本开关无关; 纯文本终端可关闭。
+pub const LOG_COLOR: bool = if eq_str(env!("CFG_LOG_COLOR"), "true") {
+    true
+} else if eq_str(env!("CFG_LOG_COLOR"), "false") {
+    false
+} else {
+    panic!("CFG_LOG_COLOR 非法 (可用 true/false)")
 };
 /// 日志默认级别阈值 (CFG_LOG_LEVEL = error/warn/info/debug/trace)
 /// 输出 ≤ 阈值的级别; 运行时可经 shell `log level <级别>` 调整

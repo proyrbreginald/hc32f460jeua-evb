@@ -137,7 +137,7 @@ pub(crate) unsafe fn request_switch(from_sp: *mut usize, to_sp: *mut usize) {
     TO_SP_ADDR.store(to_sp as usize, Ordering::Relaxed);
     SWITCH_FLAG.store(1, Ordering::Relaxed);
     // NVIC_ICSR.PENDSVSET (Cortex-M 内核外设 0xE000ED04)
-    unsafe { core::ptr::write_volatile(0xE000_ED04 as *mut u32, 1 << 28) };
+    crate::mmio::Reg::new(0xE000_ED04).write(1 << 28);
 }
 
 /// 设置 PendSV 为最低优先级、SysTick 次低 (SCB.SHPR3)
@@ -145,12 +145,12 @@ pub(crate) unsafe fn request_switch(from_sp: *mut usize, to_sp: *mut usize) {
 /// PendSV 必须低于所有中断, 确保切换发生在所有中断返回之后。
 pub(crate) fn scb_priority_init() {
     // SHPR3: [23:16] = PendSV (优先级 15), [31:24] = SysTick (优先级 14)
-    unsafe { core::ptr::write_volatile(0xE000_ED20 as *mut u32, 0xE0F0_0000) };
+    crate::mmio::Reg::new(0xE000_ED20).write(0xE0F0_0000);
 }
 
 #[inline]
 unsafe fn write_u32(addr: usize, val: u32) {
-    unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
+    crate::mmio::Reg::new(addr).write(val);
 }
 
 /// 初始化线程初始栈帧 (RT-Thread `rt_hw_stack_init` 移植)

@@ -185,11 +185,11 @@ pub enum RtcError {
 // ============================== 底层访问 ==============================
 
 fn read8(offset: usize) -> u8 {
-    unsafe { core::ptr::read_volatile((RTC_BASE + offset) as *const u8) }
+    crate::mmio::Reg::new(RTC_BASE + offset).read_u8()
 }
 
 fn write8(offset: usize, value: u8) {
-    unsafe { core::ptr::write_volatile((RTC_BASE + offset) as *mut u8, value) };
+    crate::mmio::Reg::new(RTC_BASE + offset).write_u8(value);
 }
 
 fn modify8(offset: usize, f: impl FnOnce(u8) -> u8, _cs: CriticalSection<'_>) {

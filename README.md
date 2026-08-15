@@ -34,16 +34,17 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_SYSTICK_HZ` / `CFG_TICKS_PER_SEC` | 节拍频率 (两者必须一致, 编译期校验) |
 | `CFG_PRIORITY_MAX` / `CFG_IDLE_*` | RTOS 优先级与空闲线程 |
 | `CFG_UART_*` | 控制台单元 / 引脚·功能号 / 波特率 / 数据位 / 校验 / 停止位 / 过采样 / 流控 / 噪声滤波 / 缓冲 / 中断参数 |
-| `CFG_DMA_*` | DMA 开关 / 控制台 TX 卸载单元·通道 / 最小输出长度 / 大块拷贝最小长度 |
+| `CFG_DMA_*` | DMA 开关 / 控制台 TX 单元·通道·最小长度 / 大块拷贝单元·通道·最小长度 |
 | `CFG_CAN_*` | CAN 启用 / selftest / 引脚 / 位速率·采样点·SJW·误差 / 模式 / PTB·STB / RX / 过滤器 / 超时 |
 | `CFG_LED_PIN` / `CFG_LED_LEVEL` | 板载 LED 引脚与初始电平 |
 | `CFG_SHELL_*` | 登录用户名 / 密码 / 失败次数 / 输入缓冲区 / **命令启用列表** (原 `shell.conf` 并入) |
 | `CFG_SHELL_HISTORY_SIZE` | RAM 中保留的历史命令条数 (1~16，默认 8，复位后清空) |
 | `CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` / `CFG_NANO_MAX_BYTES` | nano 终端探测回退尺寸 / 单文件编辑上限 |
-| `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
+| `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` / `CFG_LOG_COLOR` | 应用日志默认开关 / 级别阈值 / 控制台 ANSI 颜色 (运行时可用 `log` 命令切换开关与级别) |
 | `CFG_LOG_FILE_*` / `CFG_LOG_RING` / `CFG_LOG_FLUSH_MS` | 日志落盘开关 / 单文件上限 / 轮转槽数 / RAM 缓冲 / 刷新间隔 (自动保存到 `/log/`) |
 | `CFG_APP_LOGFILE_*` | 日志落盘线程栈 / 优先级 / 时间片 |
 | `CFG_CONSOLE_LINE_GAP_MS` | 控制台整行输出行间间隙 (防 USB 转串口突发丢字节) |
+| `CFG_PANIC_STRATEGY` | panic/fault 后行为: halt=停机 (调试) / reset=软复位 (产品) |
 | `CFG_RTC_ENABLE` | RTC 与日志运行时长时间戳开关 |
 | `CFG_WDT_ENABLE` / `CFG_WDT_*` | WDT 开关 / supervisor 栈、最高优先级与喂狗周期 |
 | `CFG_MPU_ENABLE` | FLASH/SRAM/外设属性与线程栈守卫开关 |
@@ -77,6 +78,8 @@ src/
 ├── vector_table.rs    # 复位/异常/144 外设中断向量表 + INT000~007 中断分发
 ├── panic.rs           # fault 帧校验、CFSR/HFSR 解码与安全栈回溯
 ├── critical_section.rs# PRIMASK 临界区 (嵌套安全, 中断安全的基础)
+├── mmio.rs            # 内存映射寄存器访问原语 (全部外设驱动共用, 含 u8/u16/u32 与 RMW)
+├── notify.rs          # 原子回调槽: ISR → 应用无锁通知 (uart/dma 共用, 可在主机测试)
 ├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
 ├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
 ├── efm.rs             # 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
@@ -887,8 +890,9 @@ continue
 - **当前集成 — Flash→RAM 大块读取加速**: 文件系统读 (`read`) / 擦除
   校验 (`verify_erased` / `partition_is_erased`) / 写后回读校验
   (`program` 回读) 对长度 ≥ `CFG_DMA_COPY_MIN` 的请求改用 DMA 整块
-  拷贝 (`copy_try`, DMA1/CH0, 32 位宽度自动分块), 比逐字节/逐字循环
-  快约一个数量级; 未接管时回退原路径, 行为不变;
+  拷贝 (`copy_try`, 通道由 `CFG_DMA_COPY_UNIT`/`CFG_DMA_COPY_CHANNEL`
+  配置且编译期校验与 TX 通道不冲突), 比逐字节/逐字循环快约一个数量级;
+  未接管时回退原路径, 行为不变;
 - **暂不采用 DMA 的位置**: UART 接收 (每字节中断在 115200 下 <5% CPU,
   未知帧长需 RTO+reconfig 重写输入路径, 收益小于风险, 原语已预留);
   Flash 编程/擦除 (写地址触发 + 逐字等待 OPTEND, bus-hold 使 DMA 同样

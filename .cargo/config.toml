@@ -82,8 +82,11 @@ CFG_DMA_ENABLE = "true"              # 启用 DMA 驱动与控制台 TX 卸载
 CFG_DMA_TX_UNIT = "2"                # 控制台 TX DMA 单元 (1/2)
 CFG_DMA_TX_CHANNEL = "0"             # 控制台 TX DMA 通道 (0~3)
 CFG_DMA_TX_MIN = "16"                # 触发 DMA 的最小输出长度 (字节)
-# 大块拷贝 (Flash→RAM 读/擦除校验/写后回读) 走 DMA1/CH0, 阈值以下的
-# 读取保持逐字节/逐字回退 (DMA 单次配置开销 ~10µs, 小块反而更慢)。
+# 大块拷贝 (Flash→RAM 读/擦除校验/写后回读) 专用通道; 不得与 TX 通道
+# 相同 (编译期校验)。阈值以下的读取保持逐字节/逐字回退 (DMA 单次配置
+# 开销 ~10µs, 小块反而更慢)。
+CFG_DMA_COPY_UNIT = "1"              # 大块拷贝 DMA 单元 (1/2)
+CFG_DMA_COPY_CHANNEL = "0"           # 大块拷贝 DMA 通道 (0~3)
 CFG_DMA_COPY_MIN = "256"             # 触发 DMA 整块拷贝的最小长度 (字节)
 
 # [can] HC32F460 单路经典 CAN 2.0B
@@ -147,6 +150,7 @@ CFG_ZMODEM_RX_MAX = "65472"       # 接收文件大小上限 (字节, 快照容�
 # [log] 应用日志 (可开关+分级+彩色, 与内核打印分离)
 CFG_LOG_ENABLE = "true" # 日志默认开关 (运行时可用 shell `log on|off` 切换)
 CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出 ≤ 阈值)
+CFG_LOG_COLOR = "true"  # 控制台 ANSI 颜色 (false=纯文本; 落盘文件恒为无色)
 
 # [logfile] 日志自动保存到 /log/ (shell `log file on|off` 可运行时切换)
 CFG_LOG_FILE_ENABLE = "true"   # 落盘开关
@@ -160,6 +164,9 @@ CFG_APP_LOGFILE_TIMESLICE = "10"
 
 # [console] 控制台输出节流 (防 USB 转串口突发丢字节)
 CFG_CONSOLE_LINE_GAP_MS = "8"  # 每行输出后的间隙 (毫秒; 0=不节流)
+
+# [panic] panic/fault 后的行为策略
+CFG_PANIC_STRATEGY = "halt"    # halt=停机 (调试期, gdb 现场检查) / reset=软复位 (产品)
 
 # [panic] panic/fault 诊断文本详细度: true=逐位解码 CFSR/HFSR 原因名
 # (调试期), false=仅输出寄存器原始值 (参考手册查表, 省 ~1.5KiB)

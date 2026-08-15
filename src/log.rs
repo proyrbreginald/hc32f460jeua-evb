@@ -229,7 +229,10 @@ pub fn log(level: Level, args: core::fmt::Arguments<'_>) {
     };
     // 整条日志在打印锁内完成 (begin → 格式化 → commit 不与其他线程交错)
     let _ = crate::console::with_print_lock(|write_raw| {
-        write_raw(level.color().as_bytes());
+        // 颜色前缀可经 CFG_LOG_COLOR 关闭 (纯文本终端; 落盘环恒为无色)
+        if crate::config::LOG_COLOR {
+            write_raw(level.color().as_bytes());
+        }
         let mut entry: Option<EntryMark> = RING.with(|ring| ring.begin_entry());
         {
             let mut sink = FanoutSink {
@@ -244,7 +247,10 @@ pub fn log(level: Level, args: core::fmt::Arguments<'_>) {
         if let Some(mark) = entry {
             RING.with(|ring| ring.commit_entry(&mark));
         }
-        write_raw(b"\x1b[0m\r\n");
+        if crate::config::LOG_COLOR {
+            write_raw(b"\x1b[0m");
+        }
+        write_raw(b"\r\n");
     });
 }
 

@@ -14,7 +14,8 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use crate::can_timing::BitTiming;
 
 const CAN_BASE: usize = 0x4007_0400;
-const PWC_BASE: usize = 0x4004_8000;
+/// CAN 时钟门控位 (FCG1.bit0, 清位 = 使能; 见 [`crate::clk::fcg1_enable`])
+const FCG1_CAN: u32 = 1;
 
 // Register offsets, checked against CM_CAN_TypeDef and the project SVD.
 const RBUF: usize = 0x00;
@@ -820,19 +821,20 @@ fn write_tx_frame(frame: &TxFrame) {
 
 fn clock_cmd(enable: bool) {
     crate::critical_section::with(|_| {
-        let address = (PWC_BASE + 0x04) as *mut u32;
-        let value = unsafe { core::ptr::read_volatile(address) };
-        let next = if enable { value & !1 } else { value | 1 };
-        unsafe { core::ptr::write_volatile(address, next) };
+        if enable {
+            crate::clk::fcg1_enable(FCG1_CAN);
+        } else {
+            crate::clk::fcg1_disable(FCG1_CAN);
+        }
     });
 }
 
 fn read8(offset: usize) -> u8 {
-    unsafe { core::ptr::read_volatile((CAN_BASE + offset) as *const u8) }
+    crate::mmio::Reg::new(CAN_BASE + offset).read_u8()
 }
 
 fn write8(offset: usize, value: u8) {
-    unsafe { core::ptr::write_volatile((CAN_BASE + offset) as *mut u8, value) };
+    crate::mmio::Reg::new(CAN_BASE + offset).write_u8(value);
 }
 
 fn modify8(offset: usize, f: impl FnOnce(u8) -> u8) {
@@ -840,9 +842,9 @@ fn modify8(offset: usize, f: impl FnOnce(u8) -> u8) {
 }
 
 fn read32(offset: usize) -> u32 {
-    unsafe { core::ptr::read_volatile((CAN_BASE + offset) as *const u32) }
+    crate::mmio::Reg::new(CAN_BASE + offset).read()
 }
 
 fn write32(offset: usize, value: u32) {
-    unsafe { core::ptr::write_volatile((CAN_BASE + offset) as *mut u32, value) };
+    crate::mmio::Reg::new(CAN_BASE + offset).write(value);
 }

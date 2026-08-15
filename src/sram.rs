@@ -122,18 +122,14 @@ pub const fn wait_cycles(hclk_hz: u32) -> WaitCycles {
 /// 解锁 SRAMC 寄存器写保护 (WTPR 与 CKPR 都要写 0x77, 对齐 DDL
 /// `SRAM_REG_Unlock`)
 pub fn unlock() {
-    unsafe {
-        core::ptr::write_volatile((SRAMC + WTPR) as *mut u32, 0x77);
-        core::ptr::write_volatile((SRAMC + CKPR) as *mut u32, 0x77);
-    }
+    crate::mmio::Reg::new(SRAMC + WTPR).write(0x77);
+    crate::mmio::Reg::new(SRAMC + CKPR).write(0x77);
 }
 
 /// 锁定 SRAMC 寄存器写保护 (键值 0x76, 对齐 DDL `SRAM_REG_Lock`)
 pub fn lock() {
-    unsafe {
-        core::ptr::write_volatile((SRAMC + WTPR) as *mut u32, 0x76);
-        core::ptr::write_volatile((SRAMC + CKPR) as *mut u32, 0x76);
-    }
+    crate::mmio::Reg::new(SRAMC + WTPR).write(0x76);
+    crate::mmio::Reg::new(SRAMC + CKPR).write(0x76);
 }
 
 /// 按 HCLK 频率自动配置全部 SRAM 等待周期 (由 [`crate::clk`] 切换时钟前调用)
@@ -151,10 +147,8 @@ pub fn set_wait_cycles(hclk_hz: u32) -> Result<(), SramError> {
         | (w.sramr as u32) << WTCR_SRAMR_RWT_POS
         | (w.sramr as u32) << WTCR_SRAMR_WWT_POS;
     unlock();
-    unsafe {
-        core::ptr::write_volatile((SRAMC + WTCR) as *mut u32, wtcr);
-    }
-    let applied = unsafe { core::ptr::read_volatile((SRAMC + WTCR) as *const u32) == wtcr };
+    crate::mmio::Reg::new(SRAMC + WTCR).write(wtcr);
+    let applied = crate::mmio::Reg::new(SRAMC + WTCR).read() == wtcr;
     lock();
     if applied {
         Ok(())
@@ -165,7 +159,7 @@ pub fn set_wait_cycles(hclk_hz: u32) -> Result<(), SramError> {
 
 /// 读取当前等待周期配置
 pub fn wait_cycles_now() -> WaitCycles {
-    let v = unsafe { core::ptr::read_volatile((SRAMC + WTCR) as *const u32) };
+    let v = crate::mmio::Reg::new(SRAMC + WTCR).read();
     WaitCycles {
         sram12: ((v >> WTCR_SRAM12_RWT_POS) & 0x7) as u8,
         sram3: ((v >> WTCR_SRAM3_RWT_POS) & 0x7) as u8,
@@ -178,12 +172,12 @@ pub fn wait_cycles_now() -> WaitCycles {
 
 /// 读取错误状态 (CKSR, 对齐 DDL `SRAM_GetStatus`)
 pub fn status() -> u32 {
-    unsafe { core::ptr::read_volatile((SRAMC + CKSR) as *const u32) }
+    crate::mmio::Reg::new(SRAMC + CKSR).read()
 }
 
 /// 清除错误标志 (写 CKSR, 写 1 清除, 对齐 DDL `SRAM_ClearStatus`)
 pub fn clear_status(flags: u32) {
-    unsafe { core::ptr::write_volatile((SRAMC + CKSR) as *mut u32, flags) };
+    crate::mmio::Reg::new(SRAMC + CKSR).write(flags);
 }
 
 /// 查询错误 (按优先级返回最高位错误, 无错误返回 None)
@@ -245,30 +239,22 @@ pub fn set_fault_action(target: CheckTarget, action: FaultAction) {
         CheckTarget::Ecc => CKCR_ECCOAD,
     };
     unlock();
-    unsafe {
-        let v = core::ptr::read_volatile((SRAMC + CKCR) as *const u32);
-        core::ptr::write_volatile(
-            (SRAMC + CKCR) as *mut u32,
-            if action == FaultAction::Reset {
-                v | bit
-            } else {
-                v & !bit
-            },
-        );
-    }
+    let ckcr = crate::mmio::Reg::new(SRAMC + CKCR);
+    let v = ckcr.read();
+    ckcr.write(if action == FaultAction::Reset {
+        v | bit
+    } else {
+        v & !bit
+    });
     lock();
 }
 
 /// 设置 SRAM3 ECC 模式 (CKCR.ECCMOD)
 pub fn set_ecc_mode(mode: EccMode) {
     unlock();
-    unsafe {
-        let v = core::ptr::read_volatile((SRAMC + CKCR) as *const u32);
-        core::ptr::write_volatile(
-            (SRAMC + CKCR) as *mut u32,
-            (v & !CKCR_ECCMOD) | ((mode as u32) << 24),
-        );
-    }
+    let ckcr = crate::mmio::Reg::new(SRAMC + CKCR);
+    let v = ckcr.read();
+    ckcr.write((v & !CKCR_ECCMOD) | ((mode as u32) << 24));
     lock();
 }
 

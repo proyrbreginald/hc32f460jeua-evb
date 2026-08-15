@@ -71,17 +71,16 @@ pub(crate) fn data_sync_barrier() {
 
 /// Request a full system reset through SCB.AIRCR.
 pub(crate) fn system_reset() -> ! {
-    const AIRCR: *mut u32 = 0xE000_ED0C as *mut u32;
+    const AIRCR_ADDR: usize = 0xE000_ED0C;
     const PRIGROUP_MASK: u32 = 0x7 << 8;
     const VECTKEY: u32 = 0x05FA << 16;
     const SYSRESETREQ: u32 = 1 << 2;
 
     disable_interrupts();
     data_sync_barrier();
-    unsafe {
-        let priority_group = core::ptr::read_volatile(AIRCR) & PRIGROUP_MASK;
-        core::ptr::write_volatile(AIRCR, VECTKEY | priority_group | SYSRESETREQ);
-    }
+    let aircr = crate::mmio::Reg::new(AIRCR_ADDR);
+    let priority_group = aircr.read() & PRIGROUP_MASK;
+    aircr.write(VECTKEY | priority_group | SYSRESETREQ);
     data_sync_barrier();
     loop {
         unsafe {

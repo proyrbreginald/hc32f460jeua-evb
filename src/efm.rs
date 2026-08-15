@@ -190,12 +190,12 @@ fn map_error(status: u32) -> Option<EfmError> {
 
 /// 读取 FSR 状态 (对齐 DDL `EFM_GetStatus`)
 pub fn status() -> u32 {
-    unsafe { core::ptr::read_volatile((EFM_BASE + FSR) as *const u32) }
+    crate::mmio::Reg::new(EFM_BASE + FSR).read()
 }
 
 /// 清除状态标志 (写 FSCLR, 对齐 DDL `EFM_ClearStatus`)
 fn clear_status(flags: u32) {
-    unsafe { core::ptr::write_volatile((EFM_BASE + FSCLR) as *mut u32, flags) };
+    crate::mmio::Reg::new(EFM_BASE + FSCLR).write(flags);
 }
 
 /// 是否就绪 (FSR.RDY=1, 可发起新操作)
@@ -218,45 +218,35 @@ pub fn wait_ready() -> bool {
 
 /// 解锁 EFM 寄存器写保护 (FAPRT 键 0x0123→0x3210, 对齐 DDL `EFM_REG_Unlock`)
 fn unlock() {
-    unsafe {
-        core::ptr::write_volatile(EFM_BASE as *mut u32, 0x0123);
-        core::ptr::write_volatile(EFM_BASE as *mut u32, 0x3210);
-    }
+    crate::mmio::Reg::new(EFM_BASE).write(0x0123);
+    crate::mmio::Reg::new(EFM_BASE).write(0x3210);
 }
 
 /// 锁定 EFM 寄存器写保护 (FAPRT=0, 对齐 DDL `EFM_REG_Lock`)
 fn lock() {
-    unsafe { core::ptr::write_volatile(EFM_BASE as *mut u32, 0x0000) };
+    crate::mmio::Reg::new(EFM_BASE).write(0x0000);
 }
 
 /// 使能擦写模式 (FWMC.PEMODE=1, 对齐 DDL `EFM_FWMC_Cmd(ENABLE)`)
 fn enable_program_mode() {
-    unsafe {
-        let v = core::ptr::read_volatile((EFM_BASE + FWMC) as *const u32);
-        // This firmware executes from main Flash, so keep bus-hold enabled
-        // (BUSHLDCTL=0) during every program/erase operation.
-        core::ptr::write_volatile(
-            (EFM_BASE + FWMC) as *mut u32,
-            (v | FWMC_PEMODE) & !FWMC_BUSHLDCTL,
-        );
-    }
+    let fwmc = crate::mmio::Reg::new(EFM_BASE + FWMC);
+    let v = fwmc.read();
+    // This firmware executes from main Flash, so keep bus-hold enabled
+    // (BUSHLDCTL=0) during every program/erase operation.
+    fwmc.write((v | FWMC_PEMODE) & !FWMC_BUSHLDCTL);
 }
 
 /// 退出擦写模式 (FWMC.PEMODE=0)
 fn disable_program_mode() {
-    unsafe {
-        let v = core::ptr::read_volatile((EFM_BASE + FWMC) as *const u32);
-        core::ptr::write_volatile((EFM_BASE + FWMC) as *mut u32, v & !FWMC_PEMODE);
-    }
+    let fwmc = crate::mmio::Reg::new(EFM_BASE + FWMC);
+    fwmc.write(fwmc.read() & !FWMC_PEMODE);
 }
 
 /// 设置操作模式 (FWMC.PEMOD, 对齐 DDL `EFM_SetOperateMode`)
 fn set_op_mode(mode: OpMode) {
-    unsafe {
-        let v = core::ptr::read_volatile((EFM_BASE + FWMC) as *const u32);
-        let v = (v & !(0x7 << FWMC_PEMOD_POS)) | ((mode as u32) << FWMC_PEMOD_POS);
-        core::ptr::write_volatile((EFM_BASE + FWMC) as *mut u32, v);
-    }
+    let fwmc = crate::mmio::Reg::new(EFM_BASE + FWMC);
+    let v = fwmc.read();
+    fwmc.write((v & !(0x7 << FWMC_PEMOD_POS)) | ((mode as u32) << FWMC_PEMOD_POS));
 }
 
 /// 关闭缓存并返回原缓存位状态 (对齐 DDL 擦/写前的 CACHE 处理)
@@ -265,34 +255,27 @@ fn set_op_mode(mode: OpMode) {
 /// 内容在编程后失效。返回值为 FRMC 的 CRST|CACHE 原值, 供
 /// [`restore_cache`] 恢复。
 fn disable_cache() -> u32 {
-    unsafe {
-        let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
-        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, v & !FRMC_CACHE_ALL);
-        v & FRMC_CACHE_ALL
-    }
+    let frmc = crate::mmio::Reg::new(EFM_BASE + FRMC);
+    let v = frmc.read();
+    frmc.write(v & !FRMC_CACHE_ALL);
+    v & FRMC_CACHE_ALL
 }
 
 /// 恢复缓存位 (写回 [`disable_cache`] 的返回值, 对齐 DDL 擦/写后的恢复)
 fn restore_cache(saved: u32) {
-    unsafe {
-        let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
-        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, (v & !FRMC_CACHE_ALL) | saved);
-    }
+    let frmc = crate::mmio::Reg::new(EFM_BASE + FRMC);
+    frmc.write((frmc.read() & !FRMC_CACHE_ALL) | saved);
 }
 
 /// 使能 Flash 数据/指令缓存 (调用方持有 [`ConfigurationGuard`])。
 fn enable_cache_unlocked() {
     unlock();
-    unsafe {
-        // 复位缓存 RAM (置位后清除, 对齐 EFM_CacheRamReset(ENABLE/DISABLE))
-        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
-        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, frmc | FRMC_CRST);
-        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
-        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, frmc & !FRMC_CRST);
-        // 使能缓存
-        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
-        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, frmc | FRMC_CACHE);
-    }
+    let frmc = crate::mmio::Reg::new(EFM_BASE + FRMC);
+    // 复位缓存 RAM (置位后清除, 对齐 EFM_CacheRamReset(ENABLE/DISABLE))
+    frmc.write(frmc.read() | FRMC_CRST);
+    frmc.write(frmc.read() & !FRMC_CRST);
+    // 使能缓存
+    frmc.write(frmc.read() | FRMC_CACHE);
     lock();
 }
 
@@ -300,10 +283,8 @@ fn enable_cache_unlocked() {
 pub fn disable_cache_cmd() -> Result<(), EfmError> {
     let _operation = OperationGuard::acquire()?;
     unlock();
-    unsafe {
-        let v = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
-        core::ptr::write_volatile((EFM_BASE + FRMC) as *mut u32, v & !FRMC_CACHE);
-    }
+    let frmc = crate::mmio::Reg::new(EFM_BASE + FRMC);
+    frmc.write(frmc.read() & !FRMC_CACHE);
     lock();
     Ok(())
 }
@@ -369,7 +350,7 @@ pub const SWAP_FLAG_DATA: u32 = 0xFFFF_4321;
 /// 当前是否处于引导交换状态 (EFM_FSWP.FSWP: 0=已交换, 1=未交换;
 /// 对齐 DDL `EFM_GetSwapStatus`)
 pub fn swap_status() -> bool {
-    unsafe { core::ptr::read_volatile((EFM_BASE + FSWP) as *const u32) & 1 == 0 }
+    crate::mmio::Reg::new(EFM_BASE + FSWP).read() & 1 == 0
 }
 
 /// 使能引导交换: 编程 0x7FFDC = 0xFFFF_4321, 复位后从扇区 1 启动
@@ -397,24 +378,22 @@ pub fn read_byte(addr: u32) -> Result<u8, EfmError> {
     if addr >= FLASH_SIZE {
         return Err(EfmError::InvalidAddr);
     }
-    Ok(unsafe { core::ptr::read_volatile(addr as *const u8) })
+    Ok(crate::mmio::Reg::new(addr as usize).read_u8())
 }
 
 /// 读取主 Flash 字 (4 字节，地址必须按字对齐)。
 pub fn read_word(addr: u32) -> Result<u32, EfmError> {
     check_addr(addr)?;
-    Ok(unsafe { core::ptr::read_volatile(addr as *const u32) })
+    Ok(crate::mmio::Reg::new(addr as usize).read())
 }
 
 /// 读取唯一 ID (UQID0~2, 96 位)
 pub fn uid() -> [u32; 3] {
-    unsafe {
-        [
-            core::ptr::read_volatile((EFM_BASE + UQID0) as *const u32),
-            core::ptr::read_volatile((EFM_BASE + UQID0 + 4) as *const u32),
-            core::ptr::read_volatile((EFM_BASE + UQID0 + 8) as *const u32),
-        ]
-    }
+    [
+        crate::mmio::Reg::new(EFM_BASE + UQID0).read(),
+        crate::mmio::Reg::new(EFM_BASE + UQID0 + 4).read(),
+        crate::mmio::Reg::new(EFM_BASE + UQID0 + 8).read(),
+    ]
 }
 
 /// 唯一 ID 十六进制字符串缓冲容量 (`HHHHHHHH-HHHHHHHH-HHHHHHHH` + NUL)
@@ -461,7 +440,7 @@ pub fn sector_erase(addr: u32) -> Result<(), EfmError> {
 
     // 触发: 向目标地址写 0 (擦除 = 全 1, 任意值均可, DDL 用 0)
     // MPU: FLASH 只读区域临时放开 (触发写是"写 Flash 地址")
-    crate::mpu::with_flash_writable(|| unsafe { core::ptr::write_volatile(addr as *mut u32, 0) });
+    crate::mpu::with_flash_writable(|| crate::mmio::Reg::new(addr as usize).write(0));
     // 扇区擦除 ~ms 级, 超时按 HCLK 折算 ~20ms (对齐 DDL EFM_ERASE_TIMEOUT)
     let result = wait_end(crate::clk::hclk_hz() / 50);
 
@@ -509,8 +488,8 @@ pub fn program(addr: u32, data: &[u8]) -> Result<(), EfmError> {
             word |= (b as u32) << (8 * j);
         }
         // 触发写 (MPU: FLASH 只读区域临时放开, 见 mpu::with_flash_writable)
-        crate::mpu::with_flash_writable(|| unsafe {
-            core::ptr::write_volatile((addr + 4 * i as u32) as *mut u32, word)
+        crate::mpu::with_flash_writable(|| {
+            crate::mmio::Reg::new((addr + 4 * i as u32) as usize).write(word)
         });
         // 单字编程 ~µs 级, 超时按 HCLK 折算 ~53µs (对齐 DDL EFM_PGM_TIMEOUT)
         result = wait_end(crate::clk::hclk_hz() / 20_000);
@@ -558,23 +537,16 @@ fn set_wait_cycle_unlocked(hclk_hz: u32) -> bool {
     let cycles = wait_cycle(hclk_hz) << 4;
 
     unlock();
-    let applied = unsafe {
-        let frmc = core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32);
-        core::ptr::write_volatile(
-            (EFM_BASE + FRMC) as *mut u32,
-            (frmc & !FRMC_FLWT_MASK) | cycles,
-        );
-        // 回读确认配置生效 (带超时, 防解锁失败时永久自旋)
-        let mut applied = false;
-        for _ in 0..10_000 {
-            if core::ptr::read_volatile((EFM_BASE + FRMC) as *const u32) & FRMC_FLWT_MASK == cycles
-            {
-                applied = true;
-                break;
-            }
+    let frmc = crate::mmio::Reg::new(EFM_BASE + FRMC);
+    frmc.write((frmc.read() & !FRMC_FLWT_MASK) | cycles);
+    // 回读确认配置生效 (带超时, 防解锁失败时永久自旋)
+    let mut applied = false;
+    for _ in 0..10_000 {
+        if frmc.read() & FRMC_FLWT_MASK == cycles {
+            applied = true;
+            break;
         }
-        applied
-    };
+    }
     lock();
     applied
 }

@@ -13,15 +13,15 @@
 //!
 //! # 策略
 //!
-//! 修改 [`STRATEGY`] 选择 panic/fault 后的行为:
+//! panic/fault 后的行为由编译期配置 [`crate::config::PANIC_STRATEGY`]
+//! (`.cargo/config.toml` `CFG_PANIC_STRATEGY`) 决定:
 //! - [`PanicStrategy::Halt`]: 屏蔽中断后 wfi 死循环 (调试期推荐);
 //! - [`PanicStrategy::Reset`]: 软复位重启 (产品部署推荐)。
 //!
 //! 注意: 输出依赖 [`crate::console`] 绑定的 UART, 未初始化时静默丢弃
 //! (不会死锁)。
 //!
-//! 策略枚举的 `Reset` 变体当前未启用 (默认 Halt), 切换 [`STRATEGY`] 时生效,
-//! 故忽略死代码警告。
+//! `Reset` 变体默认未启用 (配置为 `halt`), 故忽略死代码警告。
 #![allow(dead_code)]
 
 use crate::console::write_fmt_raw as write_fmt;
@@ -45,8 +45,9 @@ pub unsafe extern "C" fn nmi_handler() {
     }
 }
 
-/// panic/fault 后的行为策略 (编译期常量, 修改此处即可切换)
-const STRATEGY: PanicStrategy = PanicStrategy::Halt;
+/// panic/fault 后的行为策略 (编译期常量, 经 `.cargo/config.toml`
+/// `CFG_PANIC_STRATEGY` 配置)
+const STRATEGY: PanicStrategy = crate::config::PANIC_STRATEGY;
 
 /// SCB 外设基址 (Cortex-M4)
 const SCB_BASE: usize = 0xE000_ED00;
@@ -301,37 +302,35 @@ fn report_context() {
 /// 逐位原因名 (CFSR_BITS/HFSR_BITS) 由 `CFG_PANIC_VERBOSE` 控制:
 /// 关闭时仅输出原始寄存器值 (对照参考手册 CFSR/HFSR 位定义解码)。
 fn report_fault_registers() -> u32 {
-    unsafe {
-        let cfsr = core::ptr::read_volatile((SCB_BASE + 0x28) as *const u32);
-        let hfsr = core::ptr::read_volatile((SCB_BASE + 0x2C) as *const u32);
-        let mmfar = core::ptr::read_volatile((SCB_BASE + 0x34) as *const u32);
-        let bfar = core::ptr::read_volatile((SCB_BASE + 0x38) as *const u32);
+    let cfsr = crate::mmio::Reg::new(SCB_BASE + 0x28).read();
+    let hfsr = crate::mmio::Reg::new(SCB_BASE + 0x2C).read();
+    let mmfar = crate::mmio::Reg::new(SCB_BASE + 0x34).read();
+    let bfar = crate::mmio::Reg::new(SCB_BASE + 0x38).read();
 
-        write_fmt(format_args!("  CFSR 0x{:08x}:", cfsr));
-        #[cfg(panic_verbose)]
-        for (mask, name) in CFSR_BITS {
-            if cfsr & mask != 0 {
-                write_fmt(format_args!(" {}", name));
-            }
+    write_fmt(format_args!("  CFSR 0x{:08x}:", cfsr));
+    #[cfg(panic_verbose)]
+    for (mask, name) in CFSR_BITS {
+        if cfsr & mask != 0 {
+            write_fmt(format_args!(" {}", name));
         }
-        write_fmt(format_args!("\r\n  HFSR 0x{:08x}:", hfsr));
-        #[cfg(panic_verbose)]
-        for (mask, name) in HFSR_BITS {
-            if hfsr & mask != 0 {
-                write_fmt(format_args!(" {}", name));
-            }
-        }
-        write_fmt(format_args!("\r\n"));
-
-        // 仅当对应 VALID 位置位时地址有效
-        if cfsr & CFSR_MMARVALID != 0 {
-            write_fmt(format_args!("  MMFAR 0x{:08x}\r\n", mmfar));
-        }
-        if cfsr & CFSR_BFARVALID != 0 {
-            write_fmt(format_args!("  BFAR 0x{:08x}\r\n", bfar));
-        }
-        cfsr
     }
+    write_fmt(format_args!("\r\n  HFSR 0x{:08x}:", hfsr));
+    #[cfg(panic_verbose)]
+    for (mask, name) in HFSR_BITS {
+        if hfsr & mask != 0 {
+            write_fmt(format_args!(" {}", name));
+        }
+    }
+    write_fmt(format_args!("\r\n"));
+
+    // 仅当对应 VALID 位置位时地址有效
+    if cfsr & CFSR_MMARVALID != 0 {
+        write_fmt(format_args!("  MMFAR 0x{:08x}\r\n", mmfar));
+    }
+    if cfsr & CFSR_BFARVALID != 0 {
+        write_fmt(format_args!("  BFAR 0x{:08x}\r\n", bfar));
+    }
+    cfsr
 }
 
 /// 收尾: 按 [`STRATEGY`] 停机或软复位 (屏蔽中断, 防止被打断)

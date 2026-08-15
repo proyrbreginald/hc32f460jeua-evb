@@ -153,9 +153,9 @@ pub fn refresh_error() -> bool {
 }
 
 fn read(offset: usize) -> u32 {
-    unsafe { core::ptr::read_volatile((WDT_BASE + offset) as *const u32) }
+    crate::mmio::Reg::new(WDT_BASE + offset).read()
 }
 
 fn write(offset: usize, value: u32) {
-    unsafe { core::ptr::write_volatile((WDT_BASE + offset) as *mut u32, value) };
+    crate::mmio::Reg::new(WDT_BASE + offset).write(value);
 }

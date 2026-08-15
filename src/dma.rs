@@ -66,49 +66,16 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
-// ============================== 寄存器访问 ==============================
-
-struct Reg {
-    addr: usize,
-}
-
-impl Reg {
-    const fn new(addr: usize) -> Self {
-        Self { addr }
-    }
-
-    fn read(&self) -> u32 {
-        unsafe { core::ptr::read_volatile(self.addr as *mut u32) }
-    }
-
-    fn write(&self, value: u32) {
-        unsafe { core::ptr::write_volatile(self.addr as *mut u32, value) }
-    }
-
-    fn modify(&self, f: impl FnOnce(u32) -> u32) {
-        self.write(f(self.read()));
-    }
-}
-
-impl Clone for Reg {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl Copy for Reg {}
+use crate::mmio::Reg;
+use crate::notify::NotifySlot;
 
 // ============================== 基址 / 偏移 ==============================
 
 const DMA1_BASE: usize = 0x4005_3000;
 const DMA2_BASE: usize = 0x4005_3400;
 const AOS_BASE: usize = 0x4001_0800;
-const PWC_BASE: usize = 0x4004_8000;
-const PWC_FCG0: usize = 0x00;
-const PWC_FCG0PC: usize = 0x10;
-const FCG0PC_UNLOCK: u32 = 0xA5A5_0001;
-const FCG0PC_LOCK: u32 = 0xA5A5_0000;
-/// FCG0 时钟门控位 (清位 = 使能; 对齐 DDL PWC_FCG0_*)
+/// FCG0 时钟门控位 (清位 = 使能; 对齐 DDL PWC_FCG0_*; 写保护解锁见
+/// [`crate::clk::fcg0_enable`])
 const FCG0_DMA1: u32 = 1 << 14;
 const FCG0_DMA2: u32 = 1 << 15;
 const FCG0_AOS: u32 = 1 << 17;
@@ -339,7 +306,7 @@ pub enum DmaError {
 }
 
 /// 中断回调 (中断上下文执行, 必须有界、无阻塞)
-pub type Callback = fn();
+pub type Callback = crate::notify::Callback;
 
 // ============================== 核心类型 ==============================
 
@@ -785,48 +752,29 @@ const COPY_CHUNK_TIMEOUT_US: u32 = 10_000;
 
 // ============================== 中断回调槽 ==============================
 
-/// 原子回调槽 (null = 未安装; 与 uart 模块 RxNotifySlot 同模式)
-struct CallbackSlot(core::sync::atomic::AtomicPtr<()>);
-
-impl CallbackSlot {
-    const fn new() -> Self {
-        Self(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()))
-    }
-
-    fn store(&self, cb: Callback) {
-        self.0.store(
-            cb as *const () as *mut (),
-            core::sync::atomic::Ordering::Release,
-        );
-    }
-
-    fn call(&self) {
-        let ptr = self.0.load(core::sync::atomic::Ordering::Acquire);
-        if !ptr.is_null() {
-            // 槽位只接受 Callback, 存入的函数指针始终有效且与目标同宽。
-            let cb = unsafe { core::mem::transmute::<*mut (), Callback>(ptr) };
-            cb();
-        }
-    }
-}
-
-const fn new_callback_slots() -> [CallbackSlot; 8] {
-    [
-        CallbackSlot::new(),
-        CallbackSlot::new(),
-        CallbackSlot::new(),
-        CallbackSlot::new(),
-        CallbackSlot::new(),
-        CallbackSlot::new(),
-        CallbackSlot::new(),
-        CallbackSlot::new(),
-    ]
-}
-
-/// 各通道传输完成回调槽 (索引 = (单元-1)·4 + 通道)
-static TC_CALLBACKS: [CallbackSlot; 8] = new_callback_slots();
+/// 各通道传输完成回调槽 (索引 = (单元-1)·4 + 通道; 原子回调槽见
+/// [`crate::notify::NotifySlot`])
+static TC_CALLBACKS: [NotifySlot; 8] = [
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+];
 /// 各通道错误回调槽 (由单元错误 ISR 按 INTSTAT0 分发)
-static ERR_CALLBACKS: [CallbackSlot; 8] = new_callback_slots();
+static ERR_CALLBACKS: [NotifySlot; 8] = [
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+    NotifySlot::new(),
+];
 
 /// TC 中断 ISR: 清标志后通知对应通道槽位。
 unsafe extern "C" fn tc_isr<const U: u8, const C: u8>() {
@@ -882,9 +830,9 @@ pub fn reconfig_sw_trigger() {
 
 static CLOCKS_READY: AtomicU8 = AtomicU8::new(0);
 
-/// 使能 DMA 外设时钟 (FCG0: DMA1/DMA2/AOS, 对齐 DDL `FCG_Fcg0PeriphClockCmd`)。
+/// 使能 DMA 外设时钟 (FCG0: DMA1/DMA2/AOS, 经 [`crate::clk::fcg0_enable`]
+/// 自动处理 FCG0 写保护解锁)。
 ///
-/// - FCG0 写保护需先经 FCG0PC 键解锁 (与 clk 模块同键);
 /// - 幂等: 重复调用无副作用;
 /// - 由 board 初始化在时钟链就绪后调用; 注意运行期切换系统时钟会
 ///   备份/恢复 FCG0 (clk 模块), 若此后才调用本函数, DMA 时钟保持使能。
@@ -892,11 +840,7 @@ pub fn init() {
     if CLOCKS_READY.load(Ordering::Acquire) != 0 {
         return;
     }
-    let fcg0pc = Reg::new(PWC_BASE + PWC_FCG0PC);
-    let fcg0 = Reg::new(PWC_BASE + PWC_FCG0);
-    fcg0pc.write(FCG0PC_UNLOCK);
-    fcg0.modify(|v| v & !(FCG0_DMA1 | FCG0_DMA2 | FCG0_AOS));
-    fcg0pc.write(FCG0PC_LOCK);
+    crate::clk::fcg0_enable(FCG0_DMA1 | FCG0_DMA2 | FCG0_AOS);
     // 使能两个 DMA 单元 (EN=1); 并屏蔽全部完成/错误中断
     // (INTMASK 复位值未知, 显式写满确保无未注册中断误入向量表,
     // 需要时由 install_* 逐通道取消屏蔽)
@@ -993,8 +937,7 @@ pub fn uart_tx_try<const U: u8>(bytes: &[u8]) -> bool {
     let dma = UartTxDma::new();
     let uart = crate::uart::Uart::<U>::take();
     let mut consumed = true;
-    if dma.set_src_addr(bytes.as_ptr() as usize).is_ok()
-        && dma.set_trans_count(len as u16).is_ok()
+    if dma.set_src_addr(bytes.as_ptr() as usize).is_ok() && dma.set_trans_count(len as u16).is_ok()
     {
         dma.clear_tc();
         // 启动边沿: 空闲 → TE 停 → 使能通道 → TE 起 (见函数文档)
@@ -1004,7 +947,8 @@ pub fn uart_tx_try<const U: u8>(bytes: &[u8]) -> bool {
                 // 超时 = 波特率耗时 ×2 + 1ms 余量 (u64 防长包溢出; 墙钟
                 // 截止见 [`Dma::wait_done`])
                 let timeout_us = (u64::from(len as u32) * 10 * 1_000_000
-                    / u64::from(crate::config::UART_BAUDRATE)) as u32
+                    / u64::from(crate::config::UART_BAUDRATE))
+                    as u32
                     * 2
                     + 1_000;
                 if !dma.wait_done(timeout_us) {
@@ -1039,11 +983,9 @@ pub fn uart_tx_timeout_count() -> u32 {
 
 // ============================== 共享内存拷贝 (Flash→RAM / RAM→RAM) ==============================
 
-/// 共享拷贝通道: 固定 DMA1/CH0。
-///
-/// 与 TX 通道 (DMA2/CH0) 分属不同单元, 修改 CHEN 互不等待; 全系统
-/// 仅 [`copy_try`] 使用该通道, 无需占用位图。
-type CopyDma = Dma<1, 0>;
+/// 共享拷贝通道 (编译期配置, 见 `CFG_DMA_COPY_*`; 与 TX 通道分属不同
+/// 通道, 已由 [`crate::config`] 编译期校验不冲突)。
+type CopyDma = Dma<{ crate::config::DMA_COPY_UNIT }, { crate::config::DMA_COPY_CHANNEL }>;
 
 static COPY_BUSY: AtomicBool = AtomicBool::new(false);
 /// copy_try 回退计数 (诊断: 通道忙/未初始化/失败时递增, 正常应为 0)

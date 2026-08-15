@@ -113,11 +113,11 @@ const fn size_code(bytes: u32) -> u32 {
 pub const STACK_GUARD_SIZE: usize = crate::arch::STACK_GUARD_SIZE;
 
 fn write32(addr: usize, value: u32) {
-    unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
+    crate::mmio::Reg::new(addr).write(value);
 }
 
 fn read32(addr: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(addr as *const u32) }
+    crate::mmio::Reg::new(addr).read()
 }
 
 /// 完成先前显式内存访问后再修改 MPU 配置 (对齐 CMSIS ARM_MPU_Enable)。
