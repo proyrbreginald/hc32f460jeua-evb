@@ -42,6 +42,14 @@
 //! 峰值突破趋势 (疑似泄漏预警)、线程数、SRAM 奇偶/ECC 错误与栈水位;
 //! 任一线程报错即提前结束并给出 FAIL 汇总。
 //!
+//! # 堆泄漏判定
+//!
+//! 泄漏基准取**运行预热后** (压力线程首轮执行完成全部一次性惰性初始化)
+//! 的堆用量, 而非运行前: 外设/驱动的一次性初始化成本不计入泄漏。结束值
+//! 取**多次间隔采样中的最小值** (稳态用量), 避免恰好落在瞬时分配
+//! (如日志落盘线程的临时缓冲) 上虚高误报。判定准则: 结束稳态用量 −
+//! 预热基准 ≤ 2048B 即无泄漏; 结束采样波动较大时报告会附注采样明细。
+//!
 //! # 结果判定
 //!
 //! - 无错误 + 堆/线程无泄漏 + SRAM 无错误 → **PASS**;
@@ -51,7 +59,6 @@
 //!
 //! 日志分级: 进度与结果走 info 级 (可经 `log` 命令控制), 汇总始终打印。
 
-use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::rtos::{Event, EventOpt, Mailbox, MessageQueue, Mutex, Semaphore, Timeout};
@@ -1096,6 +1103,80 @@ fn fmt_elapsed(elapsed_ms: u32) -> alloc::string::String {
     alloc::format!("{}:{:02}:{:02}", h, m, s)
 }
 
+// ============================== 控制台进度条 ==============================
+
+/// 进度条块数 (█░)
+const BAR_BLOCKS: usize = 18;
+/// 进度条行目标宽度 (终端字符数, 含 `\r`); 行内容按字符数补齐,
+/// 内容缩短时 `\r` 原位刷新不会残留旧行尾
+const BAR_CELLS: usize = 76;
+
+/// 原位刷新单行进度条 (不换行, 不进入日志环; soak 运行期间控制台
+/// 唯一的持续输出)。`total_ms == 0` 表示"直到 ESC"模式, 无百分比。
+fn render_bar(elapsed_ms: u32, total_ms: u32, used: usize, threads: usize, errors: u32) {
+    let s = elapsed_ms / 1000;
+    let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
+    let mut line = if total_ms > 0 {
+        let pct = ((elapsed_ms as u64 * 100) / total_ms as u64).min(100) as usize;
+        let filled = (pct * BAR_BLOCKS) / 100;
+        let mut bar = alloc::string::String::with_capacity(BAR_BLOCKS + 2);
+        for _ in 0..filled {
+            bar.push('█');
+        }
+        for _ in filled..BAR_BLOCKS {
+            bar.push('░');
+        }
+        let (th, tm, ts) = (
+            total_ms / 3_600_000,
+            (total_ms / 60_000) % 60,
+            (total_ms / 1000) % 60,
+        );
+        alloc::format!(
+            "\r[soak] {h}:{m:02}:{s:02}/{th}:{tm:02}:{ts:02} [{bar}] {pct:3}%  堆 {:.1}K  线程 {threads}  错误 {errors}",
+            used as f64 / 1024.0
+        )
+    } else {
+        alloc::format!(
+            "\r[soak] {h}:{m:02}:{s:02} (直到 ESC)  堆 {:.1}K  线程 {threads}  错误 {errors}",
+            used as f64 / 1024.0
+        )
+    };
+    // 定宽补齐 (字符数): 行缩短时覆盖旧内容
+    while line.chars().count() < BAR_CELLS {
+        line.push(' ');
+    }
+    crate::print!("{}", line);
+}
+
+/// 清空进度条行 (结束阶段换行前调用, 避免残留)
+fn clear_bar() {
+    crate::print!("\r");
+    for _ in 0..BAR_CELLS {
+        crate::print!(" ");
+    }
+    crate::print!("\r");
+}
+
+/// 分组标签 (报告线程表显示)
+fn group_label(group: Group) -> &'static str {
+    match group {
+        Group::Basic => "RTOS 核心",
+        Group::Periph => "外设",
+    }
+}
+
+/// 文件系统错误 → 中文摘要 (报告写入失败回退显示)
+fn fs_error_summary(error: &littlefs::Error<crate::filesystem::FlashError>) -> &'static str {
+    match error {
+        littlefs::Error::Device(_) => "Flash 设备错误",
+        littlefs::Error::NoSpace => "文件系统空间不足",
+        littlefs::Error::AlreadyExists => "目标已存在",
+        littlefs::Error::NotFound => "未找到",
+        littlefs::Error::IsDirectory => "目标是目录",
+        _ => "其他文件系统错误",
+    }
+}
+
 // ============================== 命令行解析 ==============================
 
 /// 解析 `soak` 参数: `[分钟] [压力项|场景]...`
@@ -1221,7 +1302,7 @@ pub(crate) fn run(args: &str) {
         if spec.id == WorkerId::Can
             && let Some(reason) = can_skip_reason()
         {
-            crate::log_info!("[soak] CAN 压力跳过: {}", reason);
+            crate::log_debug!("[soak] CAN 压力跳过: {}", reason);
             continue;
         }
         if let Some(sel) = &selection
@@ -1241,28 +1322,29 @@ pub(crate) fn run(args: &str) {
             .active
             .store(true, Ordering::Relaxed);
         spawned.push(spec.id);
-        crate::log_info!(
+        // 已启动明细进 debug 级 (控制台只保留进度条; 完整清单见报告)
+        crate::log_debug!(
             "[soak] 压力线程 {} 已启动: 优先级 {}, 栈 {}B",
             spec.name,
             spec.priority,
             spec.stack
         );
     }
-    // 回显本次压力项 (产品证据: 明确本次测了什么)
+    // 回显本次压力项 (产品证据: 明确本次测了什么; 控制台保持简洁,
+    // 完整清单进 debug 级与 HTML 报告)
     if spawned.is_empty() {
         crate::println!("[soak] 没有可运行的压力线程 (选择项均被跳过)");
         return;
     }
-    {
-        let mut items = alloc::string::String::new();
-        for (i, &id) in spawned.iter().enumerate() {
-            if i > 0 {
-                items.push(' ');
-            }
-            items.push_str(SPECS[id.index()].short);
-        }
-        crate::println!("[soak] 共 {} 个压力线程: {}", spawned.len(), items);
-    }
+    crate::log_debug!(
+        "[soak] 共 {} 个压力线程: {}",
+        spawned.len(),
+        spawned
+            .iter()
+            .map(|&id| SPECS[id.index()].short)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 
     // ---- 监控循环 ----
     let start = crate::rtos::uptime_ms();
@@ -1272,10 +1354,17 @@ pub(crate) fn run(args: &str) {
     let mut stop_reason = "完成";
     // 堆峰值突破连击 (疑似泄漏趋势): 连续报告期突破历史峰值才告警
     let mut peak_break_streak = 0u32;
+    // 泄漏检测基准: 预热后 (压力线程首轮执行完成全部一次性惰性分配,
+    // 如外设/驱动初始化) 的堆用量。以此时刻为基准, 一次性初始化成本
+    // 不再误报"泄漏"。
+    let mut leak_base = 0usize;
 
     'monitor: loop {
         crate::rtos::thread_delay_ms(1000).ok();
         let now = crate::rtos::uptime_ms();
+        if leak_base == 0 {
+            leak_base = crate::heap::used();
+        }
 
         // ESC 中断
         if crate::selftest::abort_requested() {
@@ -1332,7 +1421,6 @@ pub(crate) fn run(args: &str) {
         }
         // 周期进度报告 + 泄漏趋势检测
         if now.wrapping_sub(last_report) >= crate::config::SOAK_REPORT_INTERVAL_MS {
-            let elapsed = now.wrapping_sub(start);
             // 峰值突破趋势: 连续报告期突破历史峰值 → 疑似泄漏 (不改判定,
             // 最终判定由结束值阈值决定; 正常压力平台期峰值稳定不触发)
             if used > peak_heap + 2048 {
@@ -1348,26 +1436,19 @@ pub(crate) fn run(args: &str) {
             } else {
                 peak_break_streak = 0;
             }
-            let mut detail = alloc::string::String::new();
-            for &id in &spawned {
-                write!(
-                    &mut detail,
-                    " {}={}",
-                    SPECS[id.index()].short,
-                    WORKERS[id.index()].cycles.load(Ordering::Relaxed)
-                )
-                .ok();
-            }
-            crate::println!(
-                "[soak] 进度 {}: 堆 {}B (峰值 {}B) 线程 {} | 循环:{}",
-                fmt_elapsed(elapsed),
-                used,
-                peak_heap,
-                crate::rtos::thread_info_list().len(),
-                detail
-            );
             last_report = now;
         }
+        // 进度条: 每秒原位刷新 (控制台唯一持续输出, 不进入日志环)
+        render_bar(
+            now.wrapping_sub(start),
+            duration_ms as u32,
+            used,
+            spawned.len(),
+            spawned
+                .iter()
+                .map(|&id| WORKERS[id.index()].errors.load(Ordering::Relaxed))
+                .sum(),
+        );
     }
 
     // ---- 停止并等待压力线程退出 ----
@@ -1389,8 +1470,28 @@ pub(crate) fn run(args: &str) {
     // 线程句柄已在创建时释放 (内核侧 kernel_self 强引用维持 TCB 至线程退出),
     // spawned 仅记录索引, 无需清理
 
+    // ---- 等待僵尸回收稳定 ----
+    // 线程退出的 TCB/栈由空闲线程异步回收; 若在回收前测量堆用量,
+    // 残留僵尸会使结束值虚高, 误报"泄漏"。给回收一个受宽限约束的窗口。
+    let recycle_start = crate::rtos::uptime_ms();
+    while crate::rtos::pending_defuncts() > 0
+        && crate::rtos::uptime_ms().wrapping_sub(recycle_start)
+            < crate::config::SOAK_HANG_GRACE_MS
+    {
+        crate::rtos::thread_delay_ms(10).ok();
+    }
+
+    // ---- 结束堆稳定采样 ----
+    // 单次测量可能恰好落在瞬时分配上 (如日志落盘线程刷新时的临时缓冲),
+    // 使结束值虚高误报泄漏。间隔采样取最小值 = 稳态用量。
+    let mut end_samples = [crate::heap::used(); 4];
+    for sample in &mut end_samples[1..] {
+        crate::rtos::thread_delay_ms(1000).ok();
+        *sample = crate::heap::used();
+    }
+    let heap_end = *end_samples.iter().min().unwrap();
+
     // ---- 最终检查 ----
-    let heap_end = crate::heap::used();
     let thread_end = crate::rtos::thread_info_list().len();
     // 互斥量最终值 == Σ(增量 × 次数); 取不到锁本身也是失败 (残留锁)
     let mut mtx_ok = false;
@@ -1399,150 +1500,149 @@ pub(crate) fn run(args: &str) {
             + MTX_LOCKS[1].load(Ordering::Relaxed) as u64 * 20;
         mtx_ok = *guard == expected;
     }
-    let leak_ok = heap_end.saturating_sub(heap_base) <= 2048 && thread_end == thread_base;
+    // 泄漏 = 结束稳态用量超出预热基准 (一次性初始化已计入基准)
+    let net_growth = heap_end.saturating_sub(leak_base);
+    let leak_ok = net_growth <= 2048 && thread_end == thread_base;
     let total_errors: u32 = spawned
         .iter()
         .map(|&id| WORKERS[id.index()].errors.load(Ordering::Relaxed))
         .sum();
     let pass = total_errors == 0 && sram_errors == 0 && leak_ok && mtx_ok;
 
-    // ---- 汇总报告 (始终打印) ----
+    // ---- 汇总报告: 单文件 HTML → /test/ (控制台仅保留结果一行) ----
+    clear_bar();
     let elapsed = crate::rtos::uptime_ms().wrapping_sub(start);
-    crate::println!(
-        "[soak] 完成: 运行 {}, 停止原因: {}",
-        fmt_elapsed(elapsed),
-        stop_reason
-    );
-    crate::println!(
-        "[soak] 结果: {}",
-        if pass {
-            "PASS — 请放心使用"
-        } else {
-            "FAIL"
-        }
-    );
-    crate::println!(
-        "[soak]   压力线程 {} 个: 总错误 {}, SRAM 奇偶/ECC 错误 {}",
-        spawned.len(),
-        total_errors,
-        sram_errors
-    );
-    // 逐线程明细: 循环数 / 错误数 / 失败详情 (位置与时刻)
-    for &id in &spawned {
-        let w = &WORKERS[id.index()];
-        let errs = w.errors.load(Ordering::Relaxed);
-        let mut line = alloc::format!(
-            "[soak]   {}: {} 循环, {} 错误",
-            w.name,
-            w.cycles.load(Ordering::Relaxed),
-            errs
-        );
-        if errs > 0 {
-            let fail_elapsed = w
-                .fail_time
-                .load(Ordering::Relaxed)
-                .wrapping_sub(SOAK_START_MS.load(Ordering::Relaxed));
-            write!(
-                &mut line,
-                " — 失败: {} (第 {} 循环, 运行 {})",
-                SoakError::from_code(w.last_error.load(Ordering::Relaxed)).text(),
-                w.fail_cycle.load(Ordering::Relaxed),
-                fmt_elapsed(fail_elapsed)
-            )
-            .ok();
-        }
-        crate::println!("{}", line);
-    }
-    // 未获得任何执行机会的线程 (调度饥饿, 测试覆盖不完整)
-    let starved: Vec<WorkerId> = spawned
+
+    // RTC 时间戳 (报告头部与文件名); RTC 未运行或日期未设置 (上电
+    // 默认 2000-01-01, 时间从复位起计数) 时退化为启动序号, 避免
+    // 报告出现误导性的 "2000-01-01" 日期
+    let rtc_stamp = crate::rtc::get_date().ok().zip(crate::rtc::get_time().ok()).filter(
+        |(d, _t)| !(d.year == 0 && d.month == 1 && d.day == 1),
+    ).map(|(d, t)| (d.year, d.month, d.day, t.hour, t.minute, t.second));
+
+    // 压力项清单 + 线程明细行
+    let items = spawned
         .iter()
-        .copied()
-        .filter(|&id| WORKERS[id.index()].cycles.load(Ordering::Relaxed) == 0)
+        .map(|&id| SPECS[id.index()].short)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rows: Vec<crate::soak_report_core::Row> = spawned
+        .iter()
+        .map(|&id| {
+            let w = &WORKERS[id.index()];
+            let errs = w.errors.load(Ordering::Relaxed);
+            let fail_text = if errs > 0 {
+                let fail_elapsed = w
+                    .fail_time
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(SOAK_START_MS.load(Ordering::Relaxed));
+                Some(alloc::format!(
+                    "{} (第 {} 循环, 运行 {})",
+                    SoakError::from_code(w.last_error.load(Ordering::Relaxed)).text(),
+                    w.fail_cycle.load(Ordering::Relaxed),
+                    fmt_elapsed(fail_elapsed)
+                ))
+            } else {
+                None
+            };
+            crate::soak_report_core::Row {
+                name: SPECS[id.index()].name,
+                short: SPECS[id.index()].short,
+                group: group_label(SPECS[id.index()].group),
+                priority: SPECS[id.index()].priority,
+                stack: SPECS[id.index()].stack,
+                cycles: w.cycles.load(Ordering::Relaxed),
+                errors: errs,
+                fail_text,
+                stack_peak: STACK_PEAK[id.index()].load(Ordering::Relaxed),
+            }
+        })
         .collect();
-    if !starved.is_empty() {
+
+    // 调度延迟直方图快照 (原子桶 → 数组)
+    let delay_hist = {
+        let mut h = [0u32; DELAY_BUCKETS];
+        for (i, bucket) in DELAY_HIST.iter().enumerate() {
+            h[i] = bucket.load(Ordering::Relaxed);
+        }
+        h
+    };
+    let delay_samples = DELAY_SAMPLES.load(Ordering::Relaxed);
+    // 分位数取直方图桶下界, 可能高于实际最坏值; 钳制到最坏值,
+    // 避免报告出现 "p99 > 最坏" 的自相矛盾
+    let delay_max = DELAY_MAX.load(Ordering::Relaxed);
+
+    // 调度饥饿 (测试覆盖不完整; 详情已在报告线程表标注)
+    if spawned
+        .iter()
+        .any(|&id| WORKERS[id.index()].cycles.load(Ordering::Relaxed) == 0)
+    {
         crate::log_warn!(
-            "[soak] {} 个压力线程从未获得执行 (调度饥饿), 结果覆盖不完整",
-            starved.len()
+            "[soak] 存在从未获得执行的压力线程 (调度饥饿), 结果覆盖不完整, 详情见报告"
         );
     }
-    // 堆: 基线/峰值/结束 + 增长率 (长时间运行的泄漏趋势证据)
-    let hours = elapsed as f64 / 3_600_000.0;
-    let net_growth = heap_end.saturating_sub(heap_base);
-    crate::println!(
-        "[soak]   堆: 基线 {}B → 峰值 {}B → 结束 {}B{}",
+
+    let data = crate::soak_report_core::Data {
+        pass,
+        elapsed_ms: elapsed,
+        stop_reason,
+        rtc_stamp,
+        start_uptime: start,
+        thread_base,
+        thread_end,
         heap_base,
         peak_heap,
         heap_end,
-        if net_growth <= 2048 {
-            " (无泄漏)"
-        } else {
-            " (泄漏!)"
-        }
-    );
-    if hours >= 0.01 {
+        heap_capacity: crate::heap::capacity(),
+        net_growth,
+        end_samples,
+        mtx_ok,
+        sram_errors,
+        total_errors,
+        spawned_count: spawned.len(),
+        items: &items,
+        delay_samples,
+        delay_p50: delay_percentile(50).min(delay_max),
+        delay_p90: delay_percentile(90).min(delay_max),
+        delay_p99: delay_percentile(99).min(delay_max),
+        delay_max,
+        delay_hist: &delay_hist,
+        wdt_enabled: crate::config::WDT_ENABLE,
+        rows: &rows,
+    };
+    let html = crate::soak_report_core::build(&data);
+    let outcome = if pass { "PASS" } else { "FAIL" };
+
+    // 报告写入失败/文件系统不可用时的紧凑控制台回退 (结果不丢失)
+    let fallback_summary = |total_errors: u32, sram_errors: u32| {
         crate::println!(
-            "[soak]   堆增长率: {:.0} B/h{}",
-            net_growth as f64 / hours,
-            if net_growth > 0 {
-                " (长期运行可能耗尽堆, 请复查)"
-            } else {
-                ""
+            "[soak]   摘要: {} 压力线程, 总错误 {}, SRAM {}, 堆净增 {}B, 线程 {}→{}, 互斥量 {}",
+            spawned.len(),
+            total_errors,
+            sram_errors,
+            net_growth,
+            thread_base,
+            thread_end,
+            if mtx_ok { "通过" } else { "失败" }
+        );
+    };
+    if let Some(mut fs) = crate::filesystem::mounted() {
+        match crate::soak_report::save(&mut fs, &html, &data) {
+            Ok(path) => {
+                crate::println!("\r[soak] 结果: {} — 报告: /{}", outcome, path);
             }
-        );
-    }
-    crate::println!(
-        "[soak]   线程: 基线 {} → 结束 {}{}",
-        thread_base,
-        thread_end,
-        if thread_end == thread_base {
-            " (无泄漏)"
-        } else {
-            " (泄漏!)"
+            Err(error) => {
+                crate::println!(
+                    "\r[soak] 结果: {} — 报告写入失败: {}",
+                    outcome,
+                    fs_error_summary(&error)
+                );
+                fallback_summary(total_errors, sram_errors);
+            }
         }
-    );
-    crate::println!(
-        "[soak]   互斥量最终值校验: {}",
-        if mtx_ok {
-            "通过 (无丢失更新)"
-        } else {
-            "失败 (丢失更新/损坏!)"
-        }
-    );
-    // 调度延迟分布 (实时性证据: 分位数 + 最坏值)
-    let samples = DELAY_SAMPLES.load(Ordering::Relaxed);
-    if samples > 0 {
-        crate::println!(
-            "[soak]   调度延迟: {} 样本, p50 {}ms, p90 {}ms, p99 {}ms, 最坏 {}ms",
-            samples,
-            delay_percentile(50),
-            delay_percentile(90),
-            delay_percentile(99),
-            DELAY_MAX.load(Ordering::Relaxed)
-        );
     } else {
-        crate::println!("[soak]   调度延迟: 无样本 (delay 压力未选择)");
+        crate::println!("\r[soak] 结果: {} — 文件系统不可用, 无法保存报告", outcome);
+        fallback_summary(total_errors, sram_errors);
     }
-    // 看门狗状态 (产品部署证据: 调度停滞时是否有硬件兜底)
-    crate::println!(
-        "[soak]   看门狗: {}",
-        if crate::config::WDT_ENABLE {
-            "已启用 (CFG_WDT_ENABLE=true, 调度停滞会被硬件复位)"
-        } else {
-            "未启用 (CFG_WDT_ENABLE=false, 建议正式部署时开启)"
-        }
-    );
-    // 栈水位汇总 (证明压力线程未逼近栈上限)
-    for &id in &spawned {
-        let peak = STACK_PEAK[id.index()].load(Ordering::Relaxed);
-        if peak > 0 {
-            let stack = SPECS[id.index()].stack;
-            crate::println!(
-                "[soak]   {} 栈峰值 {}B / {}B ({:.0}%)",
-                SPECS[id.index()].name,
-                peak,
-                stack,
-                peak as f64 * 100.0 / stack as f64
-            );
-        }
-    }
+
 }

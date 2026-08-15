@@ -9,4 +9,5 @@ pub mod can_timing;
 pub mod heap_layout;
 pub mod logfile_core;
 pub mod logring;
+pub mod soak_report_core;
 pub mod zmodem;

@@ -17,6 +17,26 @@ use crate::rtos::thread::{ThreadInner, free_thread, thread_create};
 /// 僵尸队列: 已退出/被删除的线程等待空闲线程回收
 static DEFUNCT: KCell<ListHead> = KCell::new(ListHead::const_new());
 
+/// 僵尸队列长度 (已退出、等待空闲线程回收的线程数)
+///
+/// 供压力测试在结束检查前确认回收完成, 防止残留僵尸使堆用量虚高。
+pub fn pending_defuncts() -> usize {
+    crate::critical_section::with(|cs| unsafe {
+        let head = DEFUNCT.get(cs);
+        let mut n = 0usize;
+        let mut cur = (*head).first();
+        while let Some(node) = cur {
+            // 队尾节点的 next 指向头哨兵 (结束标记)
+            if core::ptr::eq(node, head) {
+                break;
+            }
+            n += 1;
+            cur = Some((*node).next_node());
+        }
+        n
+    })
+}
+
 /// 临界区内: 线程进入僵尸队列 (须持有临界区令牌)
 pub(crate) unsafe fn defunct_push(t: *mut ThreadInner, cs: CriticalSection<'_>) {
     unsafe { (*DEFUNCT.get(cs)).push_back(&mut (*t).defunct_node) };

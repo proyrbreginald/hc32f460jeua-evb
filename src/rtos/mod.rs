@@ -134,6 +134,8 @@ pub use hooks::{
     ContextSwitchHook, ContextSwitchInfo, IdleHook, set_context_switch_hook, set_idle_hook,
 };
 #[allow(unused_imports)]
+pub use idle::pending_defuncts;
+#[allow(unused_imports)]
 pub use ipc::{
     Error, Event, EventOpt, Mailbox, MessageQueue, Mutex, MutexGuard, Semaphore, Timeout,
 };

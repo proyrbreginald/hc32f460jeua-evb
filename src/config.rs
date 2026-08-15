@@ -951,3 +951,11 @@ const _: () = assert!(
     SOAK_FLASH_INTERVAL_MS >= 1000,
     "CFG_SOAK_FLASH_INTERVAL_MS 应不小于 1000"
 );
+
+/// 测试报告预算: `/test/` 目录保留的报告文件数 (超出删除最旧;
+/// 文件名按字典序即时间序)
+pub const TEST_REPORT_SLOTS: u32 = parse_u32(env!("CFG_TEST_REPORT_SLOTS"));
+const _: () = assert!(
+    TEST_REPORT_SLOTS >= 1 && TEST_REPORT_SLOTS <= 32,
+    "CFG_TEST_REPORT_SLOTS 应为 1~32"
+);
