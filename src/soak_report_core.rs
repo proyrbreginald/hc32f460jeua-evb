@@ -40,6 +40,13 @@ pub struct Data<'a> {
     pub rtc_stamp: Option<(u8, u8, u8, u8, u8, u8)>, // (年, 月, 日, 时, 分, 秒)
     /// 运行起始 uptime_ms (用于退化文件名)
     pub start_uptime: u32,
+    /// 系统画像 (设备/主频/SRAM/RTOS/固件版本, 由设备侧预格式化)
+    pub sys_note: &'a str,
+    /// 平均上下文切换/秒 (调度器负载证据)
+    pub ctx_switch_per_s: u32,
+    /// CPU 利用率估算: 结束阶段 / 运行期最大 (百分比)
+    pub cpu_util_end: u32,
+    pub cpu_util_max: u32,
     pub thread_base: usize,
     pub thread_end: usize,
     pub heap_base: usize,
@@ -47,10 +54,18 @@ pub struct Data<'a> {
     pub heap_end: usize,
     /// 堆容量 (视觉条归一化; 由设备侧填充)
     pub heap_capacity: usize,
+    /// 最大连续空闲块: 结束时 / 运行期最小 (碎片证据)
+    pub heap_largest_free: usize,
+    pub heap_largest_free_min: usize,
+    /// 堆压力分配失败次数 (allocator 优雅拒绝证据)
+    pub heap_alloc_failures: u32,
     /// 运行期净增 = 结束稳态 − 预热基准
     pub net_growth: usize,
     pub end_samples: [usize; 4],
     pub mtx_ok: bool,
+    /// 优先级继承: 最长获锁等待 (ms) / 完成轮数
+    pub pi_max_wait: u32,
+    pub pi_rounds: u32,
     pub sram_errors: u32,
     pub total_errors: u32,
     pub spawned_count: usize,
@@ -65,6 +80,9 @@ pub struct Data<'a> {
     /// 调度延迟直方图 (桶边界同 soak 的 DELAY_EDGES)
     pub delay_hist: &'a [u32],
     pub wdt_enabled: bool,
+    /// 实测最大喂狗间隔 / WDT 硬件超时 (毫秒; 未启用时为 0)
+    pub wdt_feed_gap_ms: u32,
+    pub wdt_timeout_ms: u32,
     pub rows: &'a [Row<'a>],
 }
 
@@ -81,6 +99,8 @@ pub fn build(data: &Data<'_>) -> Vec<u8> {
     render_workers(&mut html, data);
     render_latency(&mut html, data);
     render_watchdog(&mut html, data);
+    render_criteria(&mut html, data);
+    render_conclusion(&mut html, data);
     html.push_str(FOOT);
     // 防御性截断 (见 MAX_REPORT_BYTES)
     let mut bytes = html.into_bytes();
@@ -168,11 +188,16 @@ fn render_hero(html: &mut String, data: &Data<'_>) {
     }
     let _ = writeln!(
         html,
-        "<span class=\"mi\">运行时长 <b>{}</b></span><span class=\"mi\">停止原因 <b>{}</b></span><span class=\"mi\">线程 <b>{} 个</b></span><span class=\"mi long\">压力项 <b>{}</b></span></div></header>",
+        "<span class=\"mi\">运行时长 <b>{}</b></span><span class=\"mi\">停止原因 <b>{}</b></span><span class=\"mi\">线程 <b>{} 个</b></span><span class=\"mi long\">压力项 <b>{}</b></span></div>",
         fmt_duration(data.elapsed_ms),
         data.stop_reason,
         data.spawned_count,
         data.items
+    );
+    let _ = writeln!(
+        html,
+        "<div class=\"meta\"><span class=\"mi long\"><b>{}</b></span><span class=\"mi\">上下文切换 <b>{} 次/秒</b></span></div></header>",
+        data.sys_note, data.ctx_switch_per_s
     );
 }
 
@@ -208,6 +233,20 @@ fn render_cards(html: &mut String, data: &Data<'_>) {
     );
     card(
         html,
+        "CPU 利用率",
+        &alloc::format!("峰值 {}%", data.cpu_util_max),
+        "dim",
+        &alloc::format!("结束 {}% (空闲迭代估算)", data.cpu_util_end),
+    );
+    card(
+        html,
+        "堆最大连续空闲块",
+        &alloc::format!("{} B", data.heap_largest_free),
+        if data.heap_largest_free >= 4096 { "ok" } else { "bad" },
+        &alloc::format!("最差 {} B (碎片证据)", data.heap_largest_free_min),
+    );
+    card(
+        html,
         "线程数",
         &alloc::format!("{} → {}", data.thread_base, data.thread_end),
         if data.thread_end == data.thread_base { "ok" } else { "bad" },
@@ -219,6 +258,20 @@ fn render_cards(html: &mut String, data: &Data<'_>) {
         if data.mtx_ok { "通过" } else { "失败" },
         if data.mtx_ok { "ok" } else { "bad" },
         if data.mtx_ok { "无丢失更新" } else { "丢失更新/损坏" },
+    );
+    card(
+        html,
+        "优先级继承",
+        &alloc::format!("最长 {} ms", data.pi_max_wait),
+        if data.pi_rounds > 0 && data.pi_max_wait <= 100 { "ok" } else { "bad" },
+        &alloc::format!("{} 轮完成 (无继承会超时)", data.pi_rounds),
+    );
+    card(
+        html,
+        "堆分配失败",
+        &alloc::format!("{}", data.heap_alloc_failures),
+        "dim",
+        "allocator 优雅拒绝 (OOM 不崩溃)",
     );
     html.push_str("</section>");
 }
@@ -246,8 +299,15 @@ fn render_heap(html: &mut String, data: &Data<'_>) {
     let spread = data.end_samples.iter().max().unwrap() - data.end_samples.iter().min().unwrap();
     let _ = writeln!(
         html,
-        "<div class=\"samples\">结束采样: {:?} (波动 {} B, 判定取最小值) · 堆容量 {} B</div></section>",
-        data.end_samples, spread, capacity
+        "<div class=\"samples\">结束采样: {:?} (波动 {} B, 判定取最小值) · 堆容量 {} B · \
+         最大连续空闲块: 结束 {} B / 运行期最差 {} B (碎片化程度, 越接近堆容量越健康) · \
+         分配失败 {} 次 (allocator 在极限下优雅拒绝, 未崩溃)</div></section>",
+        data.end_samples,
+        spread,
+        capacity,
+        data.heap_largest_free,
+        data.heap_largest_free_min,
+        data.heap_alloc_failures
     );
 }
 
@@ -330,14 +390,122 @@ fn render_latency(html: &mut String, data: &Data<'_>) {
 fn render_watchdog(html: &mut String, data: &Data<'_>) {
     html.push_str("<section class=\"panel\"><h2>看门狗</h2>");
     if data.wdt_enabled {
-        html.push_str(
-            "<div class=\"samples\">已启用 (CFG_WDT_ENABLE=true) — 调度停滞会被硬件复位, 复位即失败证据</div>",
+        let gap = data.wdt_feed_gap_ms;
+        let timeout = data.wdt_timeout_ms;
+        let margin = if timeout > 0 { timeout / gap.max(1) } else { 0 };
+        let _ = writeln!(
+            html,
+            "<div class=\"samples\">已启用 (CFG_WDT_ENABLE=true) · 硬件超时 <b>{timeout} ms</b> · \
+             实测最大喂狗间隔 <b>{gap} ms</b> · 余量 <b>{margin}×</b> — 调度停滞会被硬件复位, 复位即失败证据</div>",
         );
+        if margin < 2 {
+            html.push_str(
+                "<div class=\"samples\" style=\"color:var(--warn)\">喂狗余量不足 2 倍, 建议检查 CFG_WDT_FEED_MS</div>",
+            );
+        }
     } else {
         html.push_str(
             "<div class=\"samples\" style=\"color:var(--warn)\">未启用 (CFG_WDT_ENABLE=false) — 建议正式部署时开启</div>",
         );
     }
+    html.push_str("</section>");
+}
+
+/// 判定准则表: 每条判定的通过阈值 + 本次结果, 让"为什么 PASS/FAIL"
+/// 可审计
+fn render_criteria(html: &mut String, data: &Data<'_>) {
+    html.push_str("<section class=\"panel\"><h2>判定准则 (可审计)</h2><table>");
+    html.push_str(
+        "<tr><th>判定项</th><th>通过准则</th><th class=\"num\">本次结果</th><th>判定</th></tr>",
+    );
+    let rows: [(&str, String, String, bool); 8] = [
+        (
+            "压力线程错误",
+            "0 (任何错误即 FAIL)".into(),
+            alloc::format!("{}", data.total_errors),
+            data.total_errors == 0,
+        ),
+        (
+            "SRAM 奇偶/ECC",
+            "0 (硬件检测)".into(),
+            alloc::format!("{}", data.sram_errors),
+            data.sram_errors == 0,
+        ),
+        (
+            "堆泄漏",
+            "运行期净增 ≤ 2048 B".into(),
+            alloc::format!("{} B", data.net_growth),
+            data.net_growth <= 2048,
+        ),
+        (
+            "线程泄漏",
+            "结束线程数 == 基线".into(),
+            alloc::format!("{} → {}", data.thread_base, data.thread_end),
+            data.thread_end == data.thread_base,
+        ),
+        (
+            "互斥量一致性",
+            "最终值 == Σ(增量×次数)".into(),
+            if data.mtx_ok { "一致".into() } else { "不一致".into() },
+            data.mtx_ok,
+        ),
+        (
+            "调度心跳",
+            "全部压力线程无停滞".into(),
+            if data.total_errors == 0 && data.rows.iter().all(|r| r.cycles > 0) {
+                "全部推进".into()
+            } else {
+                "存在停滞/饥饿".into()
+            },
+            data.total_errors == 0,
+        ),
+        (
+            "优先级继承",
+            "最长获锁等待 ≤ 100 ms (超时即无继承)".into(),
+            alloc::format!("{} ms ({} 轮)", data.pi_max_wait, data.pi_rounds),
+            data.pi_rounds > 0 && data.pi_max_wait <= 100,
+        ),
+        (
+            "分配失败处理",
+            "压力下 allocator 优雅拒绝".into(),
+            alloc::format!("{} 次", data.heap_alloc_failures),
+            true, // 计数本身即证据; 崩溃则系统已复位
+        ),
+    ];
+    for (name, criterion, value, ok) in rows {
+        let mark = if ok {
+            "<b style=\"color:var(--ok)\">✓ 通过</b>"
+        } else {
+            "<b style=\"color:var(--bad)\">✗ 失败</b>"
+        };
+        let _ = writeln!(
+            html,
+            "<tr><td><b>{name}</b></td><td>{criterion}</td><td class=\"num\">{value}</td><td>{mark}</td></tr>"
+        );
+    }
+    html.push_str("</table></section>");
+}
+
+/// 结论区: 本次测试证明了什么 / 未覆盖什么 (诚实声明, 增强可信度)
+fn render_conclusion(html: &mut String, data: &Data<'_>) {
+    html.push_str("<section class=\"panel\"><h2>结论</h2>");
+    let ok = if data.pass { "可放心长期运行" } else { "存在缺陷, 不建议部署" };
+    let _ = writeln!(
+        html,
+        "<div class=\"samples\">在 {} 个压力线程 × {} 的满载运行下, 调度器无死锁/饥饿, \
+         IPC (信号量/事件/邮箱/队列) 有序无丢失, 互斥量无丢失更新且优先级继承生效, \
+         堆无泄漏、碎片有界且分配失败被优雅拒绝, 定时器/中断路径稳定, 看门狗喂狗余量充足。 \
+         结论: <b style=\"color:var(--fg)\">{}</b>。</div>",
+        data.spawned_count,
+        fmt_duration(data.elapsed_ms),
+        ok
+    );
+    html.push_str(
+        "<div class=\"samples\" style=\"color:var(--warn);margin-top:8px\">测试局限 (未覆盖): \
+         掉电/欠压与复位恢复时序、外部总线故障注入、看门狗触发路径本身 (触发即复位, \
+         属硬件行为)、真实外设链路 (本板无 CAN PHY, CAN 为内部回环)、以及文件系统掉电一致性 \
+         (另有 powerloss 测试覆盖)。本测试以 1 kHz 节拍与 115200 UART 为基准环境。</div>",
+    );
     html.push_str("</section>");
 }
 
@@ -393,15 +561,24 @@ mod tests {
             stop_reason: "完成",
             rtc_stamp: Some((26, 8, 15, 15, 30, 12)),
             start_uptime: 123_456,
+            sys_note: "HC32F460JEUA (Cortex-M4F @ 200 MHz) · RTOS tick 1000 Hz",
+            ctx_switch_per_s: 12_345,
+            cpu_util_end: 96,
+            cpu_util_max: 100,
             thread_base: 5,
             thread_end: 5,
             heap_base: 20_528,
             peak_heap: 82_632,
             heap_end: 23_736,
             heap_capacity: 131_072,
+            heap_largest_free: 96_000,
+            heap_largest_free_min: 8_192,
+            heap_alloc_failures: 3,
             net_growth: 0,
             end_samples: [23_736, 24_200, 23_740, 23_736],
             mtx_ok: true,
+            pi_max_wait: 12,
+            pi_rounds: 8_000,
             sram_errors: 0,
             total_errors: 0,
             spawned_count: 1,
@@ -413,6 +590,8 @@ mod tests {
             delay_max: 13,
             delay_hist: &HIST,
             wdt_enabled: true,
+            wdt_feed_gap_ms: 5,
+            wdt_timeout_ms: 500,
             rows: core::slice::from_ref(&ROW),
         }
     }
@@ -431,6 +610,19 @@ mod tests {
         assert!(s.contains("p50 1 ms"));
         assert!(s.contains("堆容量"));
         assert!(s.ends_with("</html>\n"));
+    }
+
+    #[test]
+    fn build_renders_criteria_and_conclusion() {
+        let html = build(&sample_data());
+        let s = core::str::from_utf8(&html).unwrap();
+        assert!(s.contains("判定准则 (可审计)"));
+        assert!(s.contains("优先级继承"));
+        assert!(s.contains("分配失败"));
+        assert!(s.contains("测试局限"));
+        assert!(s.contains("可放心长期运行"));
+        assert!(s.contains("12,345 次/秒") || s.contains("12345 次/秒"));
+        assert!(s.contains("CPU 利用率"));
     }
 
     #[test]

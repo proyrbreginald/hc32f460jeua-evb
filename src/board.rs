@@ -24,6 +24,8 @@ pub struct BoardResources {
     can: crate::can::Can,
 }
 
+static WDT_FEED_MAX_GAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 static RESOURCES: BoardResources = BoardResources {
     led: BoardLed::new(),
     console: crate::config::ConsoleUart::take(),
@@ -277,9 +279,21 @@ fn apply_thread_memory_protection(next: crate::rtos::ContextSwitchInfo) {
 /// 最高优先级 WDT supervisor：周期休眠，避免合法的长时间轮询输出因
 /// idle 无法运行而误触发复位，同时验证 SysTick/PendSV 仍可调度线程。
 extern "C" fn watchdog_supervisor(_param: usize) {
+    let mut last = crate::rtos::uptime_ms();
     loop {
         crate::wdt::feed();
         crate::rtos::thread_delay_ms(crate::config::WDT_FEED_INTERVAL_MS)
             .expect("WDT supervisor 必须在线程上下文运行");
+        // 记录实测最大喂狗间隔 (供压力测试报告证明余量): supervisor
+        // 为最高优先级, 实际间隔 ≈ 周期 + 节拍抖动
+        let now = crate::rtos::uptime_ms();
+        let gap = now.wrapping_sub(last);
+        last = now;
+        WDT_FEED_MAX_GAP.fetch_max(gap.max(crate::config::WDT_FEED_INTERVAL_MS), Ordering::Relaxed);
     }
+}
+
+/// 实测最大喂狗间隔 (毫秒; supervisor 运行后累计的最大值)
+pub fn wdt_feed_max_gap_ms() -> u32 {
+    WDT_FEED_MAX_GAP.load(Ordering::Relaxed)
 }

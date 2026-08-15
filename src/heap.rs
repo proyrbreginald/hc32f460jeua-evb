@@ -96,6 +96,26 @@ pub fn used() -> usize {
     })
 }
 
+/// 最大连续空闲块 (字节)。
+///
+/// 碎片化最直接的度量: 用量相同, 碎片越严重最大连续空闲块越小,
+/// 越难满足大块分配。压力测试周期采样可证明长期运行不会因碎片
+/// 耗尽可用大块。
+pub fn largest_free_block() -> usize {
+    crate::critical_section::with(|_| {
+        if !INITIALIZED.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let mut largest = 0usize;
+        let mut cur = FREE_HEAD.load(Ordering::Relaxed);
+        while cur != NULL_BLOCK {
+            largest = largest.max(block_size(cur));
+            cur = next_ptr(cur);
+        }
+        largest
+    })
+}
+
 #[inline]
 fn block_of(payload: *mut u8) -> usize {
     unsafe { core::ptr::read((payload as usize - PREFIX) as *const usize) }

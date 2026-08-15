@@ -63,7 +63,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::rtos::{Event, EventOpt, Mailbox, MessageQueue, Mutex, Semaphore, Timeout};
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 // ============================== 错误码 ==============================
@@ -99,6 +98,8 @@ enum SoakError {
     Can = 11,
     /// 互斥量数据损坏
     Mtx = 12,
+    /// 优先级继承失效 (高优先级等待无界)
+    Inherit = 13,
 }
 
 impl SoakError {
@@ -118,6 +119,7 @@ impl SoakError {
             SoakError::Delay => "调度异常",
             SoakError::Can => "CAN 收发失败",
             SoakError::Mtx => "互斥量数据损坏",
+            SoakError::Inherit => "优先级继承失效",
         }
     }
 
@@ -136,6 +138,7 @@ impl SoakError {
             10 => SoakError::Delay,
             11 => SoakError::Can,
             12 => SoakError::Mtx,
+            13 => SoakError::Inherit,
             _ => SoakError::Unknown,
         }
     }
@@ -149,6 +152,17 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// 互斥量压力对象: 双线程竞争, 各加自己的增量 (A=10, B=20),
 /// 值始终为 10 的倍数 —— 任何丢失更新/撕裂写都会被整除性检查捕获
 static SOAK_MTX: Mutex<u64> = Mutex::new(0);
+/// 优先级继承测试互斥量 (soak-mtx-pi ↔ soak-pi-lock)
+static PI_MTX: Mutex<u64> = Mutex::new(0);
+/// PI 测试: 高优先级获锁最长等待 (ms; 有界即继承生效)
+static PI_MAX_WAIT: AtomicU32 = AtomicU32::new(0);
+/// PI 测试完成轮数 (0 = 辅助线程未运行, 覆盖不完整)
+static PI_ROUNDS: AtomicU32 = AtomicU32::new(0);
+/// 堆压力分配失败次数 (压力下分配失败属正常: allocator 优雅拒绝)
+static HEAP_ALLOC_FAILURES: AtomicU32 = AtomicU32::new(0);
+/// PI 霸占窗口握手: H 置位请求霸占, hog 确认 (ACK) 后开始忙转
+static PI_HOG_GO: AtomicBool = AtomicBool::new(false);
+static PI_HOG_ACK: AtomicBool = AtomicBool::new(false);
 static MTX_LOCKS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 
 /// 其他 IPC 压力对象 (静态, 跨线程共享)
@@ -353,6 +367,7 @@ soak_table! {
     SemB:   ["soak-sem-b",   "sem-b",   1024, 6,  sem_worker,    Basic],
     MtxA:   ["soak-mtx-a",   "mtx-a",   1024, 7,  mtx_worker,    Basic],
     MtxB:   ["soak-mtx-b",   "mtx-b",   1024, 8,  mtx_worker,    Basic],
+    MtxPi:  ["soak-mtx-pi",  "mtx-pi",  1024, 2,  pi_worker,     Basic],
     EvtP:   ["soak-evt-p",   "evt-p",   1024, 9,  evt_producer,  Basic],
     EvtC:   ["soak-evt-c",   "evt-c",   1024, 10, evt_consumer,  Basic],
     MbP:    ["soak-mb-p",    "mb-p",    1024, 11, mb_producer,   Basic],
@@ -371,6 +386,10 @@ soak_table! {
 
 /// 各压力线程的栈使用峰值 (字节, 监控器从 thread_info_list 采样)
 static STACK_PEAK: [AtomicU32; WORKER_COUNT] = [const { AtomicU32::new(0) }; WORKER_COUNT];
+
+/// 优先级继承辅助线程名 (线程压力创建的临时线程之外的另一个名)
+const PI_LOCK_NAME: &str = "soak-pi-lock";
+const PI_HOG_NAME: &str = "soak-pi-hog";
 
 /// 压力项选择 (命令行): 场景别名或单项
 #[derive(Clone, Copy)]
@@ -467,6 +486,86 @@ extern "C" fn mtx_worker(param: usize) {
         crate::rtos::thread_delay_ms(1).ok();
     }
     w.active.store(false, Ordering::Relaxed);
+}
+
+/// 优先级继承压力: 高优先级线程等待被中优先级霸占 CPU 时持有的
+/// 互斥量, 验证内核优先级继承 (PI) 使等待时间有界。
+///
+/// 时窗式设计 (不挤占压力频带): 每秒一次测量窗口内, `soak-pi-hog`
+/// (优先级 6) 确认开始忙转, `soak-pi-lock` (优先级 10) 持锁约 20ms
+/// 忙计算 (5% 占空比), `soak-mtx-pi` (优先级 2) 阻塞等锁。窗口外
+/// 霸占者/持锁者近零 CPU 消耗, 7~15 优先级压力频带调度不受影响。
+///
+/// 判别: 有 PI 时持锁者被提升至 2 抢占霸占者, 等待 ≈ 持锁剩余时间
+/// (<25ms); 无 PI 时持锁者被霸占者永久饥饿 (窗口内霸占者不会自行
+/// 停止), 等待必超 100ms → FAIL。
+extern "C" fn pi_worker(param: usize) {
+    let w = &WORKERS[param];
+    crate::rtos::thread_create(PI_LOCK_NAME, 1024, 10, 0, pi_lock_thread, 0);
+    crate::rtos::thread_create(PI_HOG_NAME, 1024, 6, 0, pi_hog_thread, 0);
+    while !STOP.load(Ordering::Relaxed) {
+        // 窗口握手: 置位并等待霸占者确认开始忙转 (≤2ms) 后才测量,
+        // 保证测量瞬间持锁者确实处于被饥饿状态
+        PI_HOG_GO.store(true, Ordering::Relaxed);
+        let ack_start = crate::rtos::uptime_ms();
+        while !PI_HOG_ACK.load(Ordering::Relaxed)
+            && crate::rtos::uptime_ms().wrapping_sub(ack_start) < 10
+        {
+            crate::rtos::thread_delay_ms(1).ok();
+        }
+        let t0 = crate::rtos::uptime_ms();
+        let lock_result = PI_MTX.lock(Timeout::Ticks(100));
+        PI_HOG_GO.store(false, Ordering::Relaxed);
+        let Ok(mut guard) = lock_result else {
+            w.fail(SoakError::Inherit);
+            break;
+        };
+        let wait = crate::rtos::uptime_ms().wrapping_sub(t0);
+        PI_MAX_WAIT.fetch_max(wait, Ordering::Relaxed);
+        PI_ROUNDS.fetch_add(1, Ordering::Relaxed);
+        *guard = (*guard).wrapping_add(1);
+        drop(guard);
+        w.beat();
+        crate::rtos::thread_delay_ms(900).ok();
+    }
+    PI_HOG_GO.store(false, Ordering::Relaxed);
+    w.active.store(false, Ordering::Relaxed);
+}
+
+/// PI 低优先级持锁者: 持锁约 20ms 忙计算后睡眠 380ms (5% 占空比,
+/// 不挤占 11~15 优先级频带)。忙转期间不主动让出: 只有在被继承
+/// 提升 (或霸占者未激活) 时才有机会运行。
+extern "C" fn pi_lock_thread(_param: usize) {
+    let mut s = 0x5EEDu32;
+    while !STOP.load(Ordering::Relaxed) {
+        let Ok(mut guard) = PI_MTX.lock(Timeout::Ticks(2000)) else {
+            continue;
+        };
+        let t0 = crate::rtos::uptime_ms();
+        while crate::rtos::uptime_ms().wrapping_sub(t0) < 20 {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        }
+        *guard = (*guard).wrapping_add(s as u64);
+        drop(guard);
+        crate::rtos::thread_delay_ms(380).ok();
+    }
+}
+
+/// PI 中优先级 CPU 霸占者: 空闲时 1ms 轮询 (近零 CPU); 测量窗口内
+/// 持续忙转, 直到 H 完成测量清除请求。窗口外不消耗任何调度带宽。
+extern "C" fn pi_hog_thread(_param: usize) {
+    let mut s = 0xBEEFu32;
+    while !STOP.load(Ordering::Relaxed) {
+        crate::rtos::thread_delay_ms(1).ok();
+        if PI_HOG_GO.load(Ordering::Relaxed) {
+            PI_HOG_ACK.store(true, Ordering::Relaxed);
+            while PI_HOG_GO.load(Ordering::Relaxed) {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                CPU_SINK.store(s, Ordering::Relaxed);
+            }
+            PI_HOG_ACK.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// 事件压力: 生产者置位
@@ -611,16 +710,27 @@ extern "C" fn heap_worker(param: usize) {
     let mut live: Vec<(u32, Vec<u8>)> = Vec::new(); // (种子, 数据)
     let mut verified_all = 0u32;
     while !STOP.load(Ordering::Relaxed) {
-        // 分配 1~3 块随机大小
+        // 分配 1~3 块随机大小 (try_reserve: 分配失败是压力下的正常
+        // 现象, 计数后跳过而非 OOM panic 复位 —— 证明 allocator 在
+        // 极限下优雅拒绝而非崩溃)
         for _ in 0..(rng % 3 + 1) {
             rng = xorshift(rng);
             let size = 16 + (rng % 1024) as usize;
             let seed = rng;
-            let mut buf = vec![0u8; size];
+            let mut buf = Vec::new();
+            if buf.try_reserve_exact(size).is_err() {
+                HEAP_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            buf.resize(size, 0);
             let mut s = seed;
             for b in &mut buf {
                 s = xorshift(s);
                 *b = s as u8;
+            }
+            if live.try_reserve(1).is_err() {
+                HEAP_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
             live.push((seed, buf));
         }
@@ -669,11 +779,12 @@ extern "C" fn heap_worker(param: usize) {
 /// "已退出但 defunct 回收被调度延迟"(负载压力下的正常现象)。
 extern "C" fn tmp_exit_thread(param: usize) {
     if param != 0 {
-        unsafe {
-            (param as *const AtomicBool as *mut AtomicBool)
-                .as_ref()
-                .expect("tmp_exit_thread: 退出标志指针非法")
-                .store(true, Ordering::Relaxed);
+        // 参数非法时静默退出 (创建方阶段 1 超时判失败), 不 panic:
+        // 压力测试中的 panic 会复位系统, 掩盖真实故障定位
+        // SAFETY: 指针由 thread_worker 传入, 指向线程栈上的 AtomicBool,
+        // 线程存活期间保持有效
+        if let Some(flag) = unsafe { (param as *mut AtomicBool).as_ref() } {
+            flag.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -1279,6 +1390,9 @@ pub(crate) fn run(args: &str) {
     let mut tmp = [0u8; 8];
     while SOAK_MQ.recv(&mut tmp, Timeout::Ticks(0)).is_ok() {}
     let _ = SOAK_EVT.recv(0x0F, EventOpt::OrClear, Timeout::Ticks(0));
+    // PI 握手复位 (防御: 上次异常退出残留)
+    PI_HOG_GO.store(false, Ordering::Relaxed);
+    PI_HOG_ACK.store(false, Ordering::Relaxed);
     // 直方图复位
     for b in DELAY_HIST.iter() {
         b.store(0, Ordering::Relaxed);
@@ -1348,6 +1462,8 @@ pub(crate) fn run(args: &str) {
 
     // ---- 监控循环 ----
     let start = crate::rtos::uptime_ms();
+    // 复位内核统计 (空闲迭代/上下文切换), 作为本次运行的计数基线
+    crate::rtos::reset_stats();
     let mut last_report = start;
     let mut peak_heap = heap_base;
     let mut sram_errors = 0u32;
@@ -1358,6 +1474,12 @@ pub(crate) fn run(args: &str) {
     // 如外设/驱动初始化) 的堆用量。以此时刻为基准, 一次性初始化成本
     // 不再误报"泄漏"。
     let mut leak_base = 0usize;
+    // CPU 利用率 (空闲迭代/节拍估算) 与堆碎片采样
+    let mut last_ticks = crate::rtos::tick();
+    let mut last_idle = crate::rtos::idle_iterations();
+    let mut util_max = 0u32;
+    let mut util_end = 0u32;
+    let mut lfb_min = crate::heap::largest_free_block();
 
     'monitor: loop {
         crate::rtos::thread_delay_ms(1000).ok();
@@ -1410,6 +1532,24 @@ pub(crate) fn run(args: &str) {
         if used > peak_heap {
             peak_heap = used;
         }
+        // CPU 利用率 (估算): 空闲循环全空闲时约每节拍一次, 中断唤醒
+        // 会使迭代偏多, 故按节拍数钳制
+        let ticks_delta = crate::rtos::tick().wrapping_sub(last_ticks);
+        let idle_delta = crate::rtos::idle_iterations().wrapping_sub(last_idle);
+        last_ticks = crate::rtos::tick();
+        last_idle = crate::rtos::idle_iterations();
+        if let Some(util) = idle_delta
+            .min(ticks_delta)
+            .checked_mul(100)
+            .and_then(|v| v.checked_div(ticks_delta))
+            .map(|ratio| 100u32.saturating_sub(ratio))
+        {
+            util_max = util_max.max(util);
+            util_end = util;
+        }
+        // 堆碎片: 最大连续空闲块 (最差时刻 = 运行期最小值)
+        let lfb = crate::heap::largest_free_block();
+        lfb_min = lfb_min.min(lfb);
         // 栈水位采样: 记录各压力线程峰值 (供汇总报告证明无溢出风险)
         for t in crate::rtos::thread_info_list() {
             if let Some(id) = SPECS.iter().find(|s| s.name == t.name).map(|s| s.id) {
@@ -1456,7 +1596,10 @@ pub(crate) fn run(args: &str) {
     let wait_start = crate::rtos::uptime_ms();
     loop {
         let all_gone = !crate::rtos::thread_info_list().iter().any(|t| {
-            t.name == "soak-tmp" || spawned.iter().any(|&id| WORKERS[id.index()].name == t.name)
+            t.name == "soak-tmp"
+                || t.name == PI_LOCK_NAME
+                || t.name == PI_HOG_NAME
+                || spawned.iter().any(|&id| WORKERS[id.index()].name == t.name)
         });
         if all_gone {
             break;
@@ -1582,21 +1725,54 @@ pub(crate) fn run(args: &str) {
         );
     }
 
+    // 系统信息 + 调度统计 (报告"系统画像"区)
+    let elapsed_secs = (elapsed / 1000).max(1);
+    let ctx_switch_per_s = crate::rtos::context_switch_count() / elapsed_secs;
+    let sys_note = alloc::format!(
+        "HC32F460JEUA (Cortex-M4F @ {} MHz) · SRAM 192K · RTOS tick {} Hz · 优先级 {} · 固件 v{}",
+        crate::clk::hclk_hz() / 1_000_000,
+        crate::rtos::TICKS_PER_SEC,
+        crate::rtos::PRIORITY_MAX,
+        env!("CARGO_PKG_VERSION")
+    );
+    // WDT 余量: 实测最大喂狗间隔 vs 硬件超时
+    let wdt_feed_gap_ms = crate::board::wdt_feed_max_gap_ms();
+    let wdt_timeout_ms = if crate::config::WDT_ENABLE {
+        crate::wdt::DEFAULT
+            .timeout_us(crate::clk::pclk3_hz())
+            .unwrap_or(0) as u32
+            / 1000
+    } else {
+        0
+    };
+    let heap_largest_free = crate::heap::largest_free_block();
+    let pi_max_wait = PI_MAX_WAIT.load(Ordering::Relaxed);
+    let pi_rounds = PI_ROUNDS.load(Ordering::Relaxed);
+
     let data = crate::soak_report_core::Data {
         pass,
         elapsed_ms: elapsed,
         stop_reason,
         rtc_stamp,
         start_uptime: start,
+        sys_note: &sys_note,
+        ctx_switch_per_s,
+        cpu_util_end: util_end,
+        cpu_util_max: util_max,
         thread_base,
         thread_end,
         heap_base,
         peak_heap,
         heap_end,
         heap_capacity: crate::heap::capacity(),
+        heap_largest_free,
+        heap_largest_free_min: lfb_min,
+        heap_alloc_failures: HEAP_ALLOC_FAILURES.load(Ordering::Relaxed),
         net_growth,
         end_samples,
         mtx_ok,
+        pi_max_wait,
+        pi_rounds,
         sram_errors,
         total_errors,
         spawned_count: spawned.len(),
@@ -1608,6 +1784,8 @@ pub(crate) fn run(args: &str) {
         delay_max,
         delay_hist: &delay_hist,
         wdt_enabled: crate::config::WDT_ENABLE,
+        wdt_feed_gap_ms,
+        wdt_timeout_ms,
         rows: &rows,
     };
     let html = crate::soak_report_core::build(&data);
