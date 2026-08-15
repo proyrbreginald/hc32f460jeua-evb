@@ -1735,6 +1735,9 @@ pub(crate) fn run(args: &str) {
         crate::rtos::PRIORITY_MAX,
         env!("CARGO_PKG_VERSION")
     );
+    // 芯片唯一编号 (EFM UQID, 96 位): 报告与设备一一对应, 防止混淆
+    let mut uid_buf = [0u8; crate::efm::UID_HEX_CAP];
+    let uid = crate::efm::uid_hex(&mut uid_buf);
     // WDT 余量: 实测最大喂狗间隔 vs 硬件超时
     let wdt_feed_gap_ms = crate::board::wdt_feed_max_gap_ms();
     let wdt_timeout_ms = if crate::config::WDT_ENABLE {
@@ -1756,6 +1759,7 @@ pub(crate) fn run(args: &str) {
         rtc_stamp,
         start_uptime: start,
         sys_note: &sys_note,
+        uid,
         ctx_switch_per_s,
         cpu_util_end: util_end,
         cpu_util_max: util_max,

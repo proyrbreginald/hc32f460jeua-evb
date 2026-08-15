@@ -42,6 +42,8 @@ pub struct Data<'a> {
     pub start_uptime: u32,
     /// 系统画像 (设备/主频/SRAM/RTOS/固件版本, 由设备侧预格式化)
     pub sys_note: &'a str,
+    /// 芯片唯一编号 (EFM UQID, 96 位十六进制; 报告与设备一一对应)
+    pub uid: &'a str,
     /// 平均上下文切换/秒 (调度器负载证据)
     pub ctx_switch_per_s: u32,
     /// CPU 利用率估算: 结束阶段 / 运行期最大 (百分比)
@@ -196,8 +198,8 @@ fn render_hero(html: &mut String, data: &Data<'_>) {
     );
     let _ = writeln!(
         html,
-        "<div class=\"meta\"><span class=\"mi long\"><b>{}</b></span><span class=\"mi\">上下文切换 <b>{} 次/秒</b></span></div></header>",
-        data.sys_note, data.ctx_switch_per_s
+        "<div class=\"meta\"><span class=\"mi long\"><b>{}</b></span><span class=\"mi\">设备 UID <b>{}</b></span><span class=\"mi\">上下文切换 <b>{} 次/秒</b></span></div></header>",
+        data.sys_note, data.uid, data.ctx_switch_per_s
     );
 }
 
@@ -562,6 +564,7 @@ mod tests {
             rtc_stamp: Some((26, 8, 15, 15, 30, 12)),
             start_uptime: 123_456,
             sys_note: "HC32F460JEUA (Cortex-M4F @ 200 MHz) · RTOS tick 1000 Hz",
+            uid: "12345678-9ABCDEF0-11223344",
             ctx_switch_per_s: 12_345,
             cpu_util_end: 96,
             cpu_util_max: 100,

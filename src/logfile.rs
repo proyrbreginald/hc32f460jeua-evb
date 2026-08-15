@@ -174,10 +174,13 @@ pub fn flush_once() {
         state.segment += 1;
         state.image.clear();
     }
-    // 新段起始 (启动首写或轮转后首写): 内容标记 + 维护文件预算
+    // 新段起始 (启动首写或轮转后首写): 内容标记 (含芯片唯一编号,
+    // 日志自含设备身份) + 维护文件预算
     if state.image.is_empty() {
         let mut marker_buf = [0u8; logfile_core::MARKER_CAP];
-        let marker = logfile_core::format_boot_marker(state.boot_no, &mut marker_buf);
+        let mut uid_buf = [0u8; crate::efm::UID_HEX_CAP];
+        let uid = crate::efm::uid_hex(&mut uid_buf);
+        let marker = logfile_core::format_boot_marker(state.boot_no, uid, &mut marker_buf);
         state.image.extend_from_slice(marker);
         enforce_budget(&mut filesystem, state.boot_no, state.segment);
     }

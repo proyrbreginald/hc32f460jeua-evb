@@ -21,8 +21,9 @@ use core::fmt::Write as _;
 
 /// 文件名最大长度 (`boot_` + 20 位序号 + `_` + 2 位段号 + `.log`)
 pub const NAME_CAP: usize = 40;
-/// 内容标记最大长度 (`\n----- boot #` + 20 位序号 + ` -----\n`)
-pub const MARKER_CAP: usize = 48;
+/// 内容标记最大长度 (`\n----- boot #` + 20 位序号 + ` · UID ` + 26 位
+/// 唯一编号 + ` -----\n`)
+pub const MARKER_CAP: usize = 96;
 
 /// 把 (启动序号, 段号) 渲染为日志文件名 (段 0 无段号后缀)
 pub fn segment_name(boot: u64, segment: u32, out: &mut [u8; NAME_CAP]) -> &[u8] {
@@ -133,8 +134,12 @@ pub fn next_boot(newest: Option<u64>) -> u64 {
     newest.map(|n| n.wrapping_add(1)).unwrap_or(1).max(1)
 }
 
-/// 把启动序号渲染为内容标记 `\n----- boot #N -----\n`
-pub fn format_boot_marker(boot: u64, out: &mut [u8; MARKER_CAP]) -> &[u8] {
+/// 把启动序号与芯片唯一编号渲染为内容标记
+/// `\n----- boot #N · UID HHHHHHHH-HHHHHHHH-HHHHHHHH -----\n`
+///
+/// 日志文件自含设备身份: 多台设备混用/回收日志时, 可经 UID 溯源
+/// 出自哪一台芯片 (UID 为空字符串时省略该段)。
+pub fn format_boot_marker<'a>(boot: u64, uid: &str, out: &'a mut [u8; MARKER_CAP]) -> &'a [u8] {
     struct Sink<'a> {
         buf: &'a mut [u8],
         pos: usize,
@@ -151,7 +156,11 @@ pub fn format_boot_marker(boot: u64, out: &mut [u8; MARKER_CAP]) -> &[u8] {
         }
     }
     let mut sink = Sink { buf: out, pos: 0 };
-    let _ = write!(sink, "\n----- boot #{} -----\n", boot);
+    if uid.is_empty() {
+        let _ = write!(sink, "\n----- boot #{} -----\n", boot);
+    } else {
+        let _ = write!(sink, "\n----- boot #{} · UID {} -----\n", boot, uid);
+    }
     let pos = sink.pos;
     &out[..pos]
 }
@@ -237,9 +246,20 @@ mod tests {
     fn marker_roundtrip() {
         let mut buf = [0u8; MARKER_CAP];
         for boot in [1u64, 42, u64::MAX] {
-            let marker = format_boot_marker(boot, &mut buf);
+            let marker = format_boot_marker(boot, "", &mut buf);
             assert!(marker.starts_with(b"\n----- boot #"));
             assert!(marker.ends_with(b" -----\n"));
         }
+    }
+
+    #[test]
+    fn marker_with_uid() {
+        let mut buf = [0u8; MARKER_CAP];
+        let marker = format_boot_marker(7, "12345678-9ABCDEF0-11223344", &mut buf);
+        let s = core::str::from_utf8(marker).unwrap();
+        assert!(s.contains("boot #7"));
+        assert!(s.contains("UID 12345678-9ABCDEF0-11223344"));
+        assert!(marker.ends_with(b" -----\n"));
+        assert!(marker.len() <= MARKER_CAP);
     }
 }

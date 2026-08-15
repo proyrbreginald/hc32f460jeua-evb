@@ -417,6 +417,29 @@ pub fn uid() -> [u32; 3] {
     }
 }
 
+/// 唯一 ID 十六进制字符串缓冲容量 (`HHHHHHHH-HHHHHHHH-HHHHHHHH` + NUL)
+pub const UID_HEX_CAP: usize = 27;
+
+/// 唯一 ID 十六进制字符串 (`HHHHHHHH-HHHHHHHH-HHHHHHHH`, 26 字符)。
+///
+/// 栈缓冲输出, 零分配 —— 用于启动横幅 / 测试报告 / 日志标记的设备标识,
+/// 可区分多台设备并核对测试与日志出自同一芯片。
+pub fn uid_hex(out: &mut [u8; UID_HEX_CAP]) -> &str {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut pos = 0;
+    for (i, word) in uid().into_iter().enumerate() {
+        if i > 0 {
+            out[pos] = b'-';
+            pos += 1;
+        }
+        for shift in (0..32).step_by(4).rev() {
+            out[pos] = HEX[((word >> shift) & 0x0F) as usize];
+            pos += 1;
+        }
+    }
+    core::str::from_utf8(&out[..pos]).expect("UID 十六进制恒为 ASCII")
+}
+
 // ============================== 擦除 ==============================
 
 /// 扇区擦除 (8KB, 对齐 DDL `EFM_SectorErase`)

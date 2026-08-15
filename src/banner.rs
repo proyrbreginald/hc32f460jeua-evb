@@ -77,6 +77,9 @@ pub fn show() {
     println!("节拍 : {} ms ({} Hz)", 1000 / TICKS_PER_SEC, TICKS_PER_SEC);
     println!("优先级 : {} 级 (空闲 = {})", PRIORITY_MAX, IDLE_PRIORITY);
     println!("堆 : {} KB", heap::capacity() / 1024);
+    // 芯片唯一编号 (EFM UQID0~2, 96 位): 设备身份标识
+    let mut uid_buf = [0u8; crate::efm::UID_HEX_CAP];
+    println!("唯一编号 : {}", crate::efm::uid_hex(&mut uid_buf));
     println!("{}", SEP);
     println!("构建 : {} [{}] {}", BUILD_DATE, PROFILE, RUSTC);
     println!(
