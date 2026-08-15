@@ -139,6 +139,9 @@ CFG_APP_LOGFILE_STACK = "8192" # 落盘线程栈 (与 shell 同级: 文件系统
 CFG_APP_LOGFILE_PRIORITY = "3" # 低于 shell(1)/led(2), 高于 idle(31)
 CFG_APP_LOGFILE_TIMESLICE = "10"
 
+# [console] 控制台输出节流 (防 USB 转串口突发丢字节)
+CFG_CONSOLE_LINE_GAP_MS = "1"  # 每行输出后的间隙 (毫秒; 0=不节流)
+
 # [rtc] 实时时钟 (LRC 源), 同时作为日志时间戳 (天:时:分:秒)
 CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
 

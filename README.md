@@ -42,6 +42,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
 | `CFG_LOG_FILE_*` / `CFG_LOG_RING` / `CFG_LOG_FLUSH_MS` | 日志落盘开关 / 单文件上限 / 轮转槽数 / RAM 缓冲 / 刷新间隔 (自动保存到 `/log/`) |
 | `CFG_APP_LOGFILE_*` | 日志落盘线程栈 / 优先级 / 时间片 |
+| `CFG_CONSOLE_LINE_GAP_MS` | 控制台整行输出行间间隙 (防 USB 转串口突发丢字节) |
 | `CFG_RTC_ENABLE` | RTC 与日志运行时长时间戳开关 |
 | `CFG_WDT_ENABLE` / `CFG_WDT_*` | WDT 开关 / supervisor 栈、最高优先级与喂狗周期 |
 | `CFG_MPU_ENABLE` | FLASH/SRAM/外设属性与线程栈守卫开关 |
@@ -552,7 +553,9 @@ fn use_ipc() -> Result<(), Error> {
 - 中断上下文 / panic 诊断走无锁通道 `write_fmt_raw` (仅诊断, 可能交错);
 - 调度器启动前 (boot 阶段) 自动退化为无锁输出;
 - 注意:UART 为 115200 无流控,输出速率接近 PC 读取能力时 CH340 缓冲可能
-  溢出丢字节 (表现为行尾截断, 与打印交错无关)。
+  溢出丢字节 (表现为行尾截断/乱码, 与打印交错无关)。整行输出默认带
+  2ms 行间间隙 (`CFG_CONSOLE_LINE_GAP_MS`, 0 关闭) 让 PC 端及时读取;
+  若仍丢字节请调大该值 (或改用带流控的接口)。
 
 ## 构建 / 烧录 / 调试
 

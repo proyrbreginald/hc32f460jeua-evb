@@ -731,6 +731,19 @@ const _: () = assert!(
     "CFG_WDT_FEED_MS 必须在 1~500ms 范围内"
 );
 
+// ============================== [console] ==============================
+
+/// 控制台整行输出的行间间隙 (毫秒) (CFG_CONSOLE_LINE_GAP_MS)。
+///
+/// 115200 无流控下, 连续突发输出会超过 USB 转串口 (CH340) 与 PC 端
+/// 读取能力的组合缓冲, 导致丢字节 (行尾截断/乱码)。每行输出后让出
+/// 该时长, PC 端可在间隙内读取; 0 = 不节流。
+pub const CONSOLE_LINE_GAP_MS: u32 = parse_u32(env!("CFG_CONSOLE_LINE_GAP_MS"));
+const _: () = assert!(
+    CONSOLE_LINE_GAP_MS <= 50,
+    "CFG_CONSOLE_LINE_GAP_MS 应为 0~50"
+);
+
 // ============================== [rtc] ==============================
 
 /// 是否启用 RTC 并作为日志时间戳 (CFG_RTC_ENABLE = true/false)

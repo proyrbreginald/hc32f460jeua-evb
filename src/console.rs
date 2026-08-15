@@ -153,19 +153,25 @@ impl core::fmt::Write for FanoutSink<'_> {
 /// 原子输出一整行 (内容 + CRLF), 内容 = `prefix` + 格式化结果 + `suffix`。
 ///
 /// 格式化片段在打印锁内同时回调 `side` (如日志落盘缓冲收集无颜色内容)。
+/// 行输出完成后让出 [`crate::config::CONSOLE_LINE_GAP_MS`] (线程上下文),
+/// 给 PC 端 (USB 转串口) 留出读取间隙, 防止连续突发输出丢字节。
 pub fn write_fmt_line_fanout(
     prefix: &[u8],
     suffix: &[u8],
     args: core::fmt::Arguments<'_>,
     side: &mut dyn FnMut(&[u8]),
 ) {
-    let _ = with_print_lock(|write_raw| {
+    let done = with_print_lock(|write_raw| {
         write_raw(prefix);
         let mut sink = FanoutSink { write_raw, side };
         let _ = core::fmt::write(&mut sink, args);
         write_raw(suffix);
         write_raw(b"\r\n");
     });
+    // 行间间隙: 线程上下文才让出 (中断上下文不阻塞, 启动阶段输出量小)
+    if done.is_some() && crate::rtos::scheduler_started() && !crate::critical_section::in_isr() {
+        crate::rtos::thread_delay_ms(crate::config::CONSOLE_LINE_GAP_MS).ok();
+    }
 }
 
 /// 原子输出一整行 (内容 + CRLF, 由 `println!` 宏调用)
