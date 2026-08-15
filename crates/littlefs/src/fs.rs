@@ -1,11 +1,10 @@
 use core::str;
 
 use crate::format::{
-    BlockDevice, Crc32Mpeg2, Geometry, HEADER_SIZE, MAX_FILES, MAX_NAME_LEN,
-    MAX_WEAR_BLOCKS, MAX_WEAR_TABLE_SIZE, PROGRAM_SIZE, RECORD_FLAG_DIRECTORY,
-    RECORD_HEADER_SIZE, RecordHeader, SnapshotHeader, checked_snapshot_span,
-    commit_marker_bytes, crc32_mpeg2, decode_wear_table, encode_wear_table,
-    generation_is_newer, wear_table_size,
+    BlockDevice, Crc32Mpeg2, Geometry, HEADER_SIZE, MAX_FILES, MAX_NAME_LEN, MAX_WEAR_BLOCKS,
+    MAX_WEAR_TABLE_SIZE, PROGRAM_SIZE, RECORD_FLAG_DIRECTORY, RECORD_HEADER_SIZE, RecordHeader,
+    SnapshotHeader, checked_snapshot_span, commit_marker_bytes, crc32_mpeg2, decode_wear_table,
+    encode_wear_table, generation_is_newer, wear_table_size,
 };
 
 use crate::{EntryKind, Error, FileInfo, FsInfo};
@@ -98,12 +97,10 @@ impl<D: BlockDevice> FileSystem<D> {
             .map(|header| header.generation.wrapping_add(1))
             .unwrap_or(0);
         let table_size = wear_table_size(geometry.block_count);
-        let span = checked_snapshot_span(table_size, geometry.block_size)
-            .ok_or(Error::InvalidGeometry)?;
+        let span =
+            checked_snapshot_span(table_size, geometry.block_size).ok_or(Error::InvalidGeometry)?;
         let start_block = match &previous {
-            Some(active) => {
-                choose_start_block(active, span, &previous_wear, geometry.block_count)
-            }
+            Some(active) => choose_start_block(active, span, &previous_wear, geometry.block_count),
             None => 0,
         };
         let wear = incremented_wear(&previous_wear, start_block, span, geometry.block_count);
@@ -439,12 +436,7 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Preflight is read-only. Invalid/corrupt input and NoSpace leave the
         // mounted state usable because no destination block has been erased.
-        let stats = calculate_change(
-            &mut self.device,
-            &self.active,
-            change,
-            Crc32Mpeg2::new(),
-        )?;
+        let stats = calculate_change(&mut self.device, &self.active, change, Crc32Mpeg2::new())?;
 
         // The wear table is the first bytes of the payload, so the snapshot
         // span (and therefore the placement freedom) depends on it.
@@ -452,8 +444,8 @@ impl<D: BlockDevice> FileSystem<D> {
         let payload_len = table_size
             .checked_add(stats.payload_len)
             .ok_or(Error::NoSpace)?;
-        let span = checked_snapshot_span(payload_len, self.geometry.block_size)
-            .ok_or(Error::Corrupt)?;
+        let span =
+            checked_snapshot_span(payload_len, self.geometry.block_size).ok_or(Error::Corrupt)?;
 
         // Dynamic wear leveling: among all non-overlapping destinations pick
         // the one whose blocks were erased the least. The old sequential
@@ -461,12 +453,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let generation = self.active.generation.wrapping_add(1);
         let start_block =
             choose_start_block(&self.active, span, &self.wear, self.geometry.block_count);
-        let wear = incremented_wear(
-            &self.wear,
-            start_block,
-            span,
-            self.geometry.block_count,
-        );
+        let wear = incremented_wear(&self.wear, start_block, span, self.geometry.block_count);
         let mut table = [0u8; MAX_WEAR_TABLE_SIZE];
         encode_wear_table(&wear, self.geometry.block_count, &mut table)
             .map_err(|_| Error::Corrupt)?;
@@ -980,7 +967,8 @@ fn validate_snapshot<D: BlockDevice>(
     snapshot: &SnapshotHeader,
 ) -> Result<(), Error<D::Error>> {
     snapshot.validate().map_err(|_| Error::Corrupt)?;
-    let payload_crc = crc_segment_range(device, snapshot, HEADER_SIZE as u32, snapshot.payload_len)?;
+    let payload_crc =
+        crc_segment_range(device, snapshot, HEADER_SIZE as u32, snapshot.payload_len)?;
     if payload_crc != snapshot.payload_crc {
         return Err(Error::Corrupt);
     }
@@ -1495,7 +1483,13 @@ fn choose_start_block(
     let mut best: Option<(u32, u32, u32, u32)> = None;
     let mut start = 0;
     while start < block_count {
-        if !spans_overlap(start, span, active.start_block, active.block_span, block_count) {
+        if !spans_overlap(
+            start,
+            span,
+            active.start_block,
+            active.block_span,
+            block_count,
+        ) {
             let (mut maximum, mut sum) = (0u32, 0u32);
             let mut index = 0;
             while index < span {
@@ -1548,7 +1542,12 @@ fn read_wear_table<D: BlockDevice>(
 ) -> Result<[u16; MAX_WEAR_BLOCKS], Error<D::Error>> {
     let size = wear_table_size(snapshot.block_count);
     let mut bytes = [0u8; MAX_WEAR_TABLE_SIZE];
-    segment_read(device, snapshot, HEADER_SIZE as u32, &mut bytes[..size as usize])?;
+    segment_read(
+        device,
+        snapshot,
+        HEADER_SIZE as u32,
+        &mut bytes[..size as usize],
+    )?;
     let mut wear = [0u16; MAX_WEAR_BLOCKS];
     decode_wear_table(&bytes, snapshot.block_count, &mut wear).map_err(|_| Error::Corrupt)?;
     Ok(wear)

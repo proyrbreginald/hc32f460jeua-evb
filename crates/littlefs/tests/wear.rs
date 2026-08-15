@@ -3,8 +3,8 @@ mod common;
 
 use common::{RamError, RamNor, read_all};
 use littlefs::format::{
-    HEADER_SIZE, MAX_WEAR_TABLE_SIZE, RecordHeader, SnapshotHeader, crc32_mpeg2,
-    decode_wear_table, encode_wear_table,
+    HEADER_SIZE, MAX_WEAR_TABLE_SIZE, RecordHeader, SnapshotHeader, crc32_mpeg2, decode_wear_table,
+    encode_wear_table,
 };
 use littlefs::{Error, FileSystem, Geometry};
 
@@ -39,7 +39,11 @@ fn mixed_span_workload_distributes_erases_and_persists() {
     let device = fs.into_device();
     let mut remounted = FileSystem::mount(device).unwrap();
     let (min_ram, max_ram) = remounted.wear_bounds();
-    assert_eq!((min_ram, max_ram), (minimum, maximum), "wear table persists");
+    assert_eq!(
+        (min_ram, max_ram),
+        (minimum, maximum),
+        "wear table persists"
+    );
     assert_eq!(remounted.info().min_erase_count, minimum);
     assert_eq!(remounted.info().max_erase_count, maximum);
     remounted.verify().unwrap();
@@ -74,15 +78,23 @@ fn wear_table_sits_after_the_header_on_disk() {
     let start = (newest.start_block * geometry.block_size) as usize + HEADER_SIZE;
     let mut table = [0u16; 64];
     decode_wear_table(&image[start..start + 16], geometry.block_count, &mut table).unwrap();
-    assert_eq!(table[..geometry.block_count as usize], [1, 1, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        table[..geometry.block_count as usize],
+        [1, 1, 0, 0, 0, 0, 0, 0]
+    );
 }
 
 /// 手工构造一个"一半块磨损、一半块全新"的合法 v1.1 快照镜像。
 fn imbalanced_device() -> (RamNor, RamNor) {
     let geometry = Geometry::new(512, 8);
     let data = b"cold-config";
-    let record = RecordHeader::new(COLD_NAME.len() as u16, data.len() as u32, crc32_mpeg2(data), 0)
-        .unwrap();
+    let record = RecordHeader::new(
+        COLD_NAME.len() as u16,
+        data.len() as u32,
+        crc32_mpeg2(data),
+        0,
+    )
+    .unwrap();
     let mut wear = [0u16; 64];
     wear[0] = 1;
     wear[1] = 1;
@@ -151,7 +163,11 @@ fn level_is_a_noop_when_balanced() {
     let generation_before = mounted.info().generation;
     observer.reset_events();
     mounted.level().unwrap();
-    assert_eq!(observer.events(), 0, "no-op level must not touch the device");
+    assert_eq!(
+        observer.events(),
+        0,
+        "no-op level must not touch the device"
+    );
     assert_eq!(mounted.info().generation, generation_before);
 }
 
@@ -245,7 +261,10 @@ fn half_partition_snapshots_alternate_evenly() {
     let counts = observer.erase_counts();
     let minimum = *counts.iter().min().unwrap();
     let maximum = *counts.iter().max().unwrap();
-    assert!(maximum - minimum <= 2, "half-partition alternation: {counts:?}");
+    assert!(
+        maximum - minimum <= 2,
+        "half-partition alternation: {counts:?}"
+    );
 }
 
 /// level 在设备故障后同样要求 remount 才能继续。

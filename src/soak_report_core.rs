@@ -113,18 +113,11 @@ pub fn build(data: &Data<'_>) -> Vec<u8> {
     bytes
 }
 
-const HEAD: &str = r#"<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>soak 压力测试报告</title>
-<style>
-:root{--bg:#0b1220;--panel:#111a2e;--panel2:#16223c;--line:#22304f;--fg:#e2e8f0;
---dim:#8b9bb8;--acc:#38bdf8;--ok:#34d399;--bad:#f87171;--warn:#fbbf24}
+// 模板已按体积精简 (无换行缩进; CSS 保持可读的最小集合)
+const HEAD: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>soak 压力测试报告</title><style>
+:root{--bg:#0b1220;--panel:#111a2e;--panel2:#16223c;--line:#22304f;--fg:#e2e8f0;--dim:#8b9bb8;--acc:#38bdf8;--ok:#34d399;--bad:#f87171;--warn:#fbbf24}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--fg);font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
-line-height:1.6;padding:28px 16px;max-width:960px;margin:0 auto}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6;padding:28px 16px;max-width:960px;margin:0 auto}
 h1{font-size:1.5rem}
 h2{font-size:1.05rem;margin-bottom:14px;color:var(--acc)}
 .hero{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:22px}
@@ -132,17 +125,14 @@ h2{font-size:1.05rem;margin-bottom:14px;color:var(--acc)}
 .mi{white-space:nowrap}
 .mi.long{flex-basis:100%;white-space:normal;word-break:break-all}
 .meta b{color:var(--fg);font-weight:600}
-.badge{padding:6px 18px;border-radius:999px;font-weight:700;font-size:.95rem;
-letter-spacing:2px;border:1px solid transparent}
+.badge{padding:6px 18px;border-radius:999px;font-weight:700;font-size:.95rem;letter-spacing:2px;border:1px solid transparent}
 .badge.pass{background:rgba(52,211,153,.12);color:var(--ok);border-color:rgba(52,211,153,.4)}
 .badge.fail{background:rgba(248,113,113,.12);color:var(--bad);border-color:rgba(248,113,113,.4)}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
 .card .k{font-size:.75rem;color:var(--dim);margin-bottom:4px}
 .card .v{font-size:1.25rem;font-weight:700}
-.v.ok{color:var(--ok)}
-.v.bad{color:var(--bad)}
-.v.dim{color:var(--dim)}
+.v.ok{color:var(--ok)}.v.bad{color:var(--bad)}.v.dim{color:var(--dim)}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:22px}
 table{width:100%;border-collapse:collapse;font-size:.85rem}
 th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--line)}
@@ -159,15 +149,11 @@ tr.err td{background:rgba(248,113,113,.07)}
 .sub{color:var(--dim);font-size:.75rem}
 .warn{color:var(--warn)}
 footer{color:var(--dim);font-size:.75rem;text-align:center;margin-top:8px}
-</style>
-</head>
-<body>
+</style></head><body>
 "#;
 
-const FOOT: &str = r#"<footer>HC32F460JEUA · soak 长期稳定性测试 · 报告为自包含单文件 (内联 CSS), 可离线打开</footer>
-</body>
-</html>
-"#;
+const FOOT: &str =
+    "<footer>HC32F460JEUA · soak 测试报告 (自包含单文件)</footer>\n</body>\n</html>\n";
 
 /// 面板公共片段 (独立常量, 编译后字符串可合并, 避免每个渲染点重复存储)
 const PANEL_OPEN: &str = "<section class=\"panel\"><h2>";
@@ -194,16 +180,16 @@ fn render_hero(html: &mut String, data: &Data<'_>) {
         Some((y, m, d, hh, mm, ss)) => {
             let _ = write!(
                 html,
-                "<span class=\"mi\">生成时间 <b>20{y:02}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}</b></span>"
+                "<span class=\"mi\">时间 <b>20{y:02}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}</b></span>"
             );
         }
         None => {
-            html.push_str("<span class=\"mi\">生成时间 <b class=\"warn\">RTC 未设置</b></span>");
+            html.push_str("<span class=\"mi\">时间 <b class=\"warn\">RTC 未设置</b></span>");
         }
     }
     let _ = writeln!(
         html,
-        "<span class=\"mi\">运行时长 <b>{}</b></span><span class=\"mi\">停止原因 <b>{}</b></span><span class=\"mi\">线程 <b>{} 个</b></span><span class=\"mi long\">压力项 <b>{}</b></span></div>",
+        "<span class=\"mi\">时长 <b>{}</b></span><span class=\"mi\">停止 <b>{}</b></span><span class=\"mi\">线程 <b>{} 个</b></span><span class=\"mi long\">压力项 <b>{}</b></span></div>",
         fmt_duration(data.elapsed_ms),
         data.stop_reason,
         data.spawned_count,
@@ -211,7 +197,7 @@ fn render_hero(html: &mut String, data: &Data<'_>) {
     );
     let _ = writeln!(
         html,
-        "<div class=\"meta\"><span class=\"mi long\"><b>{}</b></span><span class=\"mi\">设备 UID <b>{}</b></span><span class=\"mi\">上下文切换 <b>{} 次/秒</b></span></div></header>",
+        "<div class=\"meta\"><span class=\"mi long\"><b>{}</b></span><span class=\"mi\">UID <b>{}</b></span><span class=\"mi\">切换 <b>{} 次/秒</b></span></div></header>",
         data.sys_note, data.uid, data.ctx_switch_per_s
     );
 }
@@ -230,63 +216,95 @@ fn render_cards(html: &mut String, data: &Data<'_>) {
         "总错误",
         &alloc::format!("{}", data.total_errors),
         if data.total_errors == 0 { "ok" } else { "bad" },
-        if data.total_errors == 0 { "全部通过" } else { "存在失败" },
+        if data.total_errors == 0 {
+            "全部通过"
+        } else {
+            "存在失败"
+        },
     );
     card(
         html,
         "SRAM 奇偶/ECC",
         &alloc::format!("{}", data.sram_errors),
         if data.sram_errors == 0 { "ok" } else { "bad" },
-        if data.sram_errors == 0 { "无错误" } else { "存在错误" },
+        if data.sram_errors == 0 {
+            "无错误"
+        } else {
+            "存在错误"
+        },
     );
     card(
         html,
         "堆运行期净增",
         &alloc::format!("{} B", data.net_growth),
         if data.net_growth <= 2048 { "ok" } else { "bad" },
-        if data.net_growth <= 2048 { "无泄漏" } else { "疑似泄漏" },
+        if data.net_growth <= 2048 {
+            "无泄漏"
+        } else {
+            "疑似泄漏"
+        },
     );
     card(
         html,
         "CPU 利用率",
         &alloc::format!("峰值 {}%", data.cpu_util_max),
         "dim",
-        &alloc::format!("结束 {}% (空闲迭代估算)", data.cpu_util_end),
+        &alloc::format!("结束 {}%", data.cpu_util_end),
     );
     card(
         html,
         "堆最大连续空闲块",
         &alloc::format!("{} B", data.heap_largest_free),
-        if data.heap_largest_free >= 4096 { "ok" } else { "bad" },
-        &alloc::format!("最差 {} B (碎片证据)", data.heap_largest_free_min),
+        if data.heap_largest_free >= 4096 {
+            "ok"
+        } else {
+            "bad"
+        },
+        &alloc::format!("最差 {} B", data.heap_largest_free_min),
     );
     card(
         html,
         "线程数",
         &alloc::format!("{} → {}", data.thread_base, data.thread_end),
-        if data.thread_end == data.thread_base { "ok" } else { "bad" },
-        if data.thread_end == data.thread_base { "无泄漏" } else { "残留线程" },
+        if data.thread_end == data.thread_base {
+            "ok"
+        } else {
+            "bad"
+        },
+        if data.thread_end == data.thread_base {
+            "无泄漏"
+        } else {
+            "残留线程"
+        },
     );
     card(
         html,
         "互斥量最终值",
         if data.mtx_ok { "通过" } else { "失败" },
         if data.mtx_ok { "ok" } else { "bad" },
-        if data.mtx_ok { "无丢失更新" } else { "丢失更新/损坏" },
+        if data.mtx_ok {
+            "无丢失更新"
+        } else {
+            "丢失更新/损坏"
+        },
     );
     card(
         html,
         "优先级继承",
         &alloc::format!("最长 {} ms", data.pi_max_wait),
-        if data.pi_rounds > 0 && data.pi_max_wait <= 100 { "ok" } else { "bad" },
-        &alloc::format!("{} 轮完成 (无继承会超时)", data.pi_rounds),
+        if data.pi_rounds > 0 && data.pi_max_wait <= 100 {
+            "ok"
+        } else {
+            "bad"
+        },
+        &alloc::format!("{} 轮", data.pi_rounds),
     );
     card(
         html,
         "堆分配失败",
         &alloc::format!("{}", data.heap_alloc_failures),
         "dim",
-        "allocator 优雅拒绝 (OOM 不崩溃)",
+        "OOM 优雅拒绝",
     );
     html.push_str("</section>");
 }
@@ -344,11 +362,12 @@ fn render_workers(html: &mut String, data: &Data<'_>) {
         let err_cls = if row.errors > 0 { " class=\"err\"" } else { "" };
         let state = match &row.fail_text {
             Some(t) => t.as_str(),
-            None if row.cycles == 0 => "从未调度 (饥饿)",
+            None if row.cycles == 0 => "未调度",
             None => "正常",
         };
         let pct = if row.stack > 0 {
-            (row.stack_peak as u64 * 1000 / row.stack as u64 + 5) / 10
+            // u32/usize 精确: 栈上限 ≤ 16KiB, peak·1000 远小于上限
+            (row.stack_peak.saturating_mul(1000) / row.stack as u32 + 5) / 10
         } else {
             0
         };
@@ -392,13 +411,18 @@ fn render_latency(html: &mut String, data: &Data<'_>) {
                 continue;
             }
             let lo = edges[i];
-            let hi = if i + 1 < edges.len() { edges[i + 1] } else { u32::MAX };
+            let hi = if i + 1 < edges.len() {
+                edges[i + 1]
+            } else {
+                u32::MAX
+            };
             let label = if hi == u32::MAX {
                 alloc::format!("≥{}ms", lo)
             } else {
                 alloc::format!("{}-{}ms", lo, hi)
             };
-            let pct = (cnt as u64 * 100 / max as u64) as usize;
+            // u32 精确; 饱和仅出现在 50 天级长 soak (samples > 42.9M)
+            let pct = (cnt.saturating_mul(100) / max) as usize;
             let _ = writeln!(
                 html,
                 "<div class=\"bar\"><span class=\"lbl\">{label}</span><span class=\"track\"><span class=\"fill\" style=\"width:{pct}%\"></span></span><span class=\"cnt\">{cnt}</span></div>"
@@ -417,7 +441,7 @@ fn render_watchdog(html: &mut String, data: &Data<'_>) {
         let _ = writeln!(
             html,
             "<div class=\"samples\">已启用 (CFG_WDT_ENABLE=true) · 硬件超时 <b>{timeout} ms</b> · \
-             实测最大喂狗间隔 <b>{gap} ms</b> · 余量 <b>{margin}×</b> — 调度停滞会被硬件复位, 复位即失败证据</div>",
+             最大喂狗间隔 <b>{gap} ms</b> · 余量 <b>{margin}×</b></div>",
         );
         if margin < 2 {
             html.push_str(WARN_OPEN);
@@ -466,7 +490,11 @@ fn render_criteria(html: &mut String, data: &Data<'_>) {
         (
             "互斥量一致性",
             "最终值 == Σ(增量×次数)".into(),
-            if data.mtx_ok { "一致".into() } else { "不一致".into() },
+            if data.mtx_ok {
+                "一致".into()
+            } else {
+                "不一致".into()
+            },
             data.mtx_ok,
         ),
         (
@@ -510,22 +538,25 @@ fn render_criteria(html: &mut String, data: &Data<'_>) {
 /// 结论区: 本次测试证明了什么 / 未覆盖什么 (诚实声明, 增强可信度)
 fn render_conclusion(html: &mut String, data: &Data<'_>) {
     panel(html, "结论");
-    let ok = if data.pass { "可放心长期运行" } else { "存在缺陷, 不建议部署" };
+    let ok = if data.pass {
+        "可放心长期运行"
+    } else {
+        "存在缺陷, 不建议部署"
+    };
     let _ = writeln!(
         html,
-        "<div class=\"samples\">在 {} 个压力线程 × {} 的满载运行下, 调度器无死锁/饥饿, \
-         IPC (信号量/事件/邮箱/队列) 有序无丢失, 互斥量无丢失更新且优先级继承生效, \
-         堆无泄漏、碎片有界且分配失败被优雅拒绝, 定时器/中断路径稳定, 看门狗喂狗余量充足。 \
-         结论: <b>{}</b>。</div>",
+        "<div class=\"samples\">{} 个线程 × {} 满载运行: 调度无死锁/饥饿, \
+         IPC 有序无丢失, 互斥量无丢失更新且优先级继承生效, 堆无泄漏、碎片有界、OOM 优雅拒绝, \
+         定时器/中断稳定, 看门狗余量充足。结论: <b>{}</b>。</div>",
         data.spawned_count,
         fmt_duration(data.elapsed_ms),
         ok
     );
     html.push_str(WARN_OPEN);
     html.push_str(
-        "测试局限 (未覆盖): 掉电/欠压与复位恢复时序、外部总线故障注入、看门狗触发路径本身 \
-         (触发即复位, 属硬件行为)、真实外设链路 (本板无 CAN PHY)、文件系统掉电一致性 \
-         (另有 powerloss 测试覆盖)。本测试以 1 kHz 节拍与 115200 UART 为基准环境。</div>",
+        "测试局限 (未覆盖): 掉电/复位时序、总线故障注入、看门狗触发路径本身、\
+         真实外设链路 (本板无 CAN PHY)、文件系统掉电一致性 (另有 powerloss 覆盖)。\
+         基准: 1 kHz 节拍 + 115200 UART。</div>",
     );
     html.push_str(PANEL_END);
 }
@@ -653,7 +684,10 @@ mod tests {
         // 布局忽略, 彩色填充不可见, 所有"进度条"只剩等宽深色轨道
         let html = build(&sample_data());
         let s = core::str::from_utf8(&html).unwrap();
-        assert!(s.contains(".bar .fill{display:block;"), "fill 必须是块级才能生效 width");
+        assert!(
+            s.contains(".bar .fill{display:block;"),
+            "fill 必须是块级才能生效 width"
+        );
         assert!(s.contains(".bar .track{flex:1;display:block;"));
     }
 
@@ -704,7 +738,7 @@ mod tests {
         let html = build(&d);
         let s = core::str::from_utf8(&html).unwrap();
         assert!(s.contains("class=\"err\""));
-        assert!(s.contains("从未调度 (饥饿)"));
+        assert!(s.contains("未调度"));
     }
 
     #[test]

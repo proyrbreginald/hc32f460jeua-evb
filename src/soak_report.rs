@@ -48,7 +48,15 @@ fn enforce_budget(filesystem: &mut crate::filesystem::FileSystem) -> Result<(), 
             names.push(name.into());
         }
     })?;
-    names.sort();
+    // 插入排序 (≤ COLLECT_CAP=32 项): 字典序即时间序 (报告名含时间戳),
+    // 避免链接 core 的泛型快速排序机器 (~2.4KiB)
+    for i in 1..names.len() {
+        let mut j = i;
+        while j > 0 && names[j] < names[j - 1] {
+            names.swap(j, j - 1);
+            j -= 1;
+        }
+    }
     let slots = crate::config::TEST_REPORT_SLOTS as usize;
     while names.len() > slots {
         let oldest = names.remove(0);

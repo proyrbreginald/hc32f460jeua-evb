@@ -137,7 +137,7 @@ unsafe extern "C" fn fault_diagnose(ipsr: u32, stacked_sp: u32, exc_return: u32,
     let cfsr = report_fault_registers();
     report_exception_frame(stacked_sp, exc_return, cfsr);
     if cfsr & CFSR_UNRELIABLE_STACK != 0 {
-        write_fmt(format_args!("  栈状态不可信，跳过帧指针回溯\r\n"));
+        write_fmt(format_args!("  栈状态不可信, 跳过回溯\r\n"));
     } else {
         report_backtrace(fp as usize);
     }
@@ -157,13 +157,11 @@ fn report_exception_frame(stacked_sp: u32, exc_return: u32, cfsr: u32) {
     ));
 
     if !valid_exc_return(exc_return) {
-        write_fmt(format_args!(
-            "  EXC_RETURN 非 Cortex-M4 合法编码，跳过异常帧\r\n"
-        ));
+        write_fmt(format_args!("  EXC_RETURN 非法, 跳过异常帧\r\n"));
         return;
     }
     if cfsr & CFSR_UNRELIABLE_STACK != 0 {
-        write_fmt(format_args!("  CFSR 指示压栈/出栈错误，跳过异常帧读取\r\n"));
+        write_fmt(format_args!("  CFSR 栈状态不可信, 跳过异常帧\r\n"));
         return;
     }
 
@@ -171,17 +169,15 @@ fn report_exception_frame(stacked_sp: u32, exc_return: u32, cfsr: u32) {
     let extension_bytes = if extended { FP_EXTENSION_BYTES } else { 0 };
     let raw = stacked_sp as usize;
     let Some(frame_addr) = raw.checked_add(extension_bytes) else {
-        write_fmt(format_args!("  异常帧地址计算溢出，跳过读取\r\n"));
+        write_fmt(format_args!("  异常帧地址计算溢出, 跳过\r\n"));
         return;
     };
     let Some(total_bytes) = extension_bytes.checked_add(BASIC_FRAME_BYTES) else {
-        write_fmt(format_args!("  异常帧长度计算溢出，跳过读取\r\n"));
+        write_fmt(format_args!("  异常帧长度计算溢出, 跳过\r\n"));
         return;
     };
     if !stack_range_is_readable(raw, total_bytes) {
-        write_fmt(format_args!(
-            "  异常帧范围无效或未按 4 字节对齐，跳过读取\r\n"
-        ));
+        write_fmt(format_args!("  异常帧范围无效/未对齐, 跳过\r\n"));
         return;
     }
 
@@ -301,6 +297,9 @@ fn report_context() {
 }
 
 /// 读取并解码 SCB fault 状态寄存器 (CFSR/HFSR/BFAR/MMFAR)
+///
+/// 逐位原因名 (CFSR_BITS/HFSR_BITS) 由 `CFG_PANIC_VERBOSE` 控制:
+/// 关闭时仅输出原始寄存器值 (对照参考手册 CFSR/HFSR 位定义解码)。
 fn report_fault_registers() -> u32 {
     unsafe {
         let cfsr = core::ptr::read_volatile((SCB_BASE + 0x28) as *const u32);
@@ -309,12 +308,14 @@ fn report_fault_registers() -> u32 {
         let bfar = core::ptr::read_volatile((SCB_BASE + 0x38) as *const u32);
 
         write_fmt(format_args!("  CFSR 0x{:08x}:", cfsr));
+        #[cfg(panic_verbose)]
         for (mask, name) in CFSR_BITS {
             if cfsr & mask != 0 {
                 write_fmt(format_args!(" {}", name));
             }
         }
         write_fmt(format_args!("\r\n  HFSR 0x{:08x}:", hfsr));
+        #[cfg(panic_verbose)]
         for (mask, name) in HFSR_BITS {
             if hfsr & mask != 0 {
                 write_fmt(format_args!(" {}", name));
@@ -346,7 +347,9 @@ fn terminate() -> ! {
 
 /// CFSR 原因位表: (掩码, 名称)
 ///
-/// MMFSR[7:0] + BFSR[15:8] + UFSR[24:16]
+/// MMFSR[7:0] + BFSR[15:8] + UFSR[24:16]。仅 `panic_verbose` 构建
+/// 携带 (省 ~1.5KiB); 非详细模式输出原始寄存器值。
+#[cfg(panic_verbose)]
 const CFSR_BITS: [(u32, &str); 14] = [
     (1 << 0, "IACCVIOL"),
     (1 << 1, "DACCVIOL"),
@@ -370,6 +373,7 @@ const CFSR_UNRELIABLE_STACK: u32 =
     (1 << 3) | (1 << 4) | (1 << 5) | (1 << 11) | (1 << 12) | (1 << 13);
 
 /// HFSR 原因位表
+#[cfg(panic_verbose)]
 const HFSR_BITS: [(u32, &str); 3] = [
     (1 << 1, "VECTTBL"),
     (1 << 30, "FORCED"),

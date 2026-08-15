@@ -141,6 +141,9 @@ const MAX_FCS_BYTES: usize = 4;
 // ============================== FCS (CRC16 / CRC32) ==============================
 
 /// 生成 CRC-16/CCITT 表 (poly 0x1021, 与 lrzsz crctab.c 一致)
+///
+/// 仅测试用: 固件运行时使用逐位 [`updcrc`], 不携带查表。
+#[cfg(test)]
 const fn crc16_table() -> [u16; 256] {
     let mut table = [0u16; 256];
     let mut i = 0;
@@ -162,6 +165,9 @@ const fn crc16_table() -> [u16; 256] {
 }
 
 /// 生成 CRC-32 表 (反射 poly 0xEDB88320, 与 lrzsz cr3tab 一致)
+///
+/// 仅测试用: 固件运行时使用逐位 [`updc32`], 不携带查表。
+#[cfg(test)]
 const fn crc32_table() -> [u32; 256] {
     let mut table = [0u32; 256];
     let mut i = 0;
@@ -182,19 +188,39 @@ const fn crc32_table() -> [u32; 256] {
     table
 }
 
-static CRC16_TABLE: [u16; 256] = crc16_table();
-static CRC32_TABLE: [u32; 256] = crc32_table();
-
-/// 一步 CRC-16 (对齐 lrzsz `updcrc`)
+/// 一步 CRC-16 (对齐 lrzsz `updcrc`; 无 512B 查表, 逐位计算)
+///
+/// 查表版 `T[crc>>8] ^ (crc<<8) ^ byte` 中 `T[i]` 是 `(i<<8)` 经 8 次
+/// 移位-异或, 该运算对异或线性, 故与下面的逐位展开逐位等价。
 #[inline]
 fn updcrc(byte: u8, crc: u16) -> u16 {
-    CRC16_TABLE[((crc >> 8) & 0xFF) as usize] ^ (crc << 8) ^ byte as u16
+    let mut value = crc & 0xFF00; // (crc >> 8) << 8, 即查表起点
+    let mut i = 0;
+    while i < 8 {
+        value = if value & 0x8000 != 0 {
+            (value << 1) ^ 0x1021
+        } else {
+            value << 1
+        };
+        i += 1;
+    }
+    value ^ ((crc & 0x00FF) << 8) ^ byte as u16
 }
 
-/// 一步 CRC-32 (对齐 lrzsz `UPDC32`; `crc >> 8` 已丢弃高位, 掩码是冗余的)
+/// 一步 CRC-32 (对齐 lrzsz `UPDC32`; 无 1KiB 查表, 逐位计算)
 #[inline]
 fn updc32(byte: u8, crc: u32) -> u32 {
-    CRC32_TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8)
+    let mut value = (crc ^ byte as u32) & 0xFF; // 查表索引
+    let mut i = 0;
+    while i < 8 {
+        value = if value & 1 != 0 {
+            (value >> 1) ^ 0xEDB8_8320
+        } else {
+            value >> 1
+        };
+        i += 1;
+    }
+    value ^ (crc >> 8)
 }
 
 /// 16 位 FCS 发送值: 数据 + 两个零字节的余数 (高位在前)
@@ -1588,6 +1614,41 @@ mod tests {
     use std::time::Duration;
 
     // ---------- FCS 向量 (与 lrzsz crctab.c 实测一致) ----------
+
+    /// 逐位实现与查表实现逐字节/逐 crc 状态完全一致 (查表版仅测试存在)。
+    #[test]
+    fn crc_bitwise_matches_table_exhaustively() {
+        let crc16_tab = crc16_table();
+        for crc in 0..=u16::MAX {
+            for &byte in &[0u8, 1, 0x7F, 0x80, 0xFF, 0x5A, 0xA5, 0x42] {
+                let table = crc16_tab[((crc >> 8) & 0xFF) as usize] ^ (crc << 8) ^ byte as u16;
+                assert_eq!(updcrc(byte, crc), table, "crc16 crc={crc:#x} b={byte:#x}");
+            }
+        }
+
+        let crc32_tab = crc32_table();
+        let mut crc = 0u32;
+        let mut step = 0;
+        while step < 1 << 16 {
+            for &byte in &[0u8, 1, 0x7F, 0x80, 0xFF, 0x5A, 0xA5, 0x42] {
+                let table = crc32_tab[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+                assert_eq!(updc32(byte, crc), table, "crc32 crc={crc:#x} b={byte:#x}");
+            }
+            crc = crc.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            step += 1;
+        }
+        // 边界值: 高位全 1 / 全 0 状态
+        for &crc in &[0u32, u32::MAX, 0x1234_5678, 0xFFFF_0000, 0x0000_FFFF] {
+            for &byte in &[0u8, 0xFF, 0x80, 0x01] {
+                let table = crc32_tab[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+                assert_eq!(
+                    updc32(byte, crc),
+                    table,
+                    "crc32 edge crc={crc:#x} b={byte:#x}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn crc16_vectors() {

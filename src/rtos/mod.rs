@@ -131,9 +131,8 @@ pub fn tick_increase() {
 // 内核 API 全集, 部分供应用选用 (二进制 crate 中未使用项会告警)
 #[allow(unused_imports)]
 pub use hooks::{
-    context_switch_count, idle_iterations, reset_stats,
-
-    ContextSwitchHook, ContextSwitchInfo, IdleHook, set_context_switch_hook, set_idle_hook,
+    ContextSwitchHook, ContextSwitchInfo, IdleHook, context_switch_count, idle_iterations,
+    reset_stats, set_context_switch_hook, set_idle_hook,
 };
 #[allow(unused_imports)]
 pub use idle::pending_defuncts;

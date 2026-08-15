@@ -314,7 +314,10 @@ extern "C" fn watchdog_supervisor(_param: usize) {
         let now = crate::rtos::uptime_ms();
         let gap = now.wrapping_sub(last);
         last = now;
-        WDT_FEED_MAX_GAP.fetch_max(gap.max(crate::config::WDT_FEED_INTERVAL_MS), Ordering::Relaxed);
+        WDT_FEED_MAX_GAP.fetch_max(
+            gap.max(crate::config::WDT_FEED_INTERVAL_MS),
+            Ordering::Relaxed,
+        );
     }
 }
 

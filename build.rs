@@ -22,6 +22,7 @@ fn main() {
         ("CFG_SHELL_ZMODEM_ENABLE", "shell_zmodem"),
         ("CFG_APP_SELFTEST_ENABLE", "shell_selftest"),
         ("CFG_SOAK_ENABLE", "shell_soak"),
+        ("CFG_PANIC_VERBOSE", "panic_verbose"),
     ] {
         match std::env::var(env).as_deref() {
             Ok("true") => println!("cargo:rustc-cfg={flag}"),
@@ -35,7 +36,13 @@ fn main() {
         println!("cargo:rustc-cfg=shell_selftest");
     }
     // 声明本工程自定义的 cfg 名, 避免 rustc 的 unexpected cfg 警告
-    for flag in ["shell_nano", "shell_zmodem", "shell_selftest", "shell_soak"] {
+    for flag in [
+        "shell_nano",
+        "shell_zmodem",
+        "shell_selftest",
+        "shell_soak",
+        "panic_verbose",
+    ] {
         println!("cargo:rustc-check-cfg=cfg({flag})");
     }
 

@@ -2,9 +2,8 @@ mod common;
 
 use common::{RamError, RamNor, read_all};
 use littlefs::format::{
-    COMMIT_OFFSET, HEADER_SIZE, MAX_WEAR_TABLE_SIZE, RECORD_FLAG_DIRECTORY,
-    RECORD_HEADER_SIZE, RecordHeader, SnapshotHeader, crc32_mpeg2, encode_wear_table,
-    generation_is_newer,
+    COMMIT_OFFSET, HEADER_SIZE, MAX_WEAR_TABLE_SIZE, RECORD_FLAG_DIRECTORY, RECORD_HEADER_SIZE,
+    RecordHeader, SnapshotHeader, crc32_mpeg2, encode_wear_table, generation_is_newer,
 };
 use littlefs::{EntryKind, Error, FileSystem, Geometry, MAX_FILES};
 

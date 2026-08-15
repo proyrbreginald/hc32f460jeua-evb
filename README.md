@@ -579,9 +579,13 @@ cargo run                            # 构建 + 烧录 (pyocd, 见 scripts/flash
 
 `debug` 构建默认已启用 `opt-level = 1` (见 `Cargo.toml` `[profile.dev]`):
 保留 debuginfo、帧指针和 panic 栈回溯所需信息；`release` 构建采用
-`opt-level = "z"` + `lto = "thin"` + `codegen-units = 1` (体积优先)。
+`opt-level = "z"` + `lto = "fat"` + `codegen-units = 1` (体积优先)。
 当前工具链与全功能配置下 `arm-none-eabi-size` 测得 `text + data`
-约为 150.6KiB (release)；具体结果会随 Rust/LLVM 版本与功能增减而变化。
+约为 140.7KiB (release)；具体结果会随 Rust/LLVM 版本与功能增减而变化。
+体积优化手段 (已落地): zmodem FCS 查表改逐位计算 (−1.7KiB)、报告文件名
+排序改插入排序 (−3.9KiB)、panic 诊断文本按 `CFG_PANIC_VERBOSE` 分级
+(−0.6KiB)、HTML 报告模板精简 (−0.4KiB)、shell/soak 帮助文本精简、
+UART 波特率/CAN 位时序/PLL 时钟 u64 除法改 u32 数学。
 
 **体积优化与功能裁剪**: 除 `CFG_*` 运行时配置外, 大体积功能均为
 **编译期开关** (`build.rs` 把配置翻译为 `#[cfg]`, 关闭时连代码一起
@@ -589,12 +593,12 @@ cargo run                            # 构建 + 烧录 (pyocd, 见 scripts/flash
 
 | 开关 | 功能 | 全关相比全开约省 |
 |---|---|---|
-| `CFG_SOAK_ENABLE` | soak 长稳测试 + HTML 报告模板 | ~54 KiB (含依赖) |
+| `CFG_SOAK_ENABLE` | soak 长稳测试 + HTML 报告模板 | ~30 KiB (含依赖) |
 | `CFG_APP_SELFTEST_ENABLE` | selftest 内核自检 | ~19 KiB |
-| `CFG_SHELL_ZMODEM_ENABLE` | sz/rz 文件传输 | ~12 KiB |
-| `CFG_SHELL_NANO_ENABLE` | nano 全屏编辑器 | ~9 KiB |
+| `CFG_SHELL_ZMODEM_ENABLE` | sz/rz 文件传输 | ~10.5 KiB |
+| `CFG_SHELL_NANO_ENABLE` | nano 全屏编辑器 | ~8 KiB |
 
-四项全部关闭时 `text + data` 约 75.7KiB (相比全开省 ~75 KiB)。
+四项全部关闭时 `text + data` 约 74.8KiB (相比全开省 ~67 KiB)。
 注: soak 依赖 selftest 的 ESC 中断, soak 开启时 selftest 自动随带编译。
 
 ### 烧录 (pyocd)

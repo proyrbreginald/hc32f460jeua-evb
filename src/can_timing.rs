@@ -35,21 +35,23 @@ impl BitTiming {
 
     /// Actual nominal bitrate, rounded down to an integer number of bits/s.
     pub const fn actual_bitrate(&self, clock_hz: u32) -> u32 {
-        let total_tq = self.time_seg1 as u64 + self.time_seg2 as u64;
-        let divisor = match (self.prescaler as u64).checked_mul(total_tq) {
+        // u32 精确: 预分频 ≤ 256, 总 TQ ≤ 73, 除数与商均不溢出
+        let total_tq = self.time_seg1 + self.time_seg2;
+        let divisor = match self.prescaler.checked_mul(total_tq) {
             Some(value) if value != 0 => value,
             _ => return 0,
         };
-        (clock_hz as u64 / divisor) as u32
+        clock_hz / divisor
     }
 
     /// Actual sample point in permille, rounded to the nearest permille.
     pub const fn sample_point_permille(&self) -> u32 {
-        let total_tq = self.time_seg1 as u64 + self.time_seg2 as u64;
+        let total_tq = self.time_seg1 + self.time_seg2;
         if total_tq == 0 {
             return 0;
         }
-        ((self.time_seg1 as u64 * 1_000 + total_tq / 2) / total_tq) as u32
+        // u32 精确: time_seg1 ≤ 65, 乘积远小于 u32 上限
+        (self.time_seg1 * 1_000 + total_tq / 2) / total_tq
     }
 
     /// Absolute bitrate error in parts per million, rounded to the nearest ppm.

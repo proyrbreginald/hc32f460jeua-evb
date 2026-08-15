@@ -352,69 +352,49 @@ static COMMANDS: &[Command] = &[
     cmd(
         "sysinfo",
         &["info"],
-        "系统信息 (型号/频率/节拍/构建)",
+        "系统信息 (型号/时钟/节拍)",
         cmd_sysinfo,
     ),
     cmd("uptime", &[], "运行时间", cmd_uptime),
     cmd("ps", &[], "线程列表", cmd_ps),
     cmd("free", &["mem"], "堆内存统计", cmd_free),
     cmd("echo", &[], "回显 <文本>", cmd_echo),
-    cmd("history", &[], "查看历史命令; history -c 清空", cmd_history),
-    cmd("pwd", &[], "显示当前路径", cmd_pwd),
+    cmd("history", &[], "历史命令; -c 清空", cmd_history),
+    cmd("pwd", &[], "当前路径", cmd_pwd),
     cmd("cd", &[], "切换路径: cd [目录]", cmd_cd),
-    cmd("ls", &[], "列出路径: ls [路径]", cmd_ls),
-    cmd("mkdir", &[], "创建目录: mkdir <目录>", cmd_mkdir),
-    cmd("rmdir", &[], "删除空目录: rmdir <目录>", cmd_rmdir),
-    cmd("cat", &[], "读取文件: cat <文件>", cmd_cat),
-    cmd(
-        "write",
-        &["put"],
-        "原子创建/覆盖: write <文件> [文本]",
-        cmd_write,
-    ),
+    cmd("ls", &[], "列出: ls [路径]", cmd_ls),
+    cmd("mkdir", &[], "建目录: mkdir <目录>", cmd_mkdir),
+    cmd("rmdir", &[], "删目录: rmdir <目录>", cmd_rmdir),
+    cmd("cat", &[], "读文件: cat <文件>", cmd_cat),
+    cmd("write", &["put"], "原子写: write <文件> [文本]", cmd_write),
     #[cfg(shell_nano)]
     cmd("nano", &[], "全屏编辑: nano <文件>", cmd_nano),
     #[cfg(shell_zmodem)]
-    cmd(
-        "sz",
-        &[],
-        "发送文件 (ZMODEM): sz <文件> [文件...]",
-        zmodem::cmd_sz,
-    ),
+    cmd("sz", &[], "发送 (ZMODEM): sz <文件>...", zmodem::cmd_sz),
     #[cfg(shell_zmodem)]
-    cmd(
-        "rz",
-        &[],
-        "接收文件 (ZMODEM): rz (主机执行 sz)",
-        zmodem::cmd_rz,
-    ),
-    cmd("rm", &[], "删除文件: rm <文件>", cmd_rm),
-    cmd("mv", &[], "原子移动: mv <旧路径> <新路径>", cmd_mv),
+    cmd("rz", &[], "接收 (ZMODEM): rz (主机 sz)", zmodem::cmd_rz),
+    cmd("rm", &[], "删文件: rm <文件>", cmd_rm),
+    cmd("mv", &[], "移动: mv <旧> <新>", cmd_mv),
     cmd("stat", &[], "路径信息: stat <路径>", cmd_stat),
-    cmd("df", &["fsinfo"], "文件系统容量与状态", cmd_df),
-    cmd("fsck", &[], "只读校验当前快照", cmd_fsck),
-    cmd("level", &[], "磨损均衡: 快照搬移到磨损最低区域", cmd_level),
-    cmd("mount", &[], "重新挂载文件系统", cmd_mount),
-    cmd("mkfs", &[], "清空文件系统: mkfs --force", cmd_mkfs),
-    cmd("led", &[], "板载 LED on|off", cmd_led),
+    cmd("df", &["fsinfo"], "文件系统容量/状态", cmd_df),
+    cmd("fsck", &[], "校验当前快照", cmd_fsck),
+    cmd("level", &[], "磨损均衡: 快照搬到磨损最低区", cmd_level),
+    cmd("mount", &[], "重新挂载", cmd_mount),
+    cmd("mkfs", &[], "清空: mkfs --force", cmd_mkfs),
+    cmd("led", &[], "LED on|off", cmd_led),
     #[cfg(shell_selftest)]
     cmd("selftest", &[], "自检: selftest [all|can]", cmd_selftest),
     #[cfg(shell_soak)]
-    cmd(
-        "soak",
-        &[],
-        "长稳测试: soak [分钟] [压力项|场景] (0=直到ESC)",
-        cmd_soak,
-    ),
+    cmd("soak", &[], "长稳: soak [分钟] [项|场景] (0=ESC)", cmd_soak),
     cmd(
         "log",
         &[],
-        "日志开关/级别/落盘 (on|off|level <级>|file [on|off])",
+        "日志开关/级别/落盘 (on|off|level <级>|file)",
         cmd_log,
     ),
     cmd("clear", &[], "清屏", cmd_clear),
     cmd("whoami", &[], "当前用户", cmd_whoami),
-    cmd("reboot", &[], "软复位重启", cmd_reboot),
+    cmd("reboot", &[], "软复位", cmd_reboot),
     cmd("logout", &["exit"], "重新登录", cmd_logout),
 ];
 
@@ -1320,7 +1300,15 @@ fn cmd_df(state: &mut ShellState, rest: &str) -> CmdResult {
         .unwrap_or(0);
     println!(
         "{:<14}  {:>7}  {:>7}  {:>4}  {:>7}  {:>10}  {:>6}  {:>9}  {}",
-        "Filesystem", "Size(B)", "Used(B)", "Use%", "Entries", "Gen", "Blocks", "WearMin", "WearMax"
+        "Filesystem",
+        "Size(B)",
+        "Used(B)",
+        "Use%",
+        "Entries",
+        "Gen",
+        "Blocks",
+        "WearMin",
+        "WearMax"
     );
     println!(
         "{:<14}  {:>7}  {:>7}  {:>3}%  {:>7}  {:>10}  {}/{}  {:>6}  {:>9}",
@@ -1351,11 +1339,9 @@ fn cmd_level(state: &mut ShellState, rest: &str) -> CmdResult {
         Ok(()) => {
             let (min_after, max_after) = filesystem.wear_bounds();
             if filesystem.info().generation == generation_before {
-                println!("磨损已均衡 (min={min_after}, max={max_after}), 无需搬移");
+                println!("磨损已均衡 (min={min_after}, max={max_after})");
             } else {
-                println!(
-                    "快照已搬移到磨损最低区域 (min={min_after}, max={max_after})"
-                );
+                println!("快照已搬到磨损最低区 (min={min_after}, max={max_after})");
             }
         }
         Err(error) => print_fs_error("level", &error),
@@ -1532,7 +1518,7 @@ fn cmd_log(_state: &mut ShellState, rest: &str) -> CmdResult {
             }
             Some(_) => println!("用法: log file [on|off]"),
         },
-        Some(_) => println!("用法: log [on|off|level <error|warn|info|debug|trace>|file [on|off]]"),
+        Some(_) => println!("用法: log [on|off|level <级>|file [on|off]]"),
     }
     CmdResult::Ok
 }

@@ -1233,7 +1233,12 @@ fn render_bar(elapsed_ms: u32, total_ms: u32, used: usize, threads: usize, error
     let s = elapsed_ms / 1000;
     let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
     let mut line = if total_ms > 0 {
-        let pct = ((elapsed_ms as u64 * 100) / total_ms as u64).min(100) as usize;
+        // u32 精确进度: 乘积可容纳时直接算; 超长 (≥49.7 天) 时改用除法形式
+        let pct = if total_ms <= u32::MAX / 100 {
+            (elapsed_ms * 100 / total_ms).min(100) as usize
+        } else {
+            (elapsed_ms / (total_ms / 100)).min(100) as usize
+        };
         let filled = (pct * BAR_BLOCKS) / 100;
         let mut bar = alloc::string::String::with_capacity(BAR_BLOCKS + 2);
         for _ in 0..filled {
@@ -1250,13 +1255,15 @@ fn render_bar(elapsed_ms: u32, total_ms: u32, used: usize, threads: usize, error
         let (ki, kf) = fmt_kib(used);
         alloc::format!(
             "\r[soak] {h}:{m:02}:{s:02}/{th}:{tm:02}:{ts:02} [{bar}] {pct:3}%  堆 {}.{}K  线程 {threads}  错误 {errors}",
-            ki, kf
+            ki,
+            kf
         )
     } else {
         let (ki, kf) = fmt_kib(used);
         alloc::format!(
             "\r[soak] {h}:{m:02}:{s:02} (直到 ESC)  堆 {}.{}K  线程 {threads}  错误 {errors}",
-            ki, kf
+            ki,
+            kf
         )
     };
     // 定宽补齐 (字符数): 行缩短时覆盖旧内容
@@ -1343,7 +1350,8 @@ fn delay_percentile(pct: u32) -> u32 {
     if samples == 0 {
         return 0;
     }
-    let target = ((samples as u64) * pct as u64 / 100).max(1) as u32;
+    // u32 精确; 饱和仅出现在 50 天级长 soak (samples > 42.9M)
+    let target = (samples.saturating_mul(pct) / 100).max(1);
     let mut acc = 0u32;
     for (i, bucket) in DELAY_HIST.iter().enumerate() {
         acc += bucket.load(Ordering::Relaxed);
@@ -1370,10 +1378,10 @@ pub(crate) fn run(args: &str) {
             }
             s
         });
-        crate::println!("[soak]   场景: basic (RTOS 核心) / periph (外设) / 缺省 = 全部");
+        crate::println!("[soak]   场景: basic|periph (缺省=全部)");
         return;
     };
-    let duration_ms = (minutes as u64) * 60_000;
+    let duration_ms = minutes.saturating_mul(60_000); // u32, 上限 ≈ 49.7 天
 
     // ---- 复位全局状态 ----
     STOP.store(false, Ordering::Relaxed);
@@ -1497,9 +1505,7 @@ pub(crate) fn run(args: &str) {
             break 'monitor;
         }
         // 时长到达
-        if minutes != 0
-            && (crate::rtos::uptime_ms() as u64).wrapping_sub(start as u64) >= duration_ms
-        {
+        if minutes != 0 && crate::rtos::uptime_ms().wrapping_sub(start) >= duration_ms {
             break 'monitor;
         }
         // 心跳停滞判定 (停滞即判挂起: 丢失唤醒/死锁/调度停滞)
@@ -1584,7 +1590,7 @@ pub(crate) fn run(args: &str) {
         // 进度条: 每秒原位刷新 (控制台唯一持续输出, 不进入日志环)
         render_bar(
             now.wrapping_sub(start),
-            duration_ms as u32,
+            duration_ms,
             used,
             spawned.len(),
             spawned
@@ -1621,8 +1627,7 @@ pub(crate) fn run(args: &str) {
     // 残留僵尸会使结束值虚高, 误报"泄漏"。给回收一个受宽限约束的窗口。
     let recycle_start = crate::rtos::uptime_ms();
     while crate::rtos::pending_defuncts() > 0
-        && crate::rtos::uptime_ms().wrapping_sub(recycle_start)
-            < crate::config::SOAK_HANG_GRACE_MS
+        && crate::rtos::uptime_ms().wrapping_sub(recycle_start) < crate::config::SOAK_HANG_GRACE_MS
     {
         crate::rtos::thread_delay_ms(10).ok();
     }
@@ -1662,9 +1667,11 @@ pub(crate) fn run(args: &str) {
     // RTC 时间戳 (报告头部与文件名); RTC 未运行或日期未设置 (上电
     // 默认 2000-01-01, 时间从复位起计数) 时退化为启动序号, 避免
     // 报告出现误导性的 "2000-01-01" 日期
-    let rtc_stamp = crate::rtc::get_date().ok().zip(crate::rtc::get_time().ok()).filter(
-        |(d, _t)| !(d.year == 0 && d.month == 1 && d.day == 1),
-    ).map(|(d, t)| (d.year, d.month, d.day, t.hour, t.minute, t.second));
+    let rtc_stamp = crate::rtc::get_date()
+        .ok()
+        .zip(crate::rtc::get_time().ok())
+        .filter(|(d, _t)| !(d.year == 0 && d.month == 1 && d.day == 1))
+        .map(|(d, t)| (d.year, d.month, d.day, t.hour, t.minute, t.second));
 
     // 压力项清单 + 线程明细行
     let items = spawned
@@ -1723,9 +1730,7 @@ pub(crate) fn run(args: &str) {
         .iter()
         .any(|&id| WORKERS[id.index()].cycles.load(Ordering::Relaxed) == 0)
     {
-        crate::log_warn!(
-            "[soak] 存在从未获得执行的压力线程 (调度饥饿), 结果覆盖不完整, 详情见报告"
-        );
+        crate::log_warn!("[soak] 存在未获得执行的线程 (饥饿), 覆盖不完整, 见报告");
     }
 
     // 系统信息 + 调度统计 (报告"系统画像"区)
@@ -1829,5 +1834,4 @@ pub(crate) fn run(args: &str) {
         crate::println!("\r[soak] 结果: {} — 文件系统不可用, 无法保存报告", outcome);
         fallback_summary(total_errors, sram_errors);
     }
-
 }

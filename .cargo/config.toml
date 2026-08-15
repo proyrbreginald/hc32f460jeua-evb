@@ -148,6 +148,10 @@ CFG_APP_LOGFILE_TIMESLICE = "10"
 # [console] 控制台输出节流 (防 USB 转串口突发丢字节)
 CFG_CONSOLE_LINE_GAP_MS = "8"  # 每行输出后的间隙 (毫秒; 0=不节流)
 
+# [panic] panic/fault 诊断文本详细度: true=逐位解码 CFSR/HFSR 原因名
+# (调试期), false=仅输出寄存器原始值 (参考手册查表, 省 ~1.5KiB)
+CFG_PANIC_VERBOSE = "false"
+
 # [soak_report] soak 测试报告 (/test/ 目录保留文件数)
 CFG_TEST_REPORT_SLOTS = "1"
 

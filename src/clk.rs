@@ -893,8 +893,17 @@ fn pll_hz() -> u32 {
     } else {
         XTAL_HZ
     };
-    let hz = (src as u64) * (n as u64 + 1) / (m as u64 + 1) / (p as u64 + 1);
-    hz.min(u32::MAX as u64) as u32
+    // u32 精确: hz = src·(n+1)/((m+1)(p+1)), 拆分为
+    // (src/((m+1)(p+1)))·(n+1) + ((src%den)·(n+1))/den;
+    // 首项 ≤ 芯片时钟上限, 次项 < den·num ≤ 512·512, 均不溢出。
+    let num = n + 1;
+    let den = (m + 1) * (p + 1);
+    let q = src / den;
+    if q > u32::MAX / num {
+        u32::MAX // 配置超出芯片时钟范围 (与旧 u64 版截断一致)
+    } else {
+        q * num + (src % den) * num / den
+    }
 }
 
 fn read8(addr: usize) -> u32 {
