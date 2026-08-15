@@ -16,7 +16,10 @@ directory tree inside complete immutable snapshots.
 - bounded reads, typed `stat`, write-size preflight, and callback-based listing;
 - explicit directories with `mkdir`, empty-directory `rmdir`, and `read_dir`;
 - atomic file rename and whole-directory-tree rename;
-- format, mount, verification, and device recovery after an I/O error.
+- format, mount, verification, and device recovery after an I/O error;
+- erase-count wear leveling: dynamic placement on every mutation (least-worn
+  non-overlapping run) plus an explicit `level()` static relocation; per-block
+  counters live in each snapshot and survive remounts and reformats.
 
 The root directory is implicit. Public paths are canonical UTF-8 paths relative
 to that root: no leading or trailing `/`, empty component, `.` component, `..`

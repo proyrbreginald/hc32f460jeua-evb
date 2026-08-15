@@ -113,7 +113,7 @@ CFG_SHELL_LOGIN_TRIES = "3"    # 登录失败允许次数
 CFG_SHELL_LINE_BUF = "128"     # 输入行缓冲区 (字节)
 CFG_SHELL_HISTORY_SIZE = "8"   # RAM 中保留的历史命令条数 (重启后清空)
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
-CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,nano,rm,mv,stat,df,fsck,mount,mkfs,led,log,selftest,soak,sz,rz,clear,whoami,reboot,logout"
+CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,nano,rm,mv,stat,df,fsck,level,mount,mkfs,led,log,selftest,soak,sz,rz,clear,whoami,reboot,logout"
 
 # 功能编译期开关 (true/false): false 时对应命令与其全部代码不编译, 直接省
 # FLASH。注意: soak 依赖 selftest 的 ESC 中断支持, soak=true 时 selftest
@@ -139,7 +139,7 @@ CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出
 CFG_LOG_FILE_ENABLE = "true"   # 落盘开关
 CFG_LOG_RING = "4096"          # RAM 日志缓冲 (字节; 满时丢最旧, 掉电丢失)
 CFG_LOG_FILE_MAX = "4096"      # 单个日志文件上限 (字节; 超出则写入下一段文件)
-CFG_LOG_FILE_SLOTS = "10"       # 保留的日志文件数 (boot_<序号>[_<段号>].log)
+CFG_LOG_FILE_SLOTS = "8"       # 保留的日志文件数 (boot_<序号>[_<段号>].log)
 CFG_LOG_FLUSH_MS = "2000"      # 落盘线程刷新间隔 (毫秒; 越小越费 Flash)
 CFG_APP_LOGFILE_STACK = "8192" # 落盘线程栈 (与 shell 同级: 文件系统写 + 格式化较深)
 CFG_APP_LOGFILE_PRIORITY = "3" # 低于 shell(1)/led(2), 高于 idle(31)

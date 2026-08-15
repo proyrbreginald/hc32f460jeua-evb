@@ -28,11 +28,11 @@ assume that a word program is atomic.
 
 ## Partition
 
-The board integration reserves sectors 54 through 61:
+The board integration reserves sectors 46 through 61:
 
 ```text
-firmware       0x00000000 .. 0x0006bfff  (432 KiB)
-filesystem     0x0006c000 .. 0x0007bfff  (8 x 8 KiB)
+firmware       0x00000000 .. 0x0005bfff  (368 KiB)
+filesystem     0x0005c000 .. 0x0007bfff  (16 x 8 KiB)
 EFM self-test  0x0007c000 .. 0x0007dfff  (sector 62)
 swap/reserved  0x0007e000 .. 0x0007ffff  (sector 63)
 ```
@@ -111,16 +111,38 @@ candidate, and chooses the newest valid generation. It does not write recovery
 state. Uncommitted and stale blocks are reclaimed only when they become the
 destination of a later transaction.
 
-The segment start advances by its span, spreading erases over the partition
-without a persistent free list or erase counters. This is dynamic wear
-distribution, not a lifetime guarantee. Complete snapshots create write
-amplification proportional to live data.
+### Erase-count wear leveling (format v1.1)
+
+Every snapshot payload begins with a fixed per-block erase table: one
+little-endian `u16` counter per block, padded to a program-unit boundary and
+covered by the payload CRC. Counters are monotonic across reformats and
+saturate at the `u16` width. This is the littlefs-style dynamic/static scheme,
+adapted to a whole-snapshot copy-on-write filesystem:
+
+- **Dynamic wear leveling**: each mutation computes its destination span and
+  scans every non-overlapping start position, choosing the run with the lowest
+  maximum erase count (lowest total, then smallest forward distance from the
+  old successor, as tie-breaks). The tie-break reproduces the sequential sweep
+  for uniformly worn devices, so uniform workloads keep rotating exactly as
+  before. Because the active snapshot is fully rewritten by every mutation,
+  dynamic placement alone converges the erase distribution even for workloads
+  whose snapshot span alternates between one block and half the partition.
+- **Static wear leveling**: `level()` rewrites the active snapshot unchanged
+  into the least-worn non-overlapping run. It is an explicit, atomically
+  committed relocation used to rebalance an idle filesystem whose blocks were
+  worn unevenly by restricted large-span placements; it is a no-op (no device
+  writes) when all counters are within one of each other.
+
+The wear table travels inside each committed snapshot, so a torn relocation
+mounts the previous complete snapshot with its previous counters; recovery is
+unchanged and never depends on a separate table update transaction.
 
 ## Capacity and durability
 
 The new and old snapshots must coexist. Therefore one snapshot may occupy no
-more than half the blocks. With the board's eight-block partition, usable
-serialized capacity is just under 32 KiB.
+more than half the blocks. With the board's sixteen-block partition, usable
+serialized capacity is just under 64 KiB (the payload CRC covers the wear
+table, which costs 2 bytes per block).
 
 Every mutating API is a durability boundary. A successful return means the new
 snapshot was synchronized and read back. On reset during an operation, mount
@@ -136,6 +158,8 @@ renames, so recovery cannot expose a partially moved tree.
 
 The format has no recursive removal, implicit parent creation, append log,
 random overwrite, streaming file handle, sparse file, symbolic link,
-permissions, timestamps, extended attributes, bad-block relocation, static
-wear leveling, encryption, or authentication. CRC detects accidental corruption
-and torn writes; it is not a security MAC.
+permissions, timestamps, extended attributes, bad-block relocation, or
+encryption. The erase counters are `u16` (saturating); a partition whose every
+block reaches the saturation point is reported honestly by the counters rather
+than remapped. CRC detects accidental corruption and torn writes; it is not a
+security MAC.

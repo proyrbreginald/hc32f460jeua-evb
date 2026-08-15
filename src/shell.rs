@@ -393,6 +393,7 @@ static COMMANDS: &[Command] = &[
     cmd("stat", &[], "路径信息: stat <路径>", cmd_stat),
     cmd("df", &["fsinfo"], "文件系统容量与状态", cmd_df),
     cmd("fsck", &[], "只读校验当前快照", cmd_fsck),
+    cmd("level", &[], "磨损均衡: 快照搬移到磨损最低区域", cmd_level),
     cmd("mount", &[], "重新挂载文件系统", cmd_mount),
     cmd("mkfs", &[], "清空文件系统: mkfs --force", cmd_mkfs),
     cmd("led", &[], "板载 LED on|off", cmd_led),
@@ -1318,11 +1319,11 @@ fn cmd_df(state: &mut ShellState, rest: &str) -> CmdResult {
         .checked_div(info.capacity_bytes)
         .unwrap_or(0);
     println!(
-        "{:<14}  {:>7}  {:>7}  {:>4}  {:>7}  {:>10}  {}",
-        "Filesystem", "Size(B)", "Used(B)", "Use%", "Entries", "Gen", "Blocks"
+        "{:<14}  {:>7}  {:>7}  {:>4}  {:>7}  {:>10}  {:>6}  {:>9}  {}",
+        "Filesystem", "Size(B)", "Used(B)", "Use%", "Entries", "Gen", "Blocks", "WearMin", "WearMax"
     );
     println!(
-        "{:<14}  {:>7}  {:>7}  {:>3}%  {:>7}  {:>10}  {}/{}",
+        "{:<14}  {:>7}  {:>7}  {:>3}%  {:>7}  {:>10}  {}/{}  {:>6}  {:>9}",
         "internal-flash",
         info.capacity_bytes,
         info.serialized_bytes,
@@ -1330,8 +1331,35 @@ fn cmd_df(state: &mut ShellState, rest: &str) -> CmdResult {
         info.entry_count,
         info.generation,
         info.active_blocks,
-        crate::filesystem::BLOCK_COUNT
+        crate::filesystem::BLOCK_COUNT,
+        info.min_erase_count,
+        info.max_erase_count
     );
+    CmdResult::Ok
+}
+
+fn cmd_level(state: &mut ShellState, rest: &str) -> CmdResult {
+    if !rest.trim().is_empty() {
+        println!("用法: level");
+        return CmdResult::Ok;
+    }
+    let Some(mut filesystem) = mounted_filesystem(state) else {
+        return CmdResult::Ok;
+    };
+    let generation_before = filesystem.info().generation;
+    match filesystem.level() {
+        Ok(()) => {
+            let (min_after, max_after) = filesystem.wear_bounds();
+            if filesystem.info().generation == generation_before {
+                println!("磨损已均衡 (min={min_after}, max={max_after}), 无需搬移");
+            } else {
+                println!(
+                    "快照已搬移到磨损最低区域 (min={min_after}, max={max_after})"
+                );
+            }
+        }
+        Err(error) => print_fs_error("level", &error),
+    }
     CmdResult::Ok
 }
 
