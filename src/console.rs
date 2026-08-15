@@ -89,40 +89,6 @@ pub fn write_fmt(args: core::fmt::Arguments<'_>) {
     }
 }
 
-/// 原子输出一整行 (内容 + CRLF, 由 `println!` 宏调用)
-///
-/// 内容与换行在同一把锁内完成, 任意时刻至多一个线程占用串口,
-/// 行与行之间不会交错。
-pub fn write_fmt_line(args: core::fmt::Arguments<'_>) {
-    if !READY.load(Ordering::Acquire) {
-        return; // UART 未就绪: 静默丢弃, 防止 TXE 等待死循环
-    }
-    if crate::rtos::scheduler_started() {
-        if crate::critical_section::in_isr() {
-            write_fmt_raw(args);
-            write_fmt_raw(core::format_args!("\r\n"));
-            return;
-        }
-        // 内容与换行在同一守卫内完成 (RAII), 行与行之间不会交错;
-        // 守卫析构前校验锁仍由当前线程持有 (正常情况下必然成立,
-        // 作为打印路径回归的哨兵检查)
-        let Ok(guard) = PRINT_MUTEX.lock(Timeout::Forever) else {
-            return;
-        };
-        write_fmt_raw(args);
-        debug_assert_eq!(
-            PRINT_MUTEX.owner(),
-            crate::rtos::sched::current(),
-            "print lock lost during output"
-        );
-        write_fmt_raw(core::format_args!("\r\n"));
-        drop(guard); // 显式释放: CRLF 输出完成后立即解锁
-    } else {
-        write_fmt_raw(args);
-        write_fmt_raw(core::format_args!("\r\n"));
-    }
-}
-
 /// 无锁输出格式化内容 (仅限中断上下文/panic 诊断使用)
 ///
 /// 不获取打印锁, 不阻塞; 输出可能与其他上下文交错。
@@ -132,6 +98,82 @@ pub fn write_fmt_raw(args: core::fmt::Arguments<'_>) {
     }
     let mut uart = ConsoleUart::take();
     let _ = core::fmt::write(&mut uart, args);
+}
+
+/// 无锁输出原始字节 (调用方负责持锁/不交错约束)
+fn write_bytes_raw(bytes: &[u8]) {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    let uart = ConsoleUart::take();
+    uart.write(bytes);
+}
+
+/// 打印锁内执行 `f`, `f` 收到原始字节写出器 (输出不会与其他线程交错)。
+///
+/// 锁协议与 [`write_fmt_line`] 相同: 调度器启动前/中断上下文自动无锁
+/// 直写 (行为一致, 仅不保证互斥)。返回 `None` 表示 UART 未就绪或取锁
+/// 失败, 此时 `f` 未执行。
+pub fn with_print_lock<R>(f: impl FnOnce(&mut dyn FnMut(&[u8])) -> R) -> Option<R> {
+    if !READY.load(Ordering::Acquire) {
+        return None;
+    }
+    if crate::rtos::scheduler_started() {
+        if crate::critical_section::in_isr() {
+            return Some(f(&mut |bytes| write_bytes_raw(bytes)));
+        }
+        let Ok(_guard) = PRINT_MUTEX.lock(Timeout::Forever) else {
+            return None;
+        };
+        debug_assert_eq!(
+            PRINT_MUTEX.owner(),
+            crate::rtos::sched::current(),
+            "print lock lost during output"
+        );
+        Some(f(&mut |bytes| write_bytes_raw(bytes)))
+    } else {
+        Some(f(&mut |bytes| write_bytes_raw(bytes)))
+    }
+}
+
+/// 格式化片段同时写 UART 与回调 `side` 的扇出 sink
+struct FanoutSink<'a> {
+    write_raw: &'a mut dyn FnMut(&[u8]),
+    side: &'a mut dyn FnMut(&[u8]),
+}
+
+impl core::fmt::Write for FanoutSink<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        (self.write_raw)(s.as_bytes());
+        (self.side)(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// 原子输出一整行 (内容 + CRLF), 内容 = `prefix` + 格式化结果 + `suffix`。
+///
+/// 格式化片段在打印锁内同时回调 `side` (如日志落盘缓冲收集无颜色内容)。
+pub fn write_fmt_line_fanout(
+    prefix: &[u8],
+    suffix: &[u8],
+    args: core::fmt::Arguments<'_>,
+    side: &mut dyn FnMut(&[u8]),
+) {
+    let _ = with_print_lock(|write_raw| {
+        write_raw(prefix);
+        let mut sink = FanoutSink { write_raw, side };
+        let _ = core::fmt::write(&mut sink, args);
+        write_raw(suffix);
+        write_raw(b"\r\n");
+    });
+}
+
+/// 原子输出一整行 (内容 + CRLF, 由 `println!` 宏调用)
+///
+/// 内容与换行在同一把锁内完成, 任意时刻至多一个线程占用串口,
+/// 行与行之间不会交错。
+pub fn write_fmt_line(args: core::fmt::Arguments<'_>) {
+    write_fmt_line_fanout(b"", b"", args, &mut |_| {});
 }
 
 // panic/fault 诊断处理见 `panic` 模块 (输出经由 write_fmt_raw)

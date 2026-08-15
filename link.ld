@@ -1,10 +1,10 @@
 MEMORY
 {
-    /* Sectors 54..61 are reserved for the power-safe filesystem.
+    /* Sectors 46..61 are reserved for the power-safe filesystem (128KiB).
      * Sector 62 remains the destructive EFM self-test sector and sector 63
      * contains the boot-swap flag/hardware-reserved words. */
-    FLASH       (rx)  : ORIGIN = 0x00000000, LENGTH = 432K
-    FILESYSTEM  (rw)  : ORIGIN = 0x0006C000, LENGTH = 64K
+    FLASH       (rx)  : ORIGIN = 0x00000000, LENGTH = 368K
+    FILESYSTEM  (rw)  : ORIGIN = 0x0005C000, LENGTH = 128K
     OTP_DATA    (rw)  : ORIGIN = 0x03000C00, LENGTH = 960
     OTP_LOCK    (rw)  : ORIGIN = 0x03000FC0, LENGTH = 60
     RAM         (rwx) : ORIGIN = 0x1FFF8000, LENGTH = 188K

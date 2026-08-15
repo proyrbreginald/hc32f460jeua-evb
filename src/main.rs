@@ -46,6 +46,9 @@ mod uart; // USART1~4: 波特率/过采样/小数分频 + 无锁原子接收环
 // ---- 输出通道 ----
 mod console; // 控制台: 打印锁 (优先级继承) + 原子整行输出
 mod log; // 应用日志: 可开关+分级+彩色, 与内核打印分离
+mod logfile; // 日志落盘线程: RAM 缓冲 → /log/ 轮转文件
+mod logfile_core; // 日志轮转纯逻辑 (槽标记/扫描, 主机单测)
+mod logring; // 日志 RAM 缓冲 (纯逻辑, 主机单测)
 
 // ---- RTOS 内核 (RT-Thread 架构移植) ----
 mod rtos;
@@ -54,8 +57,8 @@ mod uart_rtos; // UART 的 RTOS 阻塞接收适配层
 // ---- 应用 ----
 mod banner; // 启动横幅 (依赖 clk/heap/rtos 公共状态)
 mod selftest; // 内核自检 (shell `selftest` 命令同步执行)
-mod soak; // 长期稳定性测试 (shell `soak` 命令同步执行)
 mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
+mod soak; // 长期稳定性测试 (shell `soak` 命令同步执行)
 mod zmodem; // ZMODEM 文件传输协议 (纯逻辑, 主机单测与真实 lrzsz 互通)
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -102,6 +105,16 @@ pub(crate) fn main() -> ! {
         config::APP_SHELL_PRIORITY,
         config::APP_SHELL_TIMESLICE,
         shell::shell_entry,
+        0,
+    );
+    // 日志落盘线程: 周期性把 RAM 日志缓冲写入 /log/ (文件系统经全局
+    // 互斥量与 shell 共享; 挂载完成前自动跳过)
+    rtos::thread_create(
+        "logfile",
+        config::APP_LOGFILE_STACK,
+        config::APP_LOGFILE_PRIORITY,
+        config::APP_LOGFILE_TIMESLICE,
+        logfile::logfile_entry,
         0,
     );
 

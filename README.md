@@ -40,6 +40,8 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_SHELL_HISTORY_SIZE` | RAM 中保留的历史命令条数 (1~16，默认 8，复位后清空) |
 | `CFG_NANO_COLUMNS` / `CFG_NANO_ROWS` / `CFG_NANO_MAX_BYTES` | nano 终端探测回退尺寸 / 单文件编辑上限 |
 | `CFG_LOG_ENABLE` / `CFG_LOG_LEVEL` | 应用日志默认开关 / 级别阈值 (运行时可用 `log` 命令切换) |
+| `CFG_LOG_FILE_*` / `CFG_LOG_RING` / `CFG_LOG_FLUSH_MS` | 日志落盘开关 / 单文件上限 / 轮转槽数 / RAM 缓冲 / 刷新间隔 (自动保存到 `/log/`) |
+| `CFG_APP_LOGFILE_*` | 日志落盘线程栈 / 优先级 / 时间片 |
 | `CFG_RTC_ENABLE` | RTC 与日志运行时长时间戳开关 |
 | `CFG_WDT_ENABLE` / `CFG_WDT_*` | WDT 开关 / supervisor 栈、最高优先级与喂狗周期 |
 | `CFG_MPU_ENABLE` | FLASH/SRAM/外设属性与线程栈守卫开关 |
@@ -90,6 +92,8 @@ src/
 ├── can_timing.rs      # CAN 位时序搜索与 SBT 编码 (可在主机测试)
 ├── console.rs         # 控制台: 打印锁 (优先级继承) + 原子整行输出
 ├── log.rs             # 应用日志: 分级+彩色标签, 与内核打印分离 (可开关)
+├── logring.rs         # 日志 RAM 缓冲 (纯逻辑, 满时丢最旧, 主机单测)
+├── logfile.rs         # 日志落盘线程: RAM 缓冲 → /log/ 轮转文件
 ├── shell.rs           # 登录、命令注册与文件系统命令
 ├── zmodem.rs          # ZMODEM 协议 (帧/FCS/转义/收发会话, 参考 lrzsz)
 ├── shell/
@@ -235,9 +239,12 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
   写事务返回设备错误后必须 remount，防止继续使用不确定的内存 generation；
 - 不支持递归删除、隐式创建父目录、随机写、打开句柄、符号链接、属性、
   权限、时间戳、坏块迁移和静态磨损均衡；
-- 预留扇区 54~61 (`0x6C000..0x7BFFF`, 64KiB)，旧/新快照必须共存，
-  因而单个序列化快照最多占 4 个扇区，可用容量略小于 32KiB；完整快照会
-  放大写入，适合小型配置/状态文件，不适合高频大日志。
+- 预留扇区 46~61 (`0x5C000..0x7BFFF`, 128KiB)，旧/新快照必须共存，
+  因而单个序列化快照最多占 8 个扇区，可用容量略小于 64KiB；完整快照会
+  放大写入，适合小型配置/状态文件与轮转日志，不适合高频大日志;
+- 快照头记录分区几何 (块数/块大小), 磁盘格式随分区大小变化: 从 64KiB
+  分区升级到 128KiB 后, 旧快照因几何不符不会自动挂载, 需手动
+  `mkfs --force` 重建 (旧数据保留现场, 不会被自动破坏)。
 
 磁盘格式、提交顺序与安全论证见
 [`crates/littlefs/DESIGN.md`](crates/littlefs/DESIGN.md)。主机模拟 NOR 会在
@@ -249,14 +256,16 @@ HC32F460 三级中断架构 (对齐 DDL `hc32_ll_interrupts.c`):
 cargo test --workspace --target x86_64-unknown-linux-gnu
 ```
 
-真机适配 `filesystem::InternalFlash` 是唯一所有权 token，检查相对分区、
-4B 对齐、目标全擦除，并对每次 program/erase 做完整回读。它依赖已初始化的
-时钟、MPU 与 EFM，不能在 ISR 或硬实时路径调用（单扇区擦除最长约 20ms）。
-默认配置下 Shell 是最高优先级应用线程，上电首次运行时调用
-`filesystem::start`，并在该线程局部长期持有唯一实例：已有有效快照时只读
-挂载；整个 64KiB 分区全为擦除态时自动创建空文件系统；分区含数据但无有效
-快照时保留现场并保持未挂载，不会把损坏误判成首次使用。此时检查后可显式
-执行 `mkfs --force`。
+真机适配 `filesystem::InternalFlash` 检查相对分区、4B 对齐、目标全擦除，
+并对每次 program/erase 做完整回读。它依赖已初始化的时钟、MPU 与 EFM，
+不能在 ISR 或硬实时路径调用（单扇区擦除最长约 20ms）。挂载后的文件系统
+实例存放在全局 `Mutex<Option<FileSystem>>`（优先级继承），shell 命令与
+日志落盘线程 (`logfile`) 分时独占；`InternalFlash` 的 `!Send` 标记经一处
+带安全契约的 `unsafe impl Send` 放宽（所有访问经互斥量串行化，中断上下文
+被阻塞检测拒绝，单核临界区保证一致性）。已有有效快照时只读挂载；整个
+128KiB 分区全为擦除态时自动创建空文件系统；分区含数据但无有效快照时保留
+现场并保持未挂载，不会把损坏误判成首次使用。此时检查后可显式执行
+`mkfs --force`。
 
 常用 Shell 命令：
 
@@ -288,7 +297,7 @@ Shell 当前路径默认为根目录 `/`；以 `/` 开头的是绝对路径，�
 在根目录。文件/目录移动后若当前路径位于被移动的目录树中，提示符会同步
 更新；`rmdir` 会拒绝删除当前目录或其祖先。Shell 命令输入仅接受 ASCII，
 非 ASCII 或超过默认 128B 上限的命令会整行拒绝，不会静默改写或截断执行；
-`write` 面向短单行文本，文件系统本身仍支持约 32KiB 快照。每个变更命令
+`write` 面向短单行文本，文件系统本身仍支持约 64KiB 快照。每个变更命令
 成功返回时已经完成同步和回读，无需额外 `sync` 命令。
 
 普通命令输入时可用方向键上/下浏览历史；首次向上前的未提交输入会作为
@@ -322,7 +331,7 @@ Rust 模块, 零硬件依赖; 与主机 lrzsz 工具经串口互通:
   CRC32, 兼容 `sz -o` 的 16 位模式);
 - **接收** `rz`: 板端周期性发送 ZRINIT 等待主机, 主机侧执行
   `sz <文件>`; 整文件先缓存在 RAM (上限 `CFG_ZMODEM_RX_MAX`, 默认
-  32KiB, 快照文件系统要求整文件原子写入), 完整接收后经 CRC 校验与
+  64KiB, 快照文件系统要求整文件原子写入), 完整接收后经 CRC 校验与
   FCS 残差校验后原子落盘; 超过上限或文件系统剩余容量不足的文件发送
   ZSKIP 跳过, 会话继续;
 - **帧级实现与 lrzsz 逐条对齐**: 十六进制/二进制 (16/32 位 FCS) 头,
@@ -548,7 +557,7 @@ fn use_ipc() -> Result<(), Error> {
 ## 构建 / 烧录 / 调试
 
 目标: `thumbv7em-none-eabihf`,自定义链接脚本 `link.ld`
-(固件 FLASH 432K + 文件系统 64K + 自检/交换保留 16K；RAM 188K、8K 主栈、
+(固件 FLASH 368K + 文件系统 128K + 自检/交换保留 16K；RAM 188K、8K 主栈、
 `.heap` 段)。链接断言保证固件不会增长覆盖文件系统分区。
 
 ```bash
@@ -603,15 +612,59 @@ continue
 - **分层**: 内核打印 (启动横幅/panic 诊断/shell 输出, 经 console 打印锁)
   **无论如何都输出**; 应用日志是可选层, 输出与否 = (全局开关 × 级别阈值);
 - **级别与色彩**: `error`(红) / `warn`(黄) / `info`(绿) / `debug`(青) /
-  `trace`(白), 彩色标签 `[ERR]`~`[TRC]`, 整行原子输出 (不交错);
+  `trace`(白), 整行按级别着色 (`[ERR]`~`[TRC]` 标签), 整行原子输出 (不交错);
+  落盘文件为无颜色纯文本;
 - **宏**: `log_error!` / `log_warn!` / `log_info!` / `log_debug!` /
   `log_trace!` (线程上下文使用, 与 `println!` 同约束);
 - **默认值来自配置**: `CFG_LOG_ENABLE` (默认开启) + `CFG_LOG_LEVEL`
   (默认 `info`, 输出 ≤ 阈值的级别); 非法值编译期报错;
+- **自动落盘** (`logfile` 线程, 见下文): 每条日志同时以无颜色格式追加
+  到 RAM 缓冲 (`src/logring.rs`, 容量 `CFG_LOG_RING`, 满时丢弃最旧),
+  由日志落盘线程周期性写入 `/log/logN.log`;
 - **运行时控制** (shell 命令, 重启后恢复配置默认):
-  - `log` — 显示当前开关与级别;
+  - `log` — 显示当前开关、级别与落盘状态;
   - `log on` / `log off` — 切换日志开关;
-  - `log level error|warn|info|debug|trace` — 调整级别阈值。
+  - `log level error|warn|info|debug|trace` — 调整级别阈值;
+  - `log file` / `log file on` / `log file off` — 查看/切换日志落盘。
+
+### 日志自动保存 (logfile)
+
+日志除终端输出外**自动保存到文件系统 `/log/` 目录** (`src/logfile.rs`):
+
+- **单次格式化扇出**: 每条日志只做**一次** `core::fmt::write`, 控制台
+  (整行着色) 与 RAM 落盘缓冲 (无颜色纯文本) 在打印锁内经同一格式化流
+  同时输出 (`console::write_fmt_line_fanout` 的 `side` 回调 + 环条目
+  句柄 `EntryMark` 增量构建), 不再双次格式化;
+- **零中间分配落盘**: 独立 `logfile` 线程 (优先级
+  `CFG_APP_LOGFILE_PRIORITY`) 每 `CFG_LOG_FLUSH_MS` 唤醒一次, 把 RAM
+  缓冲**直接排空进文件镜像** (镜像常驻内存复用), 整文件原子写
+  `/log/`; 缓冲为空时零 Flash 写入;
+- **文件名严格有序**: 文件名为 `boot_<序号>[_<段号>].log`, 序号为
+  **u64 单调递增** (20 位零填充), 每次启动 = 上次各文件最大序号 + 1 ——
+  **字典序即时间序, 后续生成的文件保证严格有序**, 无需读内容即可判断
+  新旧 (`ls` 直接按时间排列); 镜像超过 `CFG_LOG_FILE_MAX` (默认 4KiB)
+  时段号 +1 另起文件;
+- **跨重启不覆盖**: 保留最近 `CFG_LOG_FILE_SLOTS` (默认 4) 个文件,
+  超预算时删除最旧 `(序号, 段号)` —— 普通重启**不会**覆盖上次日志,
+  只有文件数超过预算才淘汰最旧; 旧版本固件的 `logN.log` 识别为最旧并
+  最终淘汰, 迁移不破坏历史;
+- **reboot 先落盘**: shell `reboot` 命令复位前先同步执行一次
+  `logfile::flush_now()` (记录 "系统重启" 日志并排空缓冲), 再触发复位;
+  日志线程与 reboot 的刷新经文件系统互斥量 + 落盘状态锁串行化, 不会
+  互相覆盖;
+- **共享文件系统**: 快照文件系统的实例移入全局
+  `Mutex<Option<FileSystem>>` (优先级继承), shell 命令与 logfile 线程
+  分时独占; `InternalFlash` 的 `!Send` 标记经一处带安全契约的
+  `unsafe impl Send` 放宽 (所有访问经互斥量串行化, 中断上下文被阻塞
+  检测拒绝, 单核临界区保证一致性);
+- **写放大与磨损**: 快照文件系统每次提交重写整个快照, 因此仅当缓冲有
+  日志时才落盘 (空闲零 Flash 写入), 刷新间隔不宜过小 (`CFG_LOG_FLUSH_MS`
+  默认 2s); 文件系统空间不足时自动删除最旧日志文件后重试;
+- **掉电窗口**: 非 `reboot` 路径的掉电/复位最多丢失最近一个刷新间隔 +
+  RAM 缓冲内的日志 (ring 容量 `CFG_LOG_RING`, 默认 4KiB); panic/fault
+  诊断仍只走控制台 (Flash 写入在异常上下文有风险);
+- 查看: `cat /log/boot_00000000000000000001.log` (文件名即启动批次,
+  字典序即时间序)。
 
 ### 终端 (仿 Ubuntu shell)
 

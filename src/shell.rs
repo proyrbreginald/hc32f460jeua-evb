@@ -211,9 +211,9 @@ impl PendingRx {
 
 type FsError = littlefs::Error<crate::filesystem::FlashError>;
 
-/// Shell-owned filesystem state. The Flash token never leaves this thread.
+/// Shell 会话状态。文件系统实例不在此持有 —— 见 [`crate::filesystem`]
+/// 的全局互斥共享模型 (shell 命令与日志落盘线程分时独占)。
 struct ShellState {
-    filesystem: Option<crate::filesystem::FileSystem>,
     last_mount_error: Option<FsError>,
     pending_rx: PendingRx,
     history: CommandHistory,
@@ -223,25 +223,25 @@ struct ShellState {
 impl ShellState {
     fn start() -> Self {
         match crate::filesystem::start(crate::board::BoardResources::get()) {
-            Ok(crate::filesystem::Startup::Mounted(filesystem)) => {
-                let info = filesystem.info();
-                crate::log_info!(
-                    "文件系统已挂载: generation={}, 条目={} 个",
-                    info.generation,
-                    info.entry_count
-                );
+            Ok(crate::filesystem::Startup::Mounted) => {
+                if let Some(filesystem) = crate::filesystem::mounted() {
+                    let info = filesystem.info();
+                    crate::log_info!(
+                        "文件系统已挂载: generation={}, 条目={} 个",
+                        info.generation,
+                        info.entry_count
+                    );
+                }
                 Self {
-                    filesystem: Some(filesystem),
                     last_mount_error: None,
                     pending_rx: PendingRx::new(),
                     history: CommandHistory::new(),
                     cwd: ShellPath::root(),
                 }
             }
-            Ok(crate::filesystem::Startup::Formatted(filesystem)) => {
+            Ok(crate::filesystem::Startup::Formatted) => {
                 crate::log_info!("文件系统分区为空，已创建并挂载空文件系统");
                 Self {
-                    filesystem: Some(filesystem),
                     last_mount_error: None,
                     pending_rx: PendingRx::new(),
                     history: CommandHistory::new(),
@@ -256,7 +256,6 @@ impl ShellState {
                     _ => crate::log_error!("文件系统挂载失败: {:?}", error),
                 }
                 Self {
-                    filesystem: None,
                     last_mount_error: Some(error),
                     pending_rx: PendingRx::new(),
                     history: CommandHistory::new(),
@@ -267,10 +266,8 @@ impl ShellState {
     }
 
     fn remount(&mut self) -> bool {
-        drop(self.filesystem.take());
-        match crate::filesystem::mount(crate::board::BoardResources::get()) {
-            Ok(filesystem) => {
-                self.filesystem = Some(filesystem);
+        match crate::filesystem::remount() {
+            Ok(()) => {
                 self.last_mount_error = None;
                 self.cwd = ShellPath::root();
                 true
@@ -283,13 +280,20 @@ impl ShellState {
     }
 
     fn format_unmounted(&mut self) -> bool {
-        debug_assert!(self.filesystem.is_none());
-        match crate::filesystem::format(crate::board::BoardResources::get()) {
+        match crate::filesystem::format() {
             Ok(filesystem) => {
-                self.filesystem = Some(filesystem);
-                self.last_mount_error = None;
-                self.cwd = ShellPath::root();
-                true
+                drop(filesystem); // 丢弃实例并释放 token 后重新挂载到全局槽
+                match crate::filesystem::remount() {
+                    Ok(()) => {
+                        self.last_mount_error = None;
+                        self.cwd = ShellPath::root();
+                        true
+                    }
+                    Err(error) => {
+                        self.last_mount_error = Some(error);
+                        false
+                    }
+                }
             }
             Err(error) => {
                 self.last_mount_error = Some(error);
@@ -364,8 +368,18 @@ static COMMANDS: &[Command] = &[
         cmd_write,
     ),
     cmd("nano", &[], "全屏编辑: nano <文件>", cmd_nano),
-    cmd("sz", &[], "发送文件 (ZMODEM): sz <文件> [文件...]", zmodem::cmd_sz),
-    cmd("rz", &[], "接收文件 (ZMODEM): rz (主机执行 sz)", zmodem::cmd_rz),
+    cmd(
+        "sz",
+        &[],
+        "发送文件 (ZMODEM): sz <文件> [文件...]",
+        zmodem::cmd_sz,
+    ),
+    cmd(
+        "rz",
+        &[],
+        "接收文件 (ZMODEM): rz (主机执行 sz)",
+        zmodem::cmd_rz,
+    ),
     cmd("rm", &[], "删除文件: rm <文件>", cmd_rm),
     cmd("mv", &[], "原子移动: mv <旧路径> <新路径>", cmd_mv),
     cmd("stat", &[], "路径信息: stat <路径>", cmd_stat),
@@ -375,8 +389,18 @@ static COMMANDS: &[Command] = &[
     cmd("mkfs", &[], "清空文件系统: mkfs --force", cmd_mkfs),
     cmd("led", &[], "板载 LED on|off", cmd_led),
     cmd("selftest", &[], "自检: selftest [all|can]", cmd_selftest),
-    cmd("soak", &[], "长稳测试: soak [分钟] [压力项|场景] (0=直到ESC)", cmd_soak),
-    cmd("log", &[], "日志开关/级别 (on|off|level <级>)", cmd_log),
+    cmd(
+        "soak",
+        &[],
+        "长稳测试: soak [分钟] [压力项|场景] (0=直到ESC)",
+        cmd_soak,
+    ),
+    cmd(
+        "log",
+        &[],
+        "日志开关/级别/落盘 (on|off|level <级>|file [on|off])",
+        cmd_log,
+    ),
     cmd("clear", &[], "清屏", cmd_clear),
     cmd("whoami", &[], "当前用户", cmd_whoami),
     cmd("reboot", &[], "软复位重启", cmd_reboot),
@@ -574,7 +598,7 @@ fn cmd_sysinfo(state: &mut ShellState, _rest: &str) -> CmdResult {
             env!("RTOS_RUSTC")
         ),
     );
-    match state.filesystem.as_ref() {
+    match crate::filesystem::mounted() {
         Some(filesystem) => {
             let info = filesystem.info();
             sysinfo_line(
@@ -736,13 +760,16 @@ fn cmd_sysinfo(state: &mut ShellState, _rest: &str) -> CmdResult {
     sysinfo_line(
         "线程",
         format_args!(
-            "led P{} T{} {}B | shell P{} T{} {}B",
+            "led P{} T{} {}B | shell P{} T{} {}B | logfile P{} T{} {}B",
             config::APP_LED_PRIORITY,
             config::APP_LED_TIMESLICE,
             config::APP_LED_STACK,
             config::APP_SHELL_PRIORITY,
             config::APP_SHELL_TIMESLICE,
-            config::APP_SHELL_STACK
+            config::APP_SHELL_STACK,
+            config::APP_LOGFILE_PRIORITY,
+            config::APP_LOGFILE_TIMESLICE,
+            config::APP_LOGFILE_STACK
         ),
     );
     CmdResult::Ok
@@ -875,7 +902,7 @@ fn cmd_cd(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(path) = resolve_path(state, "cd", input) else {
         return CmdResult::Ok;
     };
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
     match filesystem.stat(path.as_key()) {
@@ -894,10 +921,12 @@ fn cmd_mkdir(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(path) = resolve_path(state, "mkdir", input) else {
         return CmdResult::Ok;
     };
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
-    match filesystem.mkdir(path.as_key()) {
+    let result = filesystem.mkdir(path.as_key());
+    drop(filesystem); // 释放文件系统锁, 允许 report_mutation_error 重新挂载
+    match result {
         Ok(()) => println!("{}: 目录已创建", path),
         Err(error) => report_mutation_error(state, "mkdir", error),
     }
@@ -916,10 +945,12 @@ fn cmd_rmdir(state: &mut ShellState, rest: &str) -> CmdResult {
         println!("rmdir: 不能删除当前目录或其祖先: {}", path);
         return CmdResult::Ok;
     }
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
-    match filesystem.rmdir(path.as_key()) {
+    let result = filesystem.rmdir(path.as_key());
+    drop(filesystem); // 释放文件系统锁, 允许 report_mutation_error 重新挂载
+    match result {
         Ok(()) => println!("{}: 目录已删除", path),
         Err(error) => report_mutation_error(state, "rmdir", error),
     }
@@ -992,20 +1023,19 @@ fn print_mount_error(state: &ShellState, operation: &str) {
     }
 }
 
-fn mounted_filesystem(state: &mut ShellState) -> Option<&mut crate::filesystem::FileSystem> {
-    if state.filesystem.is_none() {
+fn mounted_filesystem(state: &ShellState) -> Option<crate::filesystem::MountGuard> {
+    let Some(filesystem) = crate::filesystem::mounted() else {
         print_mount_error(state, "文件系统");
         return None;
-    }
-    state.filesystem.as_mut()
+    };
+    Some(filesystem)
 }
 
 fn report_mutation_error(state: &mut ShellState, operation: &str, error: FsError) {
     print_fs_error(operation, &error);
-    let recovery_required = state
-        .filesystem
-        .as_ref()
-        .is_some_and(littlefs::FileSystem::recovery_required);
+    let recovery_required = crate::filesystem::mounted()
+        .map(|filesystem| filesystem.recovery_required())
+        .unwrap_or(false);
     if !recovery_required {
         return;
     }
@@ -1031,7 +1061,7 @@ fn cmd_ls(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(path) = resolve_path(state, "ls", input) else {
         return CmdResult::Ok;
     };
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
     let info = match filesystem.stat(path.as_key()) {
@@ -1093,7 +1123,7 @@ fn cmd_cat(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(path) = resolve_path(state, "cat", input) else {
         return CmdResult::Ok;
     };
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
     if let Err(error) = filesystem.verify() {
@@ -1148,10 +1178,11 @@ fn cmd_write(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(path) = resolve_path(state, "write", input) else {
         return CmdResult::Ok;
     };
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
     let result = filesystem.write(path.as_key(), text.as_bytes());
+    drop(filesystem); // 释放文件系统锁, 允许 report_mutation_error 重新挂载
     match result {
         Ok(()) => println!("{}: 已持久化 {} B", path, text.len()),
         Err(error) => report_mutation_error(state, "write", error),
@@ -1179,10 +1210,11 @@ fn cmd_rm(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(path) = resolve_path(state, "rm", input) else {
         return CmdResult::Ok;
     };
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
     let result = filesystem.remove(path.as_key());
+    drop(filesystem); // 释放文件系统锁, 允许 report_mutation_error 重新挂载
     match result {
         Ok(()) => println!("{}: 已删除", path),
         Err(error) => report_mutation_error(state, "rm", error),
@@ -1201,7 +1233,7 @@ fn cmd_mv(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(new_path) = resolve_path(state, "mv", new_input) else {
         return CmdResult::Ok;
     };
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
     let source_kind = match filesystem.stat(old_path.as_key()) {
@@ -1212,6 +1244,7 @@ fn cmd_mv(state: &mut ShellState, rest: &str) -> CmdResult {
         }
     };
     let result = filesystem.rename(old_path.as_key(), new_path.as_key());
+    drop(filesystem); // 释放文件系统锁, 允许 report_mutation_error 重新挂载
     match result {
         Ok(()) => {
             if source_kind == littlefs::EntryKind::Directory
@@ -1234,7 +1267,7 @@ fn cmd_stat(state: &mut ShellState, rest: &str) -> CmdResult {
     let Some(path) = resolve_path(state, "stat", input) else {
         return CmdResult::Ok;
     };
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
     match filesystem.stat(path.as_key()) {
@@ -1262,7 +1295,7 @@ fn cmd_df(state: &mut ShellState, rest: &str) -> CmdResult {
         println!("用法: df");
         return CmdResult::Ok;
     }
-    let Some(filesystem) = state.filesystem.as_ref() else {
+    let Some(filesystem) = crate::filesystem::mounted() else {
         print_mount_error(state, "df");
         return CmdResult::Ok;
     };
@@ -1295,7 +1328,7 @@ fn cmd_fsck(state: &mut ShellState, rest: &str) -> CmdResult {
         println!("用法: fsck");
         return CmdResult::Ok;
     }
-    let Some(filesystem) = mounted_filesystem(state) else {
+    let Some(mut filesystem) = mounted_filesystem(state) else {
         return CmdResult::Ok;
     };
     match filesystem.verify() {
@@ -1311,7 +1344,7 @@ fn cmd_mount(state: &mut ShellState, rest: &str) -> CmdResult {
         return CmdResult::Ok;
     }
     if state.remount() {
-        let info = state.filesystem.as_ref().unwrap().info();
+        let info = crate::filesystem::mounted().unwrap().info();
         println!(
             "文件系统已挂载: generation={}, 条目={} 个",
             info.generation, info.entry_count
@@ -1329,8 +1362,9 @@ fn cmd_mkfs(state: &mut ShellState, rest: &str) -> CmdResult {
         return CmdResult::Ok;
     }
 
-    if let Some(filesystem) = state.filesystem.as_mut() {
+    if let Some(mut filesystem) = crate::filesystem::mounted() {
         let result = filesystem.clear();
+        drop(filesystem); // 释放文件系统锁, 允许 report_mutation_error 重新挂载
         match result {
             Ok(()) => {
                 state.cwd = ShellPath::root();
@@ -1404,6 +1438,9 @@ fn cmd_whoami(_state: &mut ShellState, _rest: &str) -> CmdResult {
 /// 软复位 (AIRCR.SYSRESETREQ)
 fn cmd_reboot(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("rebooting...");
+    // 先把缓冲中的日志同步落盘, 再复位 (日志线程周期刷新之外的最后一次)
+    crate::log_info!("系统重启: shell reboot 命令");
+    crate::logfile::flush_now();
     crate::rtos::thread_delay_ms(50).expect("shell 延时必须在线程上下文");
     crate::arch::system_reset()
 }
@@ -1421,13 +1458,14 @@ fn cmd_log(_state: &mut ShellState, rest: &str) -> CmdResult {
     let mut words = rest.split_whitespace();
     match words.next() {
         None => println!(
-            "日志: {} (级别阈值 = {})",
+            "日志: {} (级别阈值 = {}, 落盘 = {})",
             if crate::log::enabled() {
                 "开启"
             } else {
                 "关闭"
             },
-            crate::log::level().name()
+            crate::log::level().name(),
+            file_status()
         ),
         Some("on") => {
             crate::log::set_enabled(true);
@@ -1444,9 +1482,33 @@ fn cmd_log(_state: &mut ShellState, rest: &str) -> CmdResult {
             }
             None => println!("用法: log level error|warn|info|debug|trace"),
         },
-        Some(_) => println!("用法: log [on|off|level <error|warn|info|debug|trace>]"),
+        Some("file") => match words.next() {
+            None => println!(
+                "日志落盘: {} (待写入 {} B)",
+                file_status(),
+                crate::log::pending_bytes()
+            ),
+            Some("on") => {
+                crate::log::set_file_enabled(true);
+                println!("日志落盘已开启 (/log/)");
+            }
+            Some("off") => {
+                crate::log::set_file_enabled(false);
+                println!("日志落盘已关闭");
+            }
+            Some(_) => println!("用法: log file [on|off]"),
+        },
+        Some(_) => println!("用法: log [on|off|level <error|warn|info|debug|trace>|file [on|off]]"),
     }
     CmdResult::Ok
+}
+
+fn file_status() -> &'static str {
+    if crate::log::file_enabled() {
+        "开启"
+    } else {
+        "关闭"
+    }
 }
 
 fn read_pending_timeout<const U: u8>(

@@ -222,14 +222,16 @@ impl Worker {
         self.fail_time.store(0, Ordering::Relaxed);
         // 初始化为当前运行时刻: 监控器按"距上次心跳的间隔"判定停滞,
         // 新线程尚未跑第一轮前不应被误判为挂起
-        self.last_beat.store(crate::rtos::uptime_ms(), Ordering::Relaxed);
+        self.last_beat
+            .store(crate::rtos::uptime_ms(), Ordering::Relaxed);
         self.active.store(false, Ordering::Relaxed);
     }
 
     /// 心跳: 每轮循环调用, 供监控器判定"线程是否活着"
     fn beat(&self) {
         self.cycles.fetch_add(1, Ordering::Relaxed);
-        self.last_beat.store(crate::rtos::uptime_ms(), Ordering::Relaxed);
+        self.last_beat
+            .store(crate::rtos::uptime_ms(), Ordering::Relaxed);
     }
 
     /// 记录错误并**立即输出失败日志** (console 整行原子输出, 不与其他
@@ -243,7 +245,8 @@ impl Worker {
             self.last_error.store(err as u32, Ordering::Relaxed);
             self.fail_cycle
                 .store(self.cycles.load(Ordering::Relaxed), Ordering::Relaxed);
-            self.fail_time.store(crate::rtos::uptime_ms(), Ordering::Relaxed);
+            self.fail_time
+                .store(crate::rtos::uptime_ms(), Ordering::Relaxed);
             let elapsed =
                 crate::rtos::uptime_ms().wrapping_sub(SOAK_START_MS.load(Ordering::Relaxed));
             crate::log_error!(
@@ -430,7 +433,11 @@ extern "C" fn sem_worker(param: usize) {
 /// 校验值始终为 10 的倍数 + 单调不减, 最终值 == Σ(增量×次数)
 extern "C" fn mtx_worker(param: usize) {
     let w = &WORKERS[param];
-    let slot = if param == WorkerId::MtxA.index() { 0 } else { 1 };
+    let slot = if param == WorkerId::MtxA.index() {
+        0
+    } else {
+        1
+    };
     let add = if slot == 0 { 10u64 } else { 20u64 };
     let mut last = 0u64;
     while !STOP.load(Ordering::Relaxed) {
@@ -568,8 +575,7 @@ extern "C" fn mq_consumer(param: usize) {
         match SOAK_MQ.recv(&mut msg, Timeout::Ticks(1000)) {
             Ok(8) => {
                 let seq = u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]);
-                let chk =
-                    (msg[0..7].iter().fold(0u8, |a, b| a.wrapping_add(*b))).wrapping_mul(31);
+                let chk = (msg[0..7].iter().fold(0u8, |a, b| a.wrapping_add(*b))).wrapping_mul(31);
                 if msg[0] != 0x52 || msg[5] != 0xA5 || msg[6] != 0x5A || msg[7] != chk {
                     w.fail(SoakError::Data);
                     break;
@@ -702,9 +708,7 @@ extern "C" fn thread_worker(param: usize) {
         let mut stale = true;
         if ran {
             let start = crate::rtos::uptime_ms();
-            while crate::rtos::uptime_ms().wrapping_sub(start)
-                < crate::config::SOAK_HANG_GRACE_MS
-            {
+            while crate::rtos::uptime_ms().wrapping_sub(start) < crate::config::SOAK_HANG_GRACE_MS {
                 let gone = !crate::rtos::thread_info_list()
                     .iter()
                     .any(|t| t.name == "soak-tmp");
@@ -818,8 +822,7 @@ extern "C" fn delay_worker(param: usize) {
         // 最坏值 (CAS 循环)
         let mut max = DELAY_MAX.load(Ordering::Relaxed);
         while over > max {
-            match DELAY_MAX.compare_exchange_weak(max, over, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match DELAY_MAX.compare_exchange_weak(max, over, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => break,
                 Err(observed) => max = observed,
             }
@@ -901,8 +904,11 @@ extern "C" fn crc_worker(param: usize) {
             s = xorshift(s);
             *b = s as u8;
         }
-        let hw =
-            crate::crc::calculate(&buf[..len], crate::crc::DataWidth::Byte, crate::crc::Config::crc32());
+        let hw = crate::crc::calculate(
+            &buf[..len],
+            crate::crc::DataWidth::Byte,
+            crate::crc::Config::crc32(),
+        );
         let sw = soft_crc32(&buf[..len]);
         if hw != sw {
             w.fail(SoakError::Crc);
@@ -911,11 +917,9 @@ extern "C" fn crc_worker(param: usize) {
         // 周期性核对标准向量
         if w.cycles.load(Ordering::Relaxed).is_multiple_of(64) {
             let v: &[u8] = b"123456789";
-            let ok = crate::crc::calculate(
-                v,
-                crate::crc::DataWidth::Byte,
-                crate::crc::Config::crc32(),
-            ) == 0xCBF4_3926;
+            let ok =
+                crate::crc::calculate(v, crate::crc::DataWidth::Byte, crate::crc::Config::crc32())
+                    == 0xCBF4_3926;
             if !ok {
                 w.fail(SoakError::Crc);
                 break;
@@ -971,20 +975,21 @@ extern "C" fn can_worker(param: usize) {
     let xtal_was_enabled = crate::clk::xtal_enabled();
     let mut ok = true;
 
-    if can.init(crate::can::Config {
-        mode: crate::can::WorkMode::InternalLoopback,
-        filters: &SOAK_CAN_FILTERS,
-        self_ack: false,
-        ptb_single_shot: false,
-        stb_single_shot: false,
-        stb_priority: crate::can::StbPriority::Fifo,
-        rx_warn_limit: 10,
-        rx_all_frames: false,
-        rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
-        interrupts: crate::can::Interrupts::ALL,
-        ..crate::config::CAN_CONFIG
-    })
-    .is_err()
+    if can
+        .init(crate::can::Config {
+            mode: crate::can::WorkMode::InternalLoopback,
+            filters: &SOAK_CAN_FILTERS,
+            self_ack: false,
+            ptb_single_shot: false,
+            stb_single_shot: false,
+            stb_priority: crate::can::StbPriority::Fifo,
+            rx_warn_limit: 10,
+            rx_all_frames: false,
+            rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
+            interrupts: crate::can::Interrupts::ALL,
+            ..crate::config::CAN_CONFIG
+        })
+        .is_err()
     {
         ok = false;
     } else {
@@ -1003,8 +1008,7 @@ extern "C" fn can_worker(param: usize) {
                 0x00,
                 0x52,
             ];
-            let frame =
-                crate::can::TxFrame::data(crate::can::Id::Standard(0x100), 8, payload);
+            let frame = crate::can::TxFrame::data(crate::can::Id::Standard(0x100), 8, payload);
             let (buf, is_stb) = if seq & 1 == 0 {
                 (crate::can::TxBuffer::Primary, false)
             } else {
@@ -1233,7 +1237,9 @@ pub(crate) fn run(args: &str) {
             spec.entry,
             spec.id.index(),
         );
-        WORKERS[spec.id.index()].active.store(true, Ordering::Relaxed);
+        WORKERS[spec.id.index()]
+            .active
+            .store(true, Ordering::Relaxed);
         spawned.push(spec.id);
         crate::log_info!(
             "[soak] 压力线程 {} 已启动: 优先级 {}, 栈 {}B",
@@ -1286,9 +1292,7 @@ pub(crate) fn run(args: &str) {
         for &id in &spawned {
             let w = &WORKERS[id.index()];
             let idle = now.wrapping_sub(w.last_beat.load(Ordering::Relaxed));
-            if w.active.load(Ordering::Relaxed)
-                && idle > crate::config::SOAK_HANG_GRACE_MS
-            {
+            if w.active.load(Ordering::Relaxed) && idle > crate::config::SOAK_HANG_GRACE_MS {
                 crate::log_warn!(
                     "[soak] {} 心跳停滞 {}ms (超过宽限 {}ms), 判挂起",
                     w.name,
@@ -1371,10 +1375,7 @@ pub(crate) fn run(args: &str) {
     let wait_start = crate::rtos::uptime_ms();
     loop {
         let all_gone = !crate::rtos::thread_info_list().iter().any(|t| {
-            t.name == "soak-tmp"
-                || spawned
-                    .iter()
-                    .any(|&id| WORKERS[id.index()].name == t.name)
+            t.name == "soak-tmp" || spawned.iter().any(|&id| WORKERS[id.index()].name == t.name)
         });
         if all_gone {
             break;
@@ -1412,7 +1413,14 @@ pub(crate) fn run(args: &str) {
         fmt_elapsed(elapsed),
         stop_reason
     );
-    crate::println!("[soak] 结果: {}", if pass { "PASS — 请放心使用" } else { "FAIL" });
+    crate::println!(
+        "[soak] 结果: {}",
+        if pass {
+            "PASS — 请放心使用"
+        } else {
+            "FAIL"
+        }
+    );
     crate::println!(
         "[soak]   压力线程 {} 个: 总错误 {}, SRAM 奇偶/ECC 错误 {}",
         spawned.len(),
@@ -1465,7 +1473,11 @@ pub(crate) fn run(args: &str) {
         heap_base,
         peak_heap,
         heap_end,
-        if net_growth <= 2048 { " (无泄漏)" } else { " (泄漏!)" }
+        if net_growth <= 2048 {
+            " (无泄漏)"
+        } else {
+            " (泄漏!)"
+        }
     );
     if hours >= 0.01 {
         crate::println!(
@@ -1482,11 +1494,19 @@ pub(crate) fn run(args: &str) {
         "[soak]   线程: 基线 {} → 结束 {}{}",
         thread_base,
         thread_end,
-        if thread_end == thread_base { " (无泄漏)" } else { " (泄漏!)" }
+        if thread_end == thread_base {
+            " (无泄漏)"
+        } else {
+            " (泄漏!)"
+        }
     );
     crate::println!(
         "[soak]   互斥量最终值校验: {}",
-        if mtx_ok { "通过 (无丢失更新)" } else { "失败 (丢失更新/损坏!)" }
+        if mtx_ok {
+            "通过 (无丢失更新)"
+        } else {
+            "失败 (丢失更新/损坏!)"
+        }
     );
     // 调度延迟分布 (实时性证据: 分位数 + 最坏值)
     let samples = DELAY_SAMPLES.load(Ordering::Relaxed);

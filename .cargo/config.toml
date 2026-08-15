@@ -118,16 +118,26 @@ CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,r
 # [nano] 轻量全屏文本编辑器 (ASCII, ANSI 终端; 行列为自动探测失败时的回退值)
 CFG_NANO_COLUMNS = "80"
 CFG_NANO_ROWS = "24"
-CFG_NANO_MAX_BYTES = "16384"
+CFG_NANO_MAX_BYTES = "16384"      # 单文件编辑上限 (≤ 65472 = 快照容量)
 
 # [zmodem] ZMODEM 文件传输 (shell `sz` 发送 / `rz` 接收)
 CFG_ZMODEM_TIMEOUT_MS = "10000"   # 帧/字节间等待超时 (毫秒, 对齐 lrzsz 默认 10s)
 CFG_ZMODEM_SUBPACKET = "1024"     # 发送子包长度 (字节, 32~1024)
-CFG_ZMODEM_RX_MAX = "32704"       # 接收文件大小上限 (字节, 快照文件系统整文件缓存)
+CFG_ZMODEM_RX_MAX = "65472"       # 接收文件大小上限 (字节, 快照容量 64KiB 减去开销)
 
 # [log] 应用日志 (可开关+分级+彩色, 与内核打印分离)
 CFG_LOG_ENABLE = "true" # 日志默认开关 (运行时可用 shell `log on|off` 切换)
 CFG_LOG_LEVEL = "info"  # 默认级别阈值 error/warn/info/debug/trace (输出 ≤ 阈值)
+
+# [logfile] 日志自动保存到 /log/ (shell `log file on|off` 可运行时切换)
+CFG_LOG_FILE_ENABLE = "true"   # 落盘开关
+CFG_LOG_RING = "4096"          # RAM 日志缓冲 (字节; 满时丢最旧, 掉电丢失)
+CFG_LOG_FILE_MAX = "4096"      # 单个日志文件上限 (字节; 超出则写入下一段文件)
+CFG_LOG_FILE_SLOTS = "4"       # 保留的日志文件数 (boot_<序号>[_<段号>].log)
+CFG_LOG_FLUSH_MS = "2000"      # 落盘线程刷新间隔 (毫秒; 越小越费 Flash)
+CFG_APP_LOGFILE_STACK = "8192" # 落盘线程栈 (与 shell 同级: 文件系统写 + 格式化较深)
+CFG_APP_LOGFILE_PRIORITY = "3" # 低于 shell(1)/led(2), 高于 idle(31)
+CFG_APP_LOGFILE_TIMESLICE = "10"
 
 # [rtc] 实时时钟 (LRC 源), 同时作为日志时间戳 (天:时:分:秒)
 CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
@@ -149,7 +159,7 @@ CFG_APP_SHELL_STACK = "8192"     # 自检在 shell 线程内同步执行, 需更
 CFG_APP_SHELL_PRIORITY = "1"
 CFG_APP_SHELL_TIMESLICE = "10"
 CFG_APP_TIMER_PERIOD_MS = "2000"
-CFG_APP_LED_STACK = "1024"
+CFG_APP_LED_STACK = "512"     # LED 日志路径 (log 宏含控制台+落盘环两段格式化)
 CFG_APP_LED_PRIORITY = "2"
 CFG_APP_LED_TIMESLICE = "10"
 CFG_APP_LED_BLINK_MS = "500"

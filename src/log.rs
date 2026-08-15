@@ -10,8 +10,10 @@
 //!   切换 (重启后恢复配置默认值);
 //! - **原子整行输出**: 每条日志 (颜色标签 + 消息) 在一次
 //!   [`crate::console::write_fmt_line`] 内输出, 多线程不交错;
-//! - **零依赖**: 直接复用 console 的打印锁与 `format_args!`, 不引入格式化
-//!   缓冲区 (每条日志只有一次整行格式化, 无额外拷贝)。
+//! - **双通道**: 控制台原样输出 (含 ANSI 颜色); 同时以**无颜色**格式
+//!   追加到 RAM 日志缓冲 ([`crate::logring::LogRing`]), 由日志落盘线程
+//!   (见 [`crate::logfile`]) 自动保存到 `/log/` — 控制台路径零改动,
+//!   缓冲追加是一次独立的轻量格式化 (无额外拷贝到堆)。
 //!
 //! # 用法
 //!
@@ -23,9 +25,71 @@
 //! # 约束
 //!
 //! 与 `print!`/`println!` 相同: 仅在**线程上下文**可调用 (输出会取打印锁),
-//! 中断上下文不可输出日志。
+//! 中断上下文不可输出日志。日志缓冲在 RAM 中, 掉电或复位会丢失尚未
+//! 落盘的内容 (落盘间隔见 `CFG_LOG_FLUSH_MS`)。
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+use crate::critical_section;
+use crate::logring::{EntryMark, LogRing};
+
+/// 临界区互斥的日志缓冲 (追加方: 任意线程; 排空方: 日志落盘线程)。
+/// 安全契约: 所有访问都发生在 [`critical_section::with`] 内, 单核上
+/// 互斥成立; 缓冲内容无需跨线程共享可见性 (整块拷贝)。
+struct CsLogRing<const CAP: usize> {
+    inner: UnsafeCell<LogRing<CAP>>,
+}
+
+unsafe impl<const CAP: usize> Sync for CsLogRing<CAP> {}
+
+impl<const CAP: usize> CsLogRing<CAP> {
+    const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(LogRing::new()),
+        }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut LogRing<CAP>) -> R) -> R {
+        critical_section::with(|_| {
+            // SAFETY: 临界区内唯一可变访问
+            let ring = unsafe { &mut *self.inner.get() };
+            f(ring)
+        })
+    }
+}
+
+/// 日志缓冲容量 (字节, `CFG_LOG_RING`)
+const RING_CAP: usize = crate::config::LOG_RING;
+
+/// 待落盘的日志缓冲 (追加丢弃最旧)
+static RING: CsLogRing<RING_CAP> = CsLogRing::new();
+
+/// 落盘开关: 编译期默认 `CFG_LOG_FILE_ENABLE`, 运行时可经
+/// shell `log file on|off` 切换
+static FILE_ENABLED: AtomicBool = AtomicBool::new(crate::config::LOG_FILE_ENABLE);
+
+/// 日志落盘是否启用 (仅影响 [`drain`] 是否被消费, 不影响缓冲追加)
+pub fn file_enabled() -> bool {
+    FILE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 切换日志落盘开关 (shell `log file on|off` 调用)
+pub fn set_file_enabled(on: bool) {
+    FILE_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// 把缓冲中的所有日志条目拷入 `out` (每条末尾补 `\n`) 并清空缓冲。
+///
+/// 由日志落盘线程周期性调用; 返回拷贝的字节数 (0 = 无待落盘日志)。
+pub fn drain_into(out: &mut alloc::vec::Vec<u8>) -> usize {
+    RING.with(|ring| ring.drain_into(out))
+}
+
+/// 待落盘的日志字节数 (含条目头, 不含换行符)
+pub fn pending_bytes() -> usize {
+    RING.with(|ring| ring.bytes_pending())
+}
 
 /// 日志级别 (数值越小越严重, 阈值比较用 `<=`)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -93,7 +157,7 @@ impl Level {
         }
     }
 
-    /// ANSI 前景色 (标签着色)
+    /// ANSI 前景色 (整行按级别着色; 落盘文件为无颜色纯文本)
     fn color(self) -> &'static str {
         match self {
             Level::Error => "\x1b[31m", // 红
@@ -142,6 +206,13 @@ pub fn should_log(l: Level) -> bool {
 ///
 /// 时间戳 `[天:时:分:秒]` 来自 RTC 运行时长 (见 [`crate::rtc::elapsed_dhms`]);
 /// RTC 未初始化/未启动时省略前缀 (boot 阶段)。
+///
+/// # 单次格式化扇出
+///
+/// 控制台与落盘缓冲共用**一次** `core::fmt::write`。整条日志 (环条目
+/// begin → 格式化 → commit) 在**同一把打印锁**内完成: 控制台接收
+/// 颜色前缀的整行, 落盘环接收无颜色的纯文本; 环满时按"丢弃最旧"
+/// 策略腾空间, 仍放不下则截断本条 (控制台输出始终完整)。
 pub fn log(level: Level, args: core::fmt::Arguments<'_>) {
     if !should_log(level) {
         return;
@@ -156,13 +227,43 @@ pub fn log(level: Level, args: core::fmt::Arguments<'_>) {
     } else {
         core::format_args!("")
     };
-    crate::console::write_fmt_line(core::format_args!(
-        "{}{}{}\x1b[0m {}",
-        stamp,
-        level.color(),
-        level.tag(),
-        args
-    ));
+    // 整条日志在打印锁内完成 (begin → 格式化 → commit 不与其他线程交错)
+    let _ = crate::console::with_print_lock(|write_raw| {
+        write_raw(level.color().as_bytes());
+        let mut entry: Option<EntryMark> = RING.with(|ring| ring.begin_entry());
+        {
+            let mut sink = FanoutSink {
+                write_raw,
+                entry: &mut entry,
+            };
+            let _ = core::fmt::write(
+                &mut sink,
+                core::format_args!("{}{} {}", stamp, level.tag(), args),
+            );
+        }
+        if let Some(mark) = entry {
+            RING.with(|ring| ring.commit_entry(&mark));
+        }
+        write_raw(b"\x1b[0m\r\n");
+    });
+}
+
+/// 扇出 sink: 每片段写控制台 (持锁) 并追加到落盘环条目
+struct FanoutSink<'a> {
+    write_raw: &'a mut dyn FnMut(&[u8]),
+    entry: &'a mut Option<EntryMark>,
+}
+
+impl core::fmt::Write for FanoutSink<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        (self.write_raw)(s.as_bytes());
+        if let Some(mark) = &mut *self.entry {
+            RING.with(|ring| {
+                ring.append_to_entry(mark, s.as_bytes());
+            });
+        }
+        Ok(())
+    }
 }
 
 /// 输出 Error 级日志 (红色 `[ERR]` 标签)

@@ -19,10 +19,10 @@
 use crate::config;
 use crate::println;
 use crate::uart_rtos::UartRtosExt;
-use core::cell::RefCell;
 use crate::zmodem::{self, SendFile, ZmConfig, ZmError, ZmPort};
+use core::cell::RefCell;
 
-use super::{mounted_filesystem, CmdResult, ShellState};
+use super::{CmdResult, ShellState, mounted_filesystem};
 
 /// 进度输出节流 (毫秒)
 const PROGRESS_INTERVAL_MS: u32 = 500;
@@ -100,7 +100,10 @@ fn sanitize_name(raw: &[u8]) -> Option<&str> {
         return None;
     }
     let name = core::str::from_utf8(base).ok()?;
-    if name.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+    if name
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == "..")
+    {
         return None;
     }
     Some(name)
@@ -140,7 +143,7 @@ pub(super) fn cmd_sz(state: &mut ShellState, rest: &str) -> CmdResult {
         let Some(path) = super::resolve_path(state, "sz", input) else {
             continue;
         };
-        let Some(filesystem) = mounted_filesystem(state) else {
+        let Some(mut filesystem) = mounted_filesystem(state) else {
             return CmdResult::Ok;
         };
         match filesystem.stat(path.as_key()) {
@@ -178,15 +181,13 @@ pub(super) fn cmd_sz(state: &mut ShellState, rest: &str) -> CmdResult {
 
     let mut last_report = 0u32;
     let result = {
-        let Some(filesystem) = state.filesystem.as_mut() else {
+        let Some(mut filesystem) = crate::filesystem::mounted() else {
             println!("sz: 文件系统未挂载");
             return CmdResult::Ok;
         };
         let mut read_at = |index: usize, offset: u32, buf: &mut [u8]| -> Result<usize, ()> {
             let path = &send[index].0;
-            filesystem
-                .read(path.as_key(), offset, buf)
-                .map_err(|_| ())
+            filesystem.read(path.as_key(), offset, buf).map_err(|_| ())
         };
         let mut progress = |_index: usize, sent: u32, total: u32| {
             let now = crate::rtos::uptime_ms();
@@ -200,7 +201,14 @@ pub(super) fn cmd_sz(state: &mut ShellState, rest: &str) -> CmdResult {
                 crate::print!("\r 已发送 {}/{} B ({}%)", sent, total, pct);
             }
         };
-        zmodem::send_session(&mut port, &zm_config(), &files, &mut read_at, &mut progress, &mut chunk)
+        zmodem::send_session(
+            &mut port,
+            &zm_config(),
+            &files,
+            &mut read_at,
+            &mut progress,
+            &mut chunk,
+        )
     };
     println!();
     finish(&mut port, "sz", result);
@@ -232,7 +240,7 @@ pub(super) fn cmd_rz(state: &mut ShellState, rest: &str) -> CmdResult {
 
     let mut port = UartPort::new();
     let result = {
-        let Some(filesystem) = state.filesystem.as_mut() else {
+        let Some(filesystem) = crate::filesystem::mounted() else {
             println!("rz: 文件系统未挂载");
             return CmdResult::Ok;
         };
@@ -256,11 +264,7 @@ pub(super) fn cmd_rz(state: &mut ShellState, rest: &str) -> CmdResult {
                     false
                 }
                 Err(error) => {
-                    println!(
-                        "rz: 跳过 {} ({})",
-                        name,
-                        super::fs_error_summary(&error)
-                    );
+                    println!("rz: 跳过 {} ({})", name, super::fs_error_summary(&error));
                     false
                 }
             }

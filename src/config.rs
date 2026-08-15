@@ -632,8 +632,8 @@ const _: () = assert!(
 /// 上限同时约束堆分配, 超过该大小的远端文件会被跳过。
 pub const ZMODEM_RX_MAX: usize = parse_u32(env!("CFG_ZMODEM_RX_MAX")) as usize;
 const _: () = assert!(
-    ZMODEM_RX_MAX >= 1024 && ZMODEM_RX_MAX <= 32704,
-    "CFG_ZMODEM_RX_MAX 应为 1024~32704 (快照容量上限)"
+    ZMODEM_RX_MAX >= 1024 && ZMODEM_RX_MAX <= 65_472,
+    "CFG_ZMODEM_RX_MAX 应为 1024~65472 (快照容量上限)"
 );
 
 // ============================== [shell] ==============================
@@ -683,8 +683,8 @@ const _: () = assert!(
     "CFG_NANO_ROWS 应为 8~100"
 );
 const _: () = assert!(
-    NANO_MAX_BYTES >= 256 && NANO_MAX_BYTES <= 32_704,
-    "CFG_NANO_MAX_BYTES 应为 256~32704"
+    NANO_MAX_BYTES >= 256 && NANO_MAX_BYTES <= 65_472,
+    "CFG_NANO_MAX_BYTES 应为 256~65472 (快照容量上限)"
 );
 
 // ============================== [mpu] ==============================
@@ -771,6 +771,59 @@ pub const LOG_LEVEL: crate::log::Level = if eq_str(env!("CFG_LOG_LEVEL"), "error
 } else {
     panic!("CFG_LOG_LEVEL 非法 (可用 error/warn/info/debug/trace)")
 };
+
+// ============================== [logfile] ==============================
+
+/// 日志落盘开关 (CFG_LOG_FILE_ENABLE = true/false): 日志同时保存到
+/// `/log/` 目录; 运行时可经 shell `log file on|off` 切换, 重启后恢复默认。
+pub const LOG_FILE_ENABLE: bool = if eq_str(env!("CFG_LOG_FILE_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_LOG_FILE_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_LOG_FILE_ENABLE 非法 (可用 true/false)")
+};
+/// RAM 日志缓冲容量 (字节) (CFG_LOG_RING)。缓冲按条目保存待落盘日志,
+/// 满时丢弃最旧条目; 掉电/复位会丢失缓冲内容。
+pub const LOG_RING: usize = parse_u32(env!("CFG_LOG_RING")) as usize;
+const _: () = assert!(
+    LOG_RING >= 512 && LOG_RING <= 16384,
+    "CFG_LOG_RING 应为 512~16384"
+);
+/// 单个日志文件大小上限 (字节) (CFG_LOG_FILE_MAX)
+pub const LOG_FILE_MAX: usize = parse_u32(env!("CFG_LOG_FILE_MAX")) as usize;
+const _: () = assert!(
+    LOG_FILE_MAX >= 512 && LOG_FILE_MAX <= 8192,
+    "CFG_LOG_FILE_MAX 应为 512~8192"
+);
+/// 保留的日志文件数 (CFG_LOG_FILE_SLOTS): 每个文件 = 一次启动的一段日志
+/// (`boot_<序号>[_<段号>].log`), 超预算时删除最旧文件; 总日志容量 ≈
+/// MAX × SLOTS。
+pub const LOG_FILE_SLOTS: usize = parse_u32(env!("CFG_LOG_FILE_SLOTS")) as usize;
+const _: () = assert!(
+    LOG_FILE_SLOTS >= 1 && LOG_FILE_SLOTS <= 8,
+    "CFG_LOG_FILE_SLOTS 应为 1~8"
+);
+/// 日志落盘线程刷新间隔 (毫秒) (CFG_LOG_FLUSH_MS): 周期性把 RAM 缓冲
+/// 写入 `/log/`; 间隔越小延迟越低, 但 Flash 写放大与磨损越大。
+pub const LOG_FLUSH_MS: u32 = parse_u32(env!("CFG_LOG_FLUSH_MS"));
+const _: () = assert!(
+    LOG_FLUSH_MS >= 100 && LOG_FLUSH_MS <= 60000,
+    "CFG_LOG_FLUSH_MS 应为 100~60000"
+);
+/// 日志落盘线程参数 (CFG_APP_LOGFILE_*): 优先级低于 shell/LED,
+/// 只做短促的 RAM→Flash 搬运, 不抢占业务。
+pub const APP_LOGFILE_STACK: usize = parse_u32(env!("CFG_APP_LOGFILE_STACK")) as usize;
+pub const APP_LOGFILE_PRIORITY: u8 = parse_u8(env!("CFG_APP_LOGFILE_PRIORITY"));
+pub const APP_LOGFILE_TIMESLICE: u32 = parse_u32(env!("CFG_APP_LOGFILE_TIMESLICE"));
+const _: () = assert!(
+    APP_LOGFILE_STACK >= 256 && APP_LOGFILE_STACK.is_multiple_of(8),
+    "CFG_APP_LOGFILE_STACK 必须不小于 256 且按 8 字节对齐"
+);
+const _: () = assert!(
+    APP_LOGFILE_PRIORITY < IDLE_PRIORITY && APP_LOGFILE_PRIORITY > APP_LED_PRIORITY,
+    "CFG_APP_LOGFILE_PRIORITY 必须低于所有业务线程 (高于 idle)"
+);
 
 /// 命令是否在启用列表中 (CFG_SHELL_COMMANDS, 逗号分隔, 忽略首尾空格)
 ///

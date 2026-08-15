@@ -29,7 +29,6 @@
 
 use core::fmt::Write as _;
 
-
 // ============================== 协议常量 (对齐 zmodem.h) ==============================
 
 /// 帧填充字符 `*`
@@ -359,9 +358,7 @@ enum Zdl {
 /// 裸控制字节 (XON/XOFF 除外) 直接返回; `ZDLE` 后跟转义字符解回原字节;
 /// `ZDLE ZCRCE/G/Q/W` 返回帧结束序列; `ZDLE` 后 4 个 `CAN` 返回取消。
 fn zdlread<P: ZmPort>(port: &mut P, timeout_ms: u32) -> Result<Zdl, ZmError> {
-    let first = port
-        .read_timeout(timeout_ms)
-        .ok_or(ZmError::Timeout)?;
+    let first = port.read_timeout(timeout_ms).ok_or(ZmError::Timeout)?;
     if first & 0x60 != 0 {
         return Ok(Zdl::Byte(first));
     }
@@ -372,9 +369,7 @@ fn zdlread<P: ZmPort>(port: &mut P, timeout_ms: u32) -> Result<Zdl, ZmError> {
             match c {
                 ZDLE => break,
                 XON | 0x91 | XOFF | 0x93 => {
-                    c = port
-                        .read_timeout(timeout_ms)
-                        .ok_or(ZmError::Timeout)?;
+                    c = port.read_timeout(timeout_ms).ok_or(ZmError::Timeout)?;
                 }
                 _ => return Ok(Zdl::Byte(c)),
             }
@@ -382,9 +377,7 @@ fn zdlread<P: ZmPort>(port: &mut P, timeout_ms: u32) -> Result<Zdl, ZmError> {
     }
     // ZDLE 转义序列
     loop {
-        let mut c = port
-            .read_timeout(timeout_ms)
-            .ok_or(ZmError::Timeout)?;
+        let mut c = port.read_timeout(timeout_ms).ok_or(ZmError::Timeout)?;
         if c == CAN {
             // 最多再连续 3 个 CAN (共 4 个) → 取消
             let mut count = 0;
@@ -581,9 +574,7 @@ pub struct Header {
 /// 读取一个字节并跳过 XON/XOFF (对齐 `noxrd7` 的过滤语义)
 fn read_filtered<P: ZmPort>(port: &mut P, timeout_ms: u32) -> Result<u8, ZmError> {
     loop {
-        let byte = port
-            .read_timeout(timeout_ms)
-            .ok_or(ZmError::Timeout)?;
+        let byte = port.read_timeout(timeout_ms).ok_or(ZmError::Timeout)?;
         match byte & 0x7F {
             XON | XOFF => continue,
             _ => return Ok(byte),
@@ -932,8 +923,7 @@ fn build_file_info(name: &str, size: u32, out: &mut [u8]) -> Result<usize, ZmErr
         .map_err(|_| ZmError::Protocol("文件名过长"))?;
     w.buf[w.len] = 0;
     w.len += 1;
-    write!(w, "{} 0 0 0 1 {}", size, size)
-        .map_err(|_| ZmError::Protocol("文件信息块过长"))?;
+    write!(w, "{} 0 0 0 1 {}", size, size).map_err(|_| ZmError::Protocol("文件信息块过长"))?;
     if w.len >= w.buf.len() {
         return Err(ZmError::Protocol("文件信息块过长"));
     }
@@ -975,11 +965,7 @@ fn parse_decimal(bytes: &[u8]) -> Option<u32> {
             _ => return None,
         }
     }
-    if started {
-        Some(value as u32)
-    } else {
-        None
-    }
+    if started { Some(value as u32) } else { None }
 }
 
 /// 读取一个信息数据块 (ZFILE/ZSINIT/ZCOMMAND 负载), 以 ZCRCW 结束。
@@ -1061,8 +1047,7 @@ fn try_init<P: ZmPort, D: FnMut(&[u8], u32) -> bool>(
                 return Ok(Init::SessionDone);
             }
             ZFILE => {
-                let (len, end) =
-                    read_info_block(port, config, header.frameind == ZBIN32, info)?;
+                let (len, end) = read_info_block(port, config, header.frameind == ZBIN32, info)?;
                 if end != ZCRCW {
                     send_hex_hdr(port, ZNAK, &[0; 4])?;
                     continue;
@@ -1111,7 +1096,11 @@ fn ackbibi<P: ZmPort>(port: &mut P, config: &ZmConfig) -> Result<(), ZmError> {
 ///
 /// 流程: ZRPOS(已收) → 等 ZDATA → 累积子包 (ZCRCW/ZCRCQ 回 ZACK) →
 /// 直到 ZEOF(位置一致) → 调用 `commit` 提交完整文件。
-fn receive_file<P: ZmPort, C: FnMut(&[u8], u32, &[u8]) -> Result<(), ZmError>, G: FnMut(u32, u32)>(
+fn receive_file<
+    P: ZmPort,
+    C: FnMut(&[u8], u32, &[u8]) -> Result<(), ZmError>,
+    G: FnMut(u32, u32),
+>(
     port: &mut P,
     config: &ZmConfig,
     buffer: &mut [u8],
@@ -1381,12 +1370,16 @@ fn send_file_data<
         let count = if want == 0 {
             0
         } else {
-            read_at(index, sent, &mut chunk[..want])
-                .map_err(|()| ZmError::File("读取文件失败"))?
+            read_at(index, sent, &mut chunk[..want]).map_err(|()| ZmError::File("读取文件失败"))?
         };
         // want == 0: 文件正好结束于子包边界 (发送空 ZCRCE 子包, 对齐 lrzsz)
         let last = want == 0 || count < want;
-        send_data(port, &chunk[..count], if last { ZCRCE } else { ZCRCW }, fcs32)?;
+        send_data(
+            port,
+            &chunk[..count],
+            if last { ZCRCE } else { ZCRCW },
+            fcs32,
+        )?;
         sent += count as u32;
         progress(index, sent, file.size);
 
@@ -1485,7 +1478,14 @@ fn send_one<
         match header.typ {
             ZRPOS => {
                 return send_file_data(
-                    port, config, index, file, rclhdr(&header.bytes), fcs32, read_at, progress,
+                    port,
+                    config,
+                    index,
+                    file,
+                    rclhdr(&header.bytes),
+                    fcs32,
+                    read_at,
+                    progress,
                     chunk,
                 );
             }
@@ -1581,9 +1581,9 @@ pub fn send_session<
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use std::prelude::v1::*;
     use super::*;
     use std::io::{Read, Write as _};
+    use std::prelude::v1::*;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1819,7 +1819,6 @@ mod tests {
         assert_eq!(received, data);
     }
 
-
     #[test]
     fn pair_transfer_multifile_and_skip() {
         // 接收端跳过第二个文件 (超容量), 会话继续接收第三个
@@ -2004,9 +2003,7 @@ mod tests {
         }
     }
 
-    fn pipe_stdio(
-        child: &mut std::process::Child,
-    ) -> (StdioPort, std::thread::JoinHandle<()>) {
+    fn pipe_stdio(child: &mut std::process::Child) -> (StdioPort, std::thread::JoinHandle<()>) {
         let stdout = child.stdout.take().expect("子进程 stdout");
         let stdin = child.stdin.take().expect("子进程 stdin");
         let (tx, rx) = mpsc::channel();
@@ -2034,10 +2031,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zmodem-{}-{tag}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("zmodem-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2235,4 +2229,3 @@ mod tests {
         assert_eq!(size, 777);
     }
 }
-
