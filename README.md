@@ -47,7 +47,7 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 | `CFG_PANIC_STRATEGY` | panic/fault 后行为: halt=停机 (调试) / reset=软复位 (产品) |
 | `CFG_RTC_ENABLE` | RTC 与日志运行时长时间戳开关 |
 | `CFG_WDT_ENABLE` / `CFG_WDT_*` | WDT 开关 / supervisor 栈、最高优先级与喂狗周期 |
-| `CFG_MPU_ENABLE` | FLASH/SRAM/外设属性与线程栈守卫开关 |
+| `CFG_MPU_ENABLE` / `CFG_MPU_STACK_GUARD` | FLASH/SRAM/外设属性与栈守卫开关 / 守卫区大小 (须与 link.ld 一致) |
 | `CFG_APP_*` | 演示线程参数 (栈/优先级/时间片) / 自检开关 / LED 翻转周期 / 定时器周期 |
 | `CFG_SOAK_*` | 长期稳定性测试开关 / 默认时长 / 进度间隔 / 停滞判定 / Flash 节流 |
 | `CFG_ZMODEM_*` | ZMODEM 帧超时 / 发送子包长度 / 接收文件大小上限 (`sz`/`rz` 命令) |

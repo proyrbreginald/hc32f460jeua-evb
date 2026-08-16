@@ -68,6 +68,35 @@ fn main() {
     {
         println!("cargo:rustc-env=RTOS_RUSTC={}", s.trim());
     }
+
+    // 主栈 MPU 守卫区大小一致性: link.ld 的 MPU_GUARD_SIZE 决定
+    // _heap_end 与 _main_stack_guard_base, 必须与配置
+    // CFG_MPU_STACK_GUARD 一致 (不一致会导致堆上界与守卫区重叠)。
+    check_mpu_guard_consistency();
+}
+
+/// 解析 link.ld 的 `MPU_GUARD_SIZE = <n>;` 并与配置比对。
+fn check_mpu_guard_consistency() {
+    println!("cargo:rerun-if-changed=link.ld");
+    println!("cargo:rerun-if-env-changed=CFG_MPU_STACK_GUARD");
+    let link = std::fs::read_to_string("link.ld").expect("读取 link.ld 失败");
+    let link_value: u32 = link
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("MPU_GUARD_SIZE =")?;
+            rest.trim().strip_suffix(';')?.trim().parse().ok()
+        })
+        .unwrap_or_else(|| panic!("link.ld 缺少 MPU_GUARD_SIZE 定义"));
+    let config_value: u32 = std::env::var("CFG_MPU_STACK_GUARD")
+        .expect("CFG_MPU_STACK_GUARD 未定义")
+        .parse()
+        .expect("CFG_MPU_STACK_GUARD 必须为整数");
+    assert_eq!(
+        config_value, link_value,
+        "CFG_MPU_STACK_GUARD ({config_value}) 与 link.ld 的 MPU_GUARD_SIZE ({link_value}) 不一致 \
+         (link.ld 用它计算 _heap_end 与主栈守卫基址)"
+    );
 }
 
 /// Unix 秒 → (年, 月, 日) (Howard Hinnant 公历算法, 无依赖)

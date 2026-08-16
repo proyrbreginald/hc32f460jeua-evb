@@ -18,6 +18,19 @@ ENTRY(reset_handler)
  * 预留大小需按应用栈深度调整。 */
 STACK_SIZE = 8K;
 
+/* 主栈下方 MPU 守卫区大小 (字节, 2 的幂 ≥ 32): 必须与 .cargo/config.toml
+ * 的 CFG_MPU_STACK_GUARD 一致 (build.rs 编译期校验)。守卫区内不可访问,
+ * 主栈/ISR 向下溢出立即触发 MemManage 故障。 */
+MPU_GUARD_SIZE = 32;
+
+/* 堆上界 = RAM 顶 - 栈预留 - MPU 守卫 - 主栈 canary 4B (空闲线程巡检,
+ * 见 thread.rs; 位于守卫区之下, 不被守卫遮挡)。 */
+_heap_end = ORIGIN(RAM) + LENGTH(RAM) - STACK_SIZE - MPU_GUARD_SIZE - 4;
+
+/* 主栈 MPU 守卫区基址 (栈底向下 MPU_GUARD_SIZE 字节, mpu.rs 配置为
+ * 无访问区域; 已按守卫大小对齐: RAM 顶与 STACK_SIZE 均为其倍数)。 */
+_main_stack_guard_base = ORIGIN(RAM) + LENGTH(RAM) - STACK_SIZE - MPU_GUARD_SIZE;
+
 SECTIONS
 {
     .vector_table :
@@ -92,8 +105,6 @@ SECTIONS
     } > RAM
 }
 
-/* 堆上界 = RAM 顶 - 栈预留 - 主栈 canary 4B (空闲线程巡检, 见 thread.rs) */
-_heap_end = ORIGIN(RAM) + LENGTH(RAM) - STACK_SIZE - 4;
 ASSERT(_heap_end >= _heap_start, "RAM 空间不足以容纳堆和栈预留");
 ASSERT(ORIGIN(FILESYSTEM) == ORIGIN(FLASH) + LENGTH(FLASH),
        "FLASH 与文件系统分区不连续");

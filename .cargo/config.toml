@@ -186,6 +186,10 @@ CFG_WDT_FEED_MS = "500"
 
 # [mpu] 内存保护单元 (FLASH 只读 + SRAM/外设 XN + 线程栈守卫, 默认开启)
 CFG_MPU_ENABLE = "true"
+# 栈守卫区大小 (字节, 2 的幂 32~1024): 线程栈底 + 主栈(ISR)下方各一块无访问
+# 区域, 向下溢出立即 MemManage 故障。须与 link.ld 的 MPU_GUARD_SIZE 一致
+# (build.rs 编译期校验); 越大预警区越宽, 每线程栈开销 = 守卫大小。
+CFG_MPU_STACK_GUARD = "32"
 
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
 # 是否启用内核自检 (true/false); 编译期开关: false 时 selftest 命令与其

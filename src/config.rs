@@ -758,6 +758,15 @@ pub const MPU_ENABLE: bool = if eq_str(env!("CFG_MPU_ENABLE"), "true") {
 } else {
     panic!("CFG_MPU_ENABLE 非法 (可用 true/false)")
 };
+/// 栈守卫区大小 (字节) (CFG_MPU_STACK_GUARD)
+///
+/// 线程栈底与主栈 (ISR) 下方各一块无访问区域; 须与 `link.ld` 的
+/// `MPU_GUARD_SIZE` 一致 (build.rs 编译期校验)。2 的幂, 32 字节起。
+pub const MPU_STACK_GUARD: usize = parse_u32(env!("CFG_MPU_STACK_GUARD")) as usize;
+const _: () = assert!(
+    MPU_STACK_GUARD.is_power_of_two() && MPU_STACK_GUARD >= 32 && MPU_STACK_GUARD <= 1024,
+    "CFG_MPU_STACK_GUARD 应为 2 的幂且 32~1024"
+);
 
 // ============================== [wdt] ==============================
 

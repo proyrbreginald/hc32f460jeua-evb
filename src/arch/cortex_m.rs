@@ -1,8 +1,7 @@
 //! Cortex-M architecture primitives.
-
-/// Cortex-M MPU 的最小保护区域与基址对齐要求。
-pub(crate) const STACK_GUARD_SIZE: usize = 32;
-pub(crate) const STACK_GUARD_ALIGN: usize = 32;
+//!
+//! 架构层不持有工程配置: 栈守卫尺寸 (CFG_MPU_STACK_GUARD) 等编译期
+//! 常量由 `config` 模块统一提供, 消费方 (rtos/mpu) 直接引用。
 
 /// 进入架构临界区前捕获的不透明中断状态。
 pub(crate) struct InterruptState(u32);
