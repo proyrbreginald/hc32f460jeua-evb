@@ -6,9 +6,10 @@
 //! 使用方式: 各模块读 `crate::config::*` 类型化常量,
 //! 修改 `.cargo/config.toml` 后重新编译即生效 (cargo 自动追踪该文件)。
 //!
-//! 注: UART/LED 的端口类型 (PortA/PortC) 由 Rust 类型系统编码, 固定在
+//! 注: UART/CAN/LED 的端口类型 (PortA/PortB/PortC) 由 Rust 类型系统编码, 固定在
 //! 代码中; 引脚号/功能号等数值参数可在此配置。
 
+use crate::can;
 use crate::clk;
 use crate::gpio;
 use crate::uart;
@@ -40,6 +41,47 @@ const fn parse_u32(s: &str) -> u32 {
     }
     assert!(v <= u32::MAX as u64, "非法配置值: 溢出 u32");
     v as u32
+}
+
+/// 编译期解析十进制或 `0x` 前缀十六进制整数，支持 `_` 分隔。
+const fn parse_u32_auto(s: &str) -> u32 {
+    let bytes = s.as_bytes();
+    assert!(!bytes.is_empty(), "非法配置值: 整数不能为空");
+    let (mut i, radix) =
+        if bytes.len() > 2 && bytes[0] == b'0' && (bytes[1] == b'x' || bytes[1] == b'X') {
+            (2, 16u64)
+        } else {
+            (0, 10u64)
+        };
+    let digit_start = i;
+    let mut value = 0u64;
+    let mut digits = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'_' {
+            assert!(
+                i > digit_start && i + 1 < bytes.len() && bytes[i - 1] != b'_',
+                "非法配置值: `_` 只能分隔数字"
+            );
+        } else {
+            let digit = if byte >= b'0' && byte <= b'9' {
+                (byte - b'0') as u64
+            } else if radix == 16 && byte >= b'a' && byte <= b'f' {
+                (byte - b'a' + 10) as u64
+            } else if radix == 16 && byte >= b'A' && byte <= b'F' {
+                (byte - b'A' + 10) as u64
+            } else {
+                panic!("非法配置值: 应为十进制或 0x 十六进制整数")
+            };
+            assert!(digit < radix, "非法配置值: 数字超出进制范围");
+            value = value * radix + digit;
+            assert!(value <= u32::MAX as u64, "非法配置值: 溢出 u32");
+            digits += 1;
+        }
+        i += 1;
+    }
+    assert!(digits != 0, "非法配置值: 整数不能为空");
+    value as u32
 }
 
 /// 是否为非空的可打印 ASCII 字符串。
@@ -79,6 +121,16 @@ const fn eq_str(a: &str, b: &str) -> bool {
         i += 1;
     }
     true
+}
+
+const fn parse_bool(s: &str) -> bool {
+    if eq_str(s, "true") {
+        true
+    } else if eq_str(s, "false") {
+        false
+    } else {
+        panic!("非法配置值: 布尔值应为 true/false")
+    }
 }
 
 /// 编译期校验总线分频系数 (1/2/4/8/16)
@@ -374,6 +426,237 @@ const _: () = assert!(
     "CFG_UART_IRQ_PRIORITY 非法 (可用 0~15)"
 );
 
+// ============================== [dma] ==============================
+
+/// 是否启用 DMA 驱动与控制台 UART 发送卸载 (CFG_DMA_ENABLE)
+///
+/// 启用时 board 初始化路由 USART{`UART_UNIT`}_TI 事件到 TX 通道,
+/// `Uart::write` 对达标长度的输出自动改用 DMA 整块发送。
+pub const DMA_ENABLE: bool = if eq_str(env!("CFG_DMA_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_DMA_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_DMA_ENABLE 非法 (可用 true/false)")
+};
+/// 控制台 TX DMA 单元 (CFG_DMA_TX_UNIT = 1/2)
+pub const DMA_TX_UNIT: u8 = parse_u8(env!("CFG_DMA_TX_UNIT"));
+const _: () = assert!(
+    DMA_TX_UNIT == 1 || DMA_TX_UNIT == 2,
+    "CFG_DMA_TX_UNIT 非法 (可用 1/2)"
+);
+/// 控制台 TX DMA 通道 (CFG_DMA_TX_CHANNEL = 0~3)
+pub const DMA_TX_CHANNEL: u8 = parse_u8(env!("CFG_DMA_TX_CHANNEL"));
+const _: () = assert!(DMA_TX_CHANNEL <= 3, "CFG_DMA_TX_CHANNEL 非法 (可用 0~3)");
+/// 触发 DMA 发送的最小输出长度 (字节) (CFG_DMA_TX_MIN)
+///
+/// 低于该阈值的输出 (逐字节轮询开销更小) 保持原轮询路径; 阈值同时
+/// 保证 DMA 传输计数 (16 位) 的合理余量。
+pub const DMA_TX_MIN: usize = parse_u32(env!("CFG_DMA_TX_MIN")) as usize;
+const _: () = assert!(
+    DMA_TX_MIN >= 4 && DMA_TX_MIN <= 512,
+    "CFG_DMA_TX_MIN 应为 4~512"
+);
+/// 大块拷贝 (Flash→RAM / RAM→RAM) DMA 单元与通道 (CFG_DMA_COPY_UNIT /
+/// CFG_DMA_COPY_CHANNEL)
+pub const DMA_COPY_UNIT: u8 = parse_u8(env!("CFG_DMA_COPY_UNIT"));
+const _: () = assert!(
+    DMA_COPY_UNIT == 1 || DMA_COPY_UNIT == 2,
+    "CFG_DMA_COPY_UNIT 非法 (可用 1/2)"
+);
+pub const DMA_COPY_CHANNEL: u8 = parse_u8(env!("CFG_DMA_COPY_CHANNEL"));
+const _: () = assert!(
+    DMA_COPY_CHANNEL <= 3,
+    "CFG_DMA_COPY_CHANNEL 非法 (可用 0~3)"
+);
+/// TX 与 COPY 不得共用同一通道 (同一通道被两个功能同时配置会互相覆盖)
+const _: () = assert!(
+    !(DMA_ENABLE && DMA_TX_UNIT == DMA_COPY_UNIT && DMA_TX_CHANNEL == DMA_COPY_CHANNEL),
+    "CFG_DMA_TX_* 与 CFG_DMA_COPY_* 不能配置到同一通道"
+);
+/// 触发 DMA 整块拷贝 (Flash→RAM / RAM→RAM) 的最小长度 (字节)
+/// (CFG_DMA_COPY_MIN)
+///
+/// 低于该阈值的读取 (单次 DMA 配置开销反而更大) 保持逐字节/逐字回退。
+pub const DMA_COPY_MIN: usize = parse_u32(env!("CFG_DMA_COPY_MIN")) as usize;
+const _: () = assert!(
+    DMA_COPY_MIN >= 16 && DMA_COPY_MIN <= 1024,
+    "CFG_DMA_COPY_MIN 应为 16~1024"
+);
+
+// ============================== [can] ==============================
+
+/// 是否在板级启动阶段初始化 CAN。默认关闭，因为本板仅引出 PB6/PB7，
+/// 没有板载 CAN PHY；正常/外部回环模式需要外接收发器。
+pub const CAN_ENABLE: bool = parse_bool(env!("CFG_CAN_ENABLE"));
+/// 是否将 CAN 内部回环项目加入 `selftest`。
+pub const CAN_SELFTEST_ENABLE: bool = parse_bool(env!("CFG_CAN_SELFTEST_ENABLE"));
+pub const CAN_TX_PIN: u8 = parse_u8(env!("CFG_CAN_TX_PIN"));
+pub const CAN_TX_FSEL: u8 = parse_u8(env!("CFG_CAN_TX_FSEL"));
+pub const CAN_RX_PIN: u8 = parse_u8(env!("CFG_CAN_RX_PIN"));
+pub const CAN_RX_FSEL: u8 = parse_u8(env!("CFG_CAN_RX_FSEL"));
+
+const fn can_portb_supports_func_group2(pin: u8) -> bool {
+    (pin >= 3 && pin <= 10) || (pin >= 12 && pin <= 15)
+}
+
+const _: () = assert!(
+    can_portb_supports_func_group2(CAN_TX_PIN) && can_portb_supports_func_group2(CAN_RX_PIN),
+    "CFG_CAN_TX_PIN/RX_PIN 必须是 PortB 上支持 Func_Grp2 的引脚"
+);
+const _: () = assert!(
+    CAN_TX_PIN != CAN_RX_PIN,
+    "CFG_CAN_TX_PIN 与 CFG_CAN_RX_PIN 不能相同"
+);
+const _: () = assert!(
+    CAN_TX_FSEL == 50 && CAN_RX_FSEL == 51,
+    "CFG_CAN_TX_FSEL/RX_FSEL 必须分别为 CAN Func50/Func51"
+);
+
+pub const CAN_BITRATE: u32 = parse_u32(env!("CFG_CAN_BITRATE"));
+const _: () = assert!(
+    CAN_BITRATE <= crate::can_timing::MAX_CLASSIC_BITRATE,
+    "CFG_CAN_BITRATE 超过经典 CAN 1Mbit/s 上限"
+);
+pub const CAN_SAMPLE_POINT_PERMILLE: u16 = {
+    let value = parse_u32(env!("CFG_CAN_SAMPLE_POINT_PERMILLE"));
+    assert!(
+        value <= u16::MAX as u32,
+        "CFG_CAN_SAMPLE_POINT_PERMILLE 溢出 u16"
+    );
+    value as u16
+};
+pub const CAN_SJW: u8 = parse_u8(env!("CFG_CAN_SJW"));
+pub const CAN_MAX_BITRATE_ERROR_PPM: u32 = parse_u32(env!("CFG_CAN_MAX_BITRATE_ERROR_PPM"));
+
+const CAN_CONFIGURED_SYSTEM_CLOCK_HZ: u64 = match CLOCK_SOURCE {
+    clk::ClockSource::Mrc => clk::MRC_HZ as u64,
+    clk::ClockSource::Hrc => HRC_FREQ_MHZ as u64 * 1_000_000,
+    clk::ClockSource::Xtal => XTAL_HZ as u64,
+    clk::ClockSource::Pll => {
+        let source_hz = if PLL_SRC == 0 {
+            XTAL_HZ as u64
+        } else {
+            HRC_FREQ_MHZ as u64 * 1_000_000
+        };
+        source_hz * (PLL_N as u64 + 1) / (PLL_M as u64 + 1) / (PLL_P as u64 + 1)
+    }
+};
+const CAN_CONFIGURED_EXCLK_HZ: u64 = CAN_CONFIGURED_SYSTEM_CLOCK_HZ / DIV_EXCLK as u64;
+const _: () = assert!(
+    !(CAN_ENABLE || CAN_SELFTEST_ENABLE) || CAN_CONFIGURED_EXCLK_HZ * 2 >= XTAL_HZ as u64 * 3,
+    "配置的 EXCLK 必须不低于 1.5 倍 CANCLK(XTAL)"
+);
+
+pub const CAN_BIT_TIMING: crate::can_timing::BitTiming = match crate::can_timing::calculate(
+    XTAL_HZ,
+    CAN_BITRATE,
+    CAN_SAMPLE_POINT_PERMILLE as u32,
+    CAN_SJW as u32,
+    CAN_MAX_BITRATE_ERROR_PPM,
+) {
+    Some(value) => value,
+    None => panic!("CFG_CAN 位时序无法满足 DDL 约束或误差上限"),
+};
+
+pub const CAN_MODE: can::WorkMode = if eq_str(env!("CFG_CAN_MODE"), "normal") {
+    can::WorkMode::Normal
+} else if eq_str(env!("CFG_CAN_MODE"), "silent") {
+    can::WorkMode::Silent
+} else if eq_str(env!("CFG_CAN_MODE"), "internal-loopback") {
+    can::WorkMode::InternalLoopback
+} else if eq_str(env!("CFG_CAN_MODE"), "external-loopback") {
+    can::WorkMode::ExternalLoopback
+} else if eq_str(env!("CFG_CAN_MODE"), "external-loopback-silent") {
+    can::WorkMode::ExternalLoopbackSilent
+} else {
+    panic!(
+        "CFG_CAN_MODE 非法 (可用 normal/silent/internal-loopback/external-loopback/external-loopback-silent)"
+    )
+};
+pub const CAN_PTB_SINGLE_SHOT: bool = parse_bool(env!("CFG_CAN_PTB_SINGLE_SHOT"));
+pub const CAN_STB_SINGLE_SHOT: bool = parse_bool(env!("CFG_CAN_STB_SINGLE_SHOT"));
+pub const CAN_STB_PRIORITY: can::StbPriority = if eq_str(env!("CFG_CAN_STB_PRIORITY"), "fifo") {
+    can::StbPriority::Fifo
+} else if eq_str(env!("CFG_CAN_STB_PRIORITY"), "id") {
+    can::StbPriority::LowestIdFirst
+} else {
+    panic!("CFG_CAN_STB_PRIORITY 非法 (可用 fifo/id)")
+};
+pub const CAN_RX_WARN_LIMIT: u8 = parse_u8(env!("CFG_CAN_RX_WARN_LIMIT"));
+pub const CAN_ERROR_WARN_LIMIT: u8 = parse_u8(env!("CFG_CAN_ERROR_WARN_LIMIT"));
+const _: () = assert!(
+    CAN_RX_WARN_LIMIT >= 1 && CAN_RX_WARN_LIMIT <= 10,
+    "CFG_CAN_RX_WARN_LIMIT 应为 1~10"
+);
+const _: () = assert!(
+    CAN_ERROR_WARN_LIMIT <= 15,
+    "CFG_CAN_ERROR_WARN_LIMIT 应为 0~15"
+);
+pub const CAN_RX_ALL_FRAMES: bool = parse_bool(env!("CFG_CAN_RX_ALL_FRAMES"));
+pub const CAN_RX_OVERFLOW: can::RxOverflowMode =
+    if eq_str(env!("CFG_CAN_RX_OVERFLOW"), "overwrite-oldest") {
+        can::RxOverflowMode::OverwriteOldest
+    } else if eq_str(env!("CFG_CAN_RX_OVERFLOW"), "discard-newest") {
+        can::RxOverflowMode::DiscardNewest
+    } else {
+        panic!("CFG_CAN_RX_OVERFLOW 非法 (可用 overwrite-oldest/discard-newest)")
+    };
+pub const CAN_SELF_ACK: bool = parse_bool(env!("CFG_CAN_SELF_ACK"));
+
+pub const CAN_FILTER_TYPE: can::FilterType = if eq_str(env!("CFG_CAN_FILTER_TYPE"), "both") {
+    can::FilterType::StandardAndExtended
+} else if eq_str(env!("CFG_CAN_FILTER_TYPE"), "standard") {
+    can::FilterType::StandardOnly
+} else if eq_str(env!("CFG_CAN_FILTER_TYPE"), "extended") {
+    can::FilterType::ExtendedOnly
+} else {
+    panic!("CFG_CAN_FILTER_TYPE 非法 (可用 both/standard/extended)")
+};
+pub const CAN_FILTER_ID: u32 = parse_u32_auto(env!("CFG_CAN_FILTER_ID"));
+pub const CAN_FILTER_MASK: u32 = parse_u32_auto(env!("CFG_CAN_FILTER_MASK"));
+const fn assert_can_filter(id: u32, mask: u32, kind: can::FilterType) {
+    assert!(
+        id <= 0x1FFF_FFFF && mask <= 0x1FFF_FFFF,
+        "CFG_CAN_FILTER_ID/MASK 必须是 29 位 CAN ID"
+    );
+    assert!(
+        !matches!(kind, can::FilterType::StandardOnly) || id <= 0x7FF,
+        "standard 筛选器的 CFG_CAN_FILTER_ID 必须是 11 位"
+    );
+}
+const _: () = assert_can_filter(CAN_FILTER_ID, CAN_FILTER_MASK, CAN_FILTER_TYPE);
+pub static CAN_FILTERS: [can::Filter; 1] = [can::Filter {
+    id: CAN_FILTER_ID,
+    mask: CAN_FILTER_MASK,
+    kind: CAN_FILTER_TYPE,
+}];
+
+/// selftest 轮询收发的真实 RTOS 超时，不是 CPU 忙等次数。
+pub const CAN_TIMEOUT_MS: u32 = parse_u32(env!("CFG_CAN_TIMEOUT_MS"));
+const _: () = assert!(
+    CAN_TIMEOUT_MS >= 1 && CAN_TIMEOUT_MS <= 5000,
+    "CFG_CAN_TIMEOUT_MS 应为 1~5000"
+);
+
+pub const CAN_CONFIG: can::Config = can::Config {
+    mode: CAN_MODE,
+    bitrate: CAN_BITRATE,
+    sample_point_permille: CAN_SAMPLE_POINT_PERMILLE,
+    sjw: CAN_SJW,
+    max_bitrate_error_ppm: CAN_MAX_BITRATE_ERROR_PPM,
+    filters: &CAN_FILTERS,
+    ptb_single_shot: CAN_PTB_SINGLE_SHOT,
+    stb_single_shot: CAN_STB_SINGLE_SHOT,
+    stb_priority: CAN_STB_PRIORITY,
+    rx_warn_limit: CAN_RX_WARN_LIMIT,
+    error_warn_limit: CAN_ERROR_WARN_LIMIT,
+    rx_all_frames: CAN_RX_ALL_FRAMES,
+    rx_overflow: CAN_RX_OVERFLOW,
+    self_ack: CAN_SELF_ACK,
+    interrupts: can::Interrupts::ALL,
+};
+
 // ============================== [gpio] ==============================
 
 /// 板载 LED 引脚号 (CFG_LED_PIN; 端口 PortC 固定在代码中)
@@ -387,8 +670,31 @@ pub const LED_INITIAL_LEVEL: gpio::Level = if eq_str(env!("CFG_LED_LEVEL"), "hig
     panic!("CFG_LED_LEVEL 非法 (可用 high/low)")
 };
 
-// ============================== [shell] ==============================
+// ============================== [zmodem] ==============================
 
+/// ZMODEM 帧/字节间等待超时 (毫秒) (CFG_ZMODEM_TIMEOUT_MS)
+pub const ZMODEM_TIMEOUT_MS: u32 = parse_u32(env!("CFG_ZMODEM_TIMEOUT_MS"));
+const _: () = assert!(
+    ZMODEM_TIMEOUT_MS >= 100 && ZMODEM_TIMEOUT_MS <= 60000,
+    "CFG_ZMODEM_TIMEOUT_MS 应为 100~60000"
+);
+/// ZMODEM 发送子包长度 (字节) (CFG_ZMODEM_SUBPACKET)
+pub const ZMODEM_SUBPACKET: usize = parse_u32(env!("CFG_ZMODEM_SUBPACKET")) as usize;
+const _: () = assert!(
+    ZMODEM_SUBPACKET >= 32 && ZMODEM_SUBPACKET <= 1024,
+    "CFG_ZMODEM_SUBPACKET 应为 32~1024"
+);
+/// 接收缓冲上限 = 单个接收文件大小上限 (字节) (CFG_ZMODEM_RX_MAX)
+///
+/// 快照文件系统整文件原子写入, 接收文件必须先完整缓存在 RAM;
+/// 上限同时约束堆分配, 超过该大小的远端文件会被跳过。
+pub const ZMODEM_RX_MAX: usize = parse_u32(env!("CFG_ZMODEM_RX_MAX")) as usize;
+const _: () = assert!(
+    ZMODEM_RX_MAX >= 1024 && ZMODEM_RX_MAX <= 65_472,
+    "CFG_ZMODEM_RX_MAX 应为 1024~65472 (快照容量上限)"
+);
+
+// ============================== [shell] ==============================
 /// 登录用户名 / 密码 (CFG_SHELL_USERNAME / CFG_SHELL_PASSWORD)
 pub const SHELL_USERNAME: &str = env!("CFG_SHELL_USERNAME");
 pub const SHELL_PASSWORD: &str = env!("CFG_SHELL_PASSWORD");
@@ -435,8 +741,8 @@ const _: () = assert!(
     "CFG_NANO_ROWS 应为 8~100"
 );
 const _: () = assert!(
-    NANO_MAX_BYTES >= 256 && NANO_MAX_BYTES <= 32_704,
-    "CFG_NANO_MAX_BYTES 应为 256~32704"
+    NANO_MAX_BYTES >= 256 && NANO_MAX_BYTES <= 65_472,
+    "CFG_NANO_MAX_BYTES 应为 256~65472 (快照容量上限)"
 );
 
 // ============================== [mpu] ==============================
@@ -452,6 +758,15 @@ pub const MPU_ENABLE: bool = if eq_str(env!("CFG_MPU_ENABLE"), "true") {
 } else {
     panic!("CFG_MPU_ENABLE 非法 (可用 true/false)")
 };
+/// 栈守卫区大小 (字节) (CFG_MPU_STACK_GUARD)
+///
+/// 线程栈底与主栈 (ISR) 下方各一块无访问区域; 须与 `link.ld` 的
+/// `MPU_GUARD_SIZE` 一致 (build.rs 编译期校验)。2 的幂, 32 字节起。
+pub const MPU_STACK_GUARD: usize = parse_u32(env!("CFG_MPU_STACK_GUARD")) as usize;
+const _: () = assert!(
+    MPU_STACK_GUARD.is_power_of_two() && MPU_STACK_GUARD >= 32 && MPU_STACK_GUARD <= 1024,
+    "CFG_MPU_STACK_GUARD 应为 2 的幂且 32~1024"
+);
 
 // ============================== [wdt] ==============================
 
@@ -483,6 +798,35 @@ const _: () = assert!(
     "CFG_WDT_FEED_MS 必须在 1~500ms 范围内"
 );
 
+// ============================== [console] ==============================
+
+/// 控制台整行输出的行间间隙 (毫秒) (CFG_CONSOLE_LINE_GAP_MS)。
+///
+/// 115200 无流控下, 连续突发输出会超过 USB 转串口 (CH340) 与 PC 端
+/// 读取能力的组合缓冲, 导致丢字节 (行尾截断/乱码)。每行输出后让出
+/// 该时长, PC 端可在间隙内读取; 0 = 不节流。
+pub const CONSOLE_LINE_GAP_MS: u32 = parse_u32(env!("CFG_CONSOLE_LINE_GAP_MS"));
+const _: () = assert!(
+    CONSOLE_LINE_GAP_MS <= 50,
+    "CFG_CONSOLE_LINE_GAP_MS 应为 0~50"
+);
+
+// ============================== [panic] ==============================
+
+/// panic/fault 后的行为策略 (CFG_PANIC_STRATEGY = halt/reset)
+///
+/// - `halt`: 屏蔽中断后 wfi 死循环 (调试期推荐, 便于 gdb 现场检查);
+/// - `reset`: 软复位重启 (产品部署推荐, 尽快恢复服务)。
+/// 见 [`crate::panic::PanicStrategy`]。
+pub const PANIC_STRATEGY: crate::panic::PanicStrategy =
+    if eq_str(env!("CFG_PANIC_STRATEGY"), "halt") {
+        crate::panic::PanicStrategy::Halt
+    } else if eq_str(env!("CFG_PANIC_STRATEGY"), "reset") {
+        crate::panic::PanicStrategy::Reset
+    } else {
+        panic!("CFG_PANIC_STRATEGY 非法 (可用 halt/reset)")
+    };
+
 // ============================== [rtc] ==============================
 
 /// 是否启用 RTC 并作为日志时间戳 (CFG_RTC_ENABLE = true/false)
@@ -508,6 +852,15 @@ pub const LOG_ENABLE: bool = if eq_str(env!("CFG_LOG_ENABLE"), "true") {
 } else {
     panic!("CFG_LOG_ENABLE 非法 (可用 true/false)")
 };
+/// 控制台日志是否带 ANSI 颜色 (CFG_LOG_COLOR = true/false)。
+/// 落盘文件恒为无颜色纯文本, 与本开关无关; 纯文本终端可关闭。
+pub const LOG_COLOR: bool = if eq_str(env!("CFG_LOG_COLOR"), "true") {
+    true
+} else if eq_str(env!("CFG_LOG_COLOR"), "false") {
+    false
+} else {
+    panic!("CFG_LOG_COLOR 非法 (可用 true/false)")
+};
 /// 日志默认级别阈值 (CFG_LOG_LEVEL = error/warn/info/debug/trace)
 /// 输出 ≤ 阈值的级别; 运行时可经 shell `log level <级别>` 调整
 pub const LOG_LEVEL: crate::log::Level = if eq_str(env!("CFG_LOG_LEVEL"), "error") {
@@ -523,6 +876,59 @@ pub const LOG_LEVEL: crate::log::Level = if eq_str(env!("CFG_LOG_LEVEL"), "error
 } else {
     panic!("CFG_LOG_LEVEL 非法 (可用 error/warn/info/debug/trace)")
 };
+
+// ============================== [logfile] ==============================
+
+/// 日志落盘开关 (CFG_LOG_FILE_ENABLE = true/false): 日志同时保存到
+/// `/log/` 目录; 运行时可经 shell `log file on|off` 切换, 重启后恢复默认。
+pub const LOG_FILE_ENABLE: bool = if eq_str(env!("CFG_LOG_FILE_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_LOG_FILE_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_LOG_FILE_ENABLE 非法 (可用 true/false)")
+};
+/// RAM 日志缓冲容量 (字节) (CFG_LOG_RING)。缓冲按条目保存待落盘日志,
+/// 满时丢弃最旧条目; 掉电/复位会丢失缓冲内容。
+pub const LOG_RING: usize = parse_u32(env!("CFG_LOG_RING")) as usize;
+const _: () = assert!(
+    LOG_RING >= 512 && LOG_RING <= 16384,
+    "CFG_LOG_RING 应为 512~16384"
+);
+/// 单个日志文件大小上限 (字节) (CFG_LOG_FILE_MAX)
+pub const LOG_FILE_MAX: usize = parse_u32(env!("CFG_LOG_FILE_MAX")) as usize;
+const _: () = assert!(
+    LOG_FILE_MAX >= 512 && LOG_FILE_MAX <= 8192,
+    "CFG_LOG_FILE_MAX 应为 512~8192"
+);
+/// 保留的日志文件数 (CFG_LOG_FILE_SLOTS): 每个文件 = 一次启动的一段日志
+/// (`boot_<序号>[_<段号>].log`), 超预算时删除最旧文件; 总日志容量 ≈
+/// MAX × SLOTS。
+pub const LOG_FILE_SLOTS: usize = parse_u32(env!("CFG_LOG_FILE_SLOTS")) as usize;
+const _: () = assert!(
+    LOG_FILE_SLOTS >= 1 && LOG_FILE_SLOTS <= 8,
+    "CFG_LOG_FILE_SLOTS 应为 1~8"
+);
+/// 日志落盘线程刷新间隔 (毫秒) (CFG_LOG_FLUSH_MS): 周期性把 RAM 缓冲
+/// 写入 `/log/`; 间隔越小延迟越低, 但 Flash 写放大与磨损越大。
+pub const LOG_FLUSH_MS: u32 = parse_u32(env!("CFG_LOG_FLUSH_MS"));
+const _: () = assert!(
+    LOG_FLUSH_MS >= 100 && LOG_FLUSH_MS <= 60000,
+    "CFG_LOG_FLUSH_MS 应为 100~60000"
+);
+/// 日志落盘线程参数 (CFG_APP_LOGFILE_*): 优先级低于 shell/LED,
+/// 只做短促的 RAM→Flash 搬运, 不抢占业务。
+pub const APP_LOGFILE_STACK: usize = parse_u32(env!("CFG_APP_LOGFILE_STACK")) as usize;
+pub const APP_LOGFILE_PRIORITY: u8 = parse_u8(env!("CFG_APP_LOGFILE_PRIORITY"));
+pub const APP_LOGFILE_TIMESLICE: u32 = parse_u32(env!("CFG_APP_LOGFILE_TIMESLICE"));
+const _: () = assert!(
+    APP_LOGFILE_STACK >= 256 && APP_LOGFILE_STACK.is_multiple_of(8),
+    "CFG_APP_LOGFILE_STACK 必须不小于 256 且按 8 字节对齐"
+);
+const _: () = assert!(
+    APP_LOGFILE_PRIORITY < IDLE_PRIORITY && APP_LOGFILE_PRIORITY > APP_LED_PRIORITY,
+    "CFG_APP_LOGFILE_PRIORITY 必须低于所有业务线程 (高于 idle)"
+);
 
 /// 命令是否在启用列表中 (CFG_SHELL_COMMANDS, 逗号分隔, 忽略首尾空格)
 ///
@@ -571,15 +977,6 @@ pub const APP_LED_STACK: usize = parse_u32(env!("CFG_APP_LED_STACK")) as usize;
 pub const APP_LED_PRIORITY: u8 = parse_u8(env!("CFG_APP_LED_PRIORITY"));
 pub const APP_LED_TIMESLICE: u32 = parse_u32(env!("CFG_APP_LED_TIMESLICE"));
 pub const APP_LED_BLINK_MS: u32 = parse_u32(env!("CFG_APP_LED_BLINK_MS"));
-/// 是否启用内核自检 (CFG_APP_SELFTEST_ENABLE = true/false)
-/// 启用后通过 shell 命令 `selftest` 手动启动, 不再开机自动运行
-pub const APP_SELFTEST_ENABLE: bool = if eq_str(env!("CFG_APP_SELFTEST_ENABLE"), "true") {
-    true
-} else if eq_str(env!("CFG_APP_SELFTEST_ENABLE"), "false") {
-    false
-} else {
-    panic!("CFG_APP_SELFTEST_ENABLE 非法 (可用 true/false)")
-};
 pub const APP_SHELL_STACK: usize = parse_u32(env!("CFG_APP_SHELL_STACK")) as usize;
 pub const APP_SHELL_PRIORITY: u8 = parse_u8(env!("CFG_APP_SHELL_PRIORITY"));
 pub const APP_SHELL_TIMESLICE: u32 = parse_u32(env!("CFG_APP_SHELL_TIMESLICE"));
@@ -606,4 +1003,39 @@ const _: () = assert!(APP_LED_BLINK_MS > 0, "CFG_APP_LED_BLINK_MS 必须大于 0
 const _: () = assert!(
     APP_TIMER_PERIOD_MS > 0,
     "CFG_APP_TIMER_PERIOD_MS 必须大于 0"
+);
+
+// ============================== [soak] ==============================
+
+/// soak 无参数时的默认时长 (分钟; 0 = 直到 ESC)
+pub const SOAK_MINUTES: u32 = parse_u32(env!("CFG_SOAK_MINUTES"));
+const _: () = assert!(
+    SOAK_MINUTES <= 24 * 60 * 7,
+    "CFG_SOAK_MINUTES 不应超过 7 天 (10080 分钟)"
+);
+/// 进度报告间隔 (毫秒)
+pub const SOAK_REPORT_INTERVAL_MS: u32 = parse_u32(env!("CFG_SOAK_REPORT_INTERVAL_MS"));
+const _: () = assert!(
+    SOAK_REPORT_INTERVAL_MS >= 1000,
+    "CFG_SOAK_REPORT_INTERVAL_MS 应不小于 1000"
+);
+/// 压力线程心跳停滞判定: 超过该时长无进展即判挂起 (毫秒)
+pub const SOAK_HANG_GRACE_MS: u32 = parse_u32(env!("CFG_SOAK_HANG_GRACE_MS"));
+const _: () = assert!(
+    SOAK_HANG_GRACE_MS >= 1000,
+    "CFG_SOAK_HANG_GRACE_MS 应不小于 1000"
+);
+/// Flash 压力节流: 两次擦写循环的最小间隔 (毫秒, 保护 Flash 寿命)
+pub const SOAK_FLASH_INTERVAL_MS: u32 = parse_u32(env!("CFG_SOAK_FLASH_INTERVAL_MS"));
+const _: () = assert!(
+    SOAK_FLASH_INTERVAL_MS >= 1000,
+    "CFG_SOAK_FLASH_INTERVAL_MS 应不小于 1000"
+);
+
+/// 测试报告预算: `/test/` 目录保留的报告文件数 (超出删除最旧;
+/// 文件名按字典序即时间序)
+pub const TEST_REPORT_SLOTS: u32 = parse_u32(env!("CFG_TEST_REPORT_SLOTS"));
+const _: () = assert!(
+    TEST_REPORT_SLOTS >= 1 && TEST_REPORT_SLOTS <= 32,
+    "CFG_TEST_REPORT_SLOTS 应为 1~32"
 );

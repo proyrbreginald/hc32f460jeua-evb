@@ -172,6 +172,33 @@ const FCG1_DEFAULT: u32 = 0xFFFF_FFFF;
 const FCG2_DEFAULT: u32 = 0xFFFF_FFFF;
 const FCG3_DEFAULT: u32 = 0xFFFF_FFFF;
 
+/// 使能 FCG0 位域 (清位 = 使能; 自动经 FCG0PC 键解锁/锁回写保护)。
+///
+/// 供启动阶段给受保护的外设 (DMA/AOS 等) 开门, 对齐 DDL
+/// `FCG_Fcg0PeriphClockCmd`。位常量见各外设模块 (如
+/// [`crate::dma`] 的 FCG0_DMA1/2/AOS)。
+pub(crate) fn fcg0_enable(bits: u32) {
+    let fcg0pc = crate::mmio::Reg::new(PWC_BASE + PWC_FCG0PC);
+    let fcg0 = crate::mmio::Reg::new(PWC_BASE + PWC_FCG0);
+    fcg0pc.write(FCG0PC_UNLOCK);
+    let v = fcg0.read();
+    fcg0.write(v & !bits);
+    fcg0pc.write(FCG0PC_LOCK);
+}
+
+/// 使能 FCG1 位域 (清位 = 使能; FCG1 无写保护, 对齐 DDL
+/// `FCG_Fcg1PeriphClockCmd`)。USART1~4 时钟位见 [`crate::uart`]。
+pub(crate) fn fcg1_enable(bits: u32) {
+    let v = read32(PWC_BASE + PWC_FCG1);
+    write32(PWC_BASE + PWC_FCG1, v & !bits);
+}
+
+/// 失能 FCG1 位域 (置位 = 关闭; 供 CAN 等掉电场景使用)。
+pub(crate) fn fcg1_disable(bits: u32) {
+    let v = read32(PWC_BASE + PWC_FCG1);
+    write32(PWC_BASE + PWC_FCG1, v | bits);
+}
+
 /// 系统时钟方案 (由 [`init`] 按配置统一编排)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClockSource {
@@ -387,6 +414,11 @@ pub fn xtal_stable() -> bool {
     read8(CMU_BASE + CMU_OSCSTBSR) & OSCSTBSR_XTALSTBF != 0
 }
 
+/// Whether the external crystal oscillator is commanded on (XTALSTP=0).
+pub fn xtal_enabled() -> bool {
+    read8(CMU_BASE + CMU_XTALCR) & 1 == 0
+}
+
 /// 切换系统时钟源到 MPLL (200MHz)
 ///
 /// **切换前**按目标频率配置 FLASH/SRAM 等待周期 (表 7-1/8-1)、
@@ -432,21 +464,19 @@ pub fn switch_to_pll() -> Result<(), ClkError> {
 /// 关闭前需以键 0xA5A5 置 PRT0=1 (对齐 DDL PWC_FCG0_REG_Unlock);
 /// 恢复时 [`fcg_restore`] 会恢复 PRT0 为受保护态。
 fn fcg_close() -> [u32; 4] {
-    let saved = unsafe {
-        // 解除 FCG0 写保护 (PRT0=1)
-        core::ptr::write_volatile((PWC_BASE + PWC_FCG0PC) as *mut u32, FCG0PC_UNLOCK);
-        let saved = [
-            read32(PWC_BASE + PWC_FCG0),
-            read32(PWC_BASE + PWC_FCG1),
-            read32(PWC_BASE + PWC_FCG2),
-            read32(PWC_BASE + PWC_FCG3),
-        ];
-        write32(PWC_BASE + PWC_FCG0, FCG0_DEFAULT);
-        write32(PWC_BASE + PWC_FCG1, FCG1_DEFAULT);
-        write32(PWC_BASE + PWC_FCG2, FCG2_DEFAULT);
-        write32(PWC_BASE + PWC_FCG3, FCG3_DEFAULT);
-        saved
-    };
+    let fcg0pc = crate::mmio::Reg::new(PWC_BASE + PWC_FCG0PC);
+    // 解除 FCG0 写保护 (PRT0=1)
+    fcg0pc.write(FCG0PC_UNLOCK);
+    let saved = [
+        read32(PWC_BASE + PWC_FCG0),
+        read32(PWC_BASE + PWC_FCG1),
+        read32(PWC_BASE + PWC_FCG2),
+        read32(PWC_BASE + PWC_FCG3),
+    ];
+    write32(PWC_BASE + PWC_FCG0, FCG0_DEFAULT);
+    write32(PWC_BASE + PWC_FCG1, FCG1_DEFAULT);
+    write32(PWC_BASE + PWC_FCG2, FCG2_DEFAULT);
+    write32(PWC_BASE + PWC_FCG3, FCG3_DEFAULT);
     // 等待外设时钟关闭稳定 (对齐 DDL CLK_SYSCLK_SW_STB = 30µs)
     delay_short();
     delay_short();
@@ -455,14 +485,12 @@ fn fcg_close() -> [u32; 4] {
 
 /// 恢复外设时钟并恢复 FCG0 写保护 (对齐 DDL `SetSysClockSrc` 的 FCG 恢复段)
 fn fcg_restore(saved: [u32; 4]) {
-    unsafe {
-        write32(PWC_BASE + PWC_FCG0, saved[0]);
-        write32(PWC_BASE + PWC_FCG1, saved[1]);
-        write32(PWC_BASE + PWC_FCG2, saved[2]);
-        write32(PWC_BASE + PWC_FCG3, saved[3]);
-        // 恢复 FCG0 写保护 (PRT0=0, 复位默认态)
-        core::ptr::write_volatile((PWC_BASE + PWC_FCG0PC) as *mut u32, FCG0PC_LOCK);
-    }
+    write32(PWC_BASE + PWC_FCG0, saved[0]);
+    write32(PWC_BASE + PWC_FCG1, saved[1]);
+    write32(PWC_BASE + PWC_FCG2, saved[2]);
+    write32(PWC_BASE + PWC_FCG3, saved[3]);
+    // 恢复 FCG0 写保护 (PRT0=0, 复位默认态)
+    crate::mmio::Reg::new(PWC_BASE + PWC_FCG0PC).write(FCG0PC_LOCK);
     // 等待外设时钟恢复稳定
     delay_short();
     delay_short();
@@ -533,15 +561,12 @@ const PCCR_RDWT_MASK: u16 = 0x3 << 14; // RDWT[15:14]
 /// 高系统时钟下单周期无法正确采样输入电平 (参考手册 GPIO 章节),
 /// 需插入读等待。PCCR 受 PWPR 写保护 (0xA501 解锁 / 0xA500 锁定)。
 fn set_gpio_read_wait(wait: u32) {
-    unsafe {
-        core::ptr::write_volatile(GPIO_PWPR as *mut u16, 0xA501);
-        let pccr = core::ptr::read_volatile(GPIO_PCCR as *const u16);
-        core::ptr::write_volatile(
-            GPIO_PCCR as *mut u16,
-            (pccr & !PCCR_RDWT_MASK) | ((wait as u16 & 0x3) << 14),
-        );
-        core::ptr::write_volatile(GPIO_PWPR as *mut u16, 0xA500);
-    }
+    let pwpr = crate::mmio::Reg::new(GPIO_PWPR);
+    let pccr = crate::mmio::Reg::new(GPIO_PCCR);
+    pwpr.write_u16(0xA501);
+    let value = (pccr.read_u16() & !PCCR_RDWT_MASK) | ((wait as u16 & 0x3) << 14);
+    pccr.write_u16(value);
+    pwpr.write_u16(0xA500);
 }
 
 /// PWC 寄存器偏移 (SVD)
@@ -561,14 +586,11 @@ const MD_SWITCH_CMD: u8 = 0x10;
 /// 随后延时 ~30us 等待切换完成。PWC 寄存器由 FPRC CODE1 解锁
 /// (cmu_unlock 已含 CODE0|CODE1)。
 fn pwc_high_performance() {
-    unsafe {
-        let pwrc2 = core::ptr::read_volatile(PWC_PWRC2 as *const u8);
-        core::ptr::write_volatile(
-            PWC_PWRC2 as *mut u8,
-            (pwrc2 & !(PWRC2_DDAS | PWRC2_DVS)) | PWRC2_DDAS,
-        );
-        core::ptr::write_volatile(PWC_MDSWCR as *mut u8, MD_SWITCH_CMD);
-    }
+    let pwrc2 = crate::mmio::Reg::new(PWC_PWRC2);
+    let mdswcr = crate::mmio::Reg::new(PWC_MDSWCR);
+    let value = (pwrc2.read_u8() & !(PWRC2_DDAS | PWRC2_DVS)) | PWRC2_DDAS;
+    pwrc2.write_u8(value);
+    mdswcr.write_u8(MD_SWITCH_CMD);
     // 等待模式切换完成 (~30us @ 8MHz)
     delay_short();
     delay_short();
@@ -851,16 +873,12 @@ pub fn mco1_cmd(enable: bool) {
 
 /// 解锁 CMU 寄存器写保护 (PWC.FPRC)
 fn cmu_unlock() {
-    unsafe {
-        core::ptr::write_volatile((PWC_BASE + PWC_FPRC_OFF) as *mut u16, FPRC_UNLOCK);
-    }
+    crate::mmio::Reg::new(PWC_BASE + PWC_FPRC_OFF).write_u16(FPRC_UNLOCK);
 }
 
 /// 恢复 CMU 寄存器写保护 (PWC.FPRC)
 fn cmu_lock() {
-    unsafe {
-        core::ptr::write_volatile((PWC_BASE + PWC_FPRC_OFF) as *mut u16, FPRC_LOCK);
-    }
+    crate::mmio::Reg::new(PWC_BASE + PWC_FPRC_OFF).write_u16(FPRC_LOCK);
 }
 
 /// HRC 频率: 由运行期只读的 ICG1.HRCFREQSEL (bit0) 决定: 1→16MHz, 0→20MHz
@@ -868,12 +886,10 @@ fn cmu_lock() {
 /// 该位由复位时从 flash 0x404 ICG1 配置字载入 (见 [`crate::icg`] 模块),
 /// 即由配置 `CFG_HRC_FREQ` 决定 —— 两者恒一致 (flash 字由配置生成)。
 fn hrc_hz() -> u32 {
-    unsafe {
-        if core::ptr::read_volatile(0x4001_0684 as *const u32) & 1 != 0 {
-            16_000_000
-        } else {
-            20_000_000
-        }
+    if crate::mmio::Reg::new(0x4001_0684).read() & 1 != 0 {
+        16_000_000
+    } else {
+        20_000_000
     }
 }
 
@@ -888,24 +904,33 @@ fn pll_hz() -> u32 {
     } else {
         XTAL_HZ
     };
-    let hz = (src as u64) * (n as u64 + 1) / (m as u64 + 1) / (p as u64 + 1);
-    hz.min(u32::MAX as u64) as u32
+    // u32 精确: hz = src·(n+1)/((m+1)(p+1)), 拆分为
+    // (src/((m+1)(p+1)))·(n+1) + ((src%den)·(n+1))/den;
+    // 首项 ≤ 芯片时钟上限, 次项 < den·num ≤ 512·512, 均不溢出。
+    let num = n + 1;
+    let den = (m + 1) * (p + 1);
+    let q = src / den;
+    if q > u32::MAX / num {
+        u32::MAX // 配置超出芯片时钟范围 (与旧 u64 版截断一致)
+    } else {
+        q * num + (src % den) * num / den
+    }
 }
 
 fn read8(addr: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(addr as *const u8) as u32 }
+    crate::mmio::Reg::new(addr).read_u8() as u32
 }
 
 fn write8(addr: usize, value: u32) {
-    unsafe { core::ptr::write_volatile(addr as *mut u8, value as u8) }
+    crate::mmio::Reg::new(addr).write_u8(value as u8);
 }
 
 fn read32(addr: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(addr as *const u32) }
+    crate::mmio::Reg::new(addr).read()
 }
 
 fn write32(addr: usize, value: u32) {
-    unsafe { core::ptr::write_volatile(addr as *mut u32, value) }
+    crate::mmio::Reg::new(addr).write(value);
 }
 
 /// 短延时 (时钟源切换稳定等待)

@@ -1,5 +1,5 @@
 //! 内核自检: 依次验证信号量/互斥量/事件/邮箱/消息队列/延时/
-//! 线程删除/线程退出/Flash/CRC。
+//! 线程删除/线程退出/Flash/CRC/CAN，亦可用 `selftest can` 单独验证 CAN。
 //!
 //! **同步执行** (由 shell 的 `selftest` 命令调用, 完成后才出下一提示符);
 //! 每项检查后轮询 ESC, 按下即中断剩余项。
@@ -35,66 +35,323 @@ extern "C" fn blk_sender(_param: usize) {
 /// 检测用户是否按下 ESC (0x1B): 轮询并清空接收缓冲
 ///
 /// 自检期间终端输入一律丢弃 (ESC 除外); 返回 true 表示请求中断。
-fn abort_requested() -> bool {
-    let uart = crate::board::BoardResources::get().console();
-    let mut esc = false;
-    while let Some(b) = uart.read_rx() {
-        if b == 0x1B {
-            esc = true;
-        }
-    }
-    esc
+pub(crate) fn abort_requested() -> bool {
+    crate::board::abort_requested()
 }
 
-/// CAN 内部回环自测: 初始化 → 发送模式数据帧 → 接收校验
-///
-/// 内部回环模式 (ILB) 下信号在芯片内部环回, 无需 PB6/PB7 引脚与
-/// 外部收发器; 自应答使能保证发送帧回环到接收缓冲 (RX.CTRL.TX=1)。
-/// 对齐 DDL `can_loopback` 例程的 CanTx/CanRx 校验流程。
-fn can_loopback_test() -> bool {
-    // 初始化: 内部回环 + 自应答 + 全接受滤波 + 500Kbps
-    let cfg = crate::can::Config {
-        mode: crate::can::WorkMode::InternalLoopback,
-        self_ack: true,
-        baudrate: 500_000,
-        ..Default::default()
-    };
-    if crate::can::init(cfg).is_err() {
-        return false; // XTAL 未起振/波特率不可实现等
-    }
+static CAN_SELFTEST_FILTERS: [crate::can::Filter; 4] = [
+    crate::can::Filter {
+        id: 0x0A0,
+        mask: 0x001,
+        kind: crate::can::FilterType::StandardOnly,
+    },
+    crate::can::Filter {
+        id: 0x01AB_CDEF,
+        mask: 0,
+        kind: crate::can::FilterType::ExtendedOnly,
+    },
+    crate::can::Filter {
+        id: 0x321,
+        mask: 0,
+        kind: crate::can::FilterType::StandardOnly,
+    },
+    crate::can::Filter {
+        id: 0x5AA,
+        mask: 0,
+        kind: crate::can::FilterType::ExtendedOnly,
+    },
+];
 
-    // 发送一帧: ID=0x5A5 (标准帧), 8 字节递增模式数据
-    let mut data = [0u8; 8];
-    for (i, b) in data.iter_mut().enumerate() {
-        *b = (0xA0 + i as u8).wrapping_add(1);
-    }
-    let tx = crate::can::TxFrame {
-        id: 0x5A5,
-        ide: false,
-        rtr: false,
-        dlc: 8,
-        data,
-    };
-    if crate::can::send(&tx).is_err() {
-        crate::can::local_reset();
-        return false;
-    }
+const CAN_SELFTEST_FRAMES: [crate::can::TxFrame; 3] = [
+    crate::can::TxFrame::data(
+        crate::can::Id::Standard(0x0A1),
+        8,
+        [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+    ),
+    crate::can::TxFrame::data(
+        crate::can::Id::Extended(0x01AB_CDEF),
+        3,
+        [0xD1, 0xD2, 0xD3, 0, 0, 0, 0, 0],
+    ),
+    crate::can::TxFrame::remote(crate::can::Id::Standard(0x321), 0),
+];
 
-    // 接收回环帧 (带超时 ~50ms) 并校验: ID/数据/自发标志
-    let ok = match crate::can::recv_timeout() {
-        Ok(rx) => {
-            rx.id == 0x5A5
-                && rx.self_tx
-                && rx.dlc == 8
-                && rx.data == data
-                && crate::can::error_counts() == (0, 0)
+#[derive(Clone, Copy, Debug)]
+enum CanSelftestError {
+    ApplicationCanEnabled,
+    IrqConsumerRegistered,
+    Aborted,
+    Driver(crate::can::CanError),
+    TxTimeout(crate::can::TxBuffer),
+    Controller(crate::can::Status, crate::can::ErrorInfo),
+    FilterAcceptedUnexpectedFrame(crate::can::RxFrame),
+    RxTimeout {
+        received: u8,
+    },
+    FrameMismatch {
+        index: u8,
+        frame: crate::can::RxFrame,
+    },
+    RxFifoNotEmpty,
+    ErrorCountersIncreased {
+        before: crate::can::ErrorInfo,
+        after: crate::can::ErrorInfo,
+    },
+    RestoreClock(crate::clk::ClkError),
+}
+
+impl From<crate::can::CanError> for CanSelftestError {
+    fn from(value: crate::can::CanError) -> Self {
+        Self::Driver(value)
+    }
+}
+
+impl core::fmt::Display for CanSelftestError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ApplicationCanEnabled => write!(f, "应用 CAN 已启用，不能取得独占控制权"),
+            Self::IrqConsumerRegistered => write!(f, "CAN IRQ consumer 仍已注册"),
+            Self::Aborted => write!(f, "用户按 ESC 中止"),
+            Self::Driver(error) => write!(f, "驱动错误: {:?}", error),
+            Self::TxTimeout(buffer) => write!(f, "{:?} 发送超时并已中止", buffer),
+            Self::Controller(status, info) => write!(
+                f,
+                "控制器错误: status={:#010X}, kind={:?}, ALC={}, REC={}, TEC={}",
+                status.bits(),
+                info.kind,
+                info.arbitration_lost_position,
+                info.rx_count,
+                info.tx_count
+            ),
+            Self::FilterAcceptedUnexpectedFrame(frame) => {
+                write!(f, "验收筛选器错误接收了帧: {:?}", frame)
+            }
+            Self::RxTimeout { received } => {
+                write!(
+                    f,
+                    "接收超时: 仅收到 {}/{} 帧",
+                    received,
+                    CAN_SELFTEST_FRAMES.len()
+                )
+            }
+            Self::FrameMismatch { index, frame } => {
+                write!(f, "第 {} 帧不匹配: {:?}", index, frame)
+            }
+            Self::RxFifoNotEmpty => write!(f, "读取预期帧后 RX FIFO 仍非空"),
+            Self::ErrorCountersIncreased { before, after } => write!(
+                f,
+                "内部回环使错误计数增加: REC {}->{}, TEC {}->{}",
+                before.rx_count, after.rx_count, before.tx_count, after.tx_count
+            ),
+            Self::RestoreClock(error) => write!(f, "恢复 XTAL 状态失败: {:?}", error),
         }
-        Err(_) => false,
-    };
+    }
+}
 
-    // 清理: 本地复位, 退出回环 (不影响后续使用)
-    crate::can::local_reset();
-    ok
+fn wait_can_tx(
+    can: &crate::can::Can,
+    buffer: crate::can::TxBuffer,
+) -> Result<(), CanSelftestError> {
+    let complete = match buffer {
+        crate::can::TxBuffer::Primary => crate::can::Status::PTB_TX,
+        crate::can::TxBuffer::Secondary => crate::can::Status::STB_TX,
+    };
+    let start = crate::rtos::uptime_ms();
+    loop {
+        if abort_requested() {
+            can.abort(buffer);
+            return Err(CanSelftestError::Aborted);
+        }
+        let status = can.status();
+        if status.intersects(crate::can::Status::TX_ERRORS) {
+            can.abort(buffer);
+            return Err(CanSelftestError::Controller(status, can.error_info()));
+        }
+        if status.contains(complete) {
+            can.clear_status(complete);
+            return Ok(());
+        }
+        if crate::rtos::uptime_ms().wrapping_sub(start) >= crate::config::CAN_TIMEOUT_MS {
+            can.abort(buffer);
+            return Err(CanSelftestError::TxTimeout(buffer));
+        }
+        crate::rtos::thread_delay_ms(1).expect("CAN selftest 必须在线程上下文运行");
+    }
+}
+
+fn frame_matches(rx: &crate::can::RxFrame, tx: &crate::can::TxFrame) -> bool {
+    rx.id == tx.id
+        && rx.rtr == tx.rtr
+        && rx.dlc == tx.dlc
+        && rx.self_tx
+        && rx.error == crate::can::ErrorKind::None
+        && rx.data[..usize::from(tx.dlc)] == tx.data[..usize::from(tx.dlc)]
+}
+
+fn expect_filter_rejection(
+    can: &crate::can::Can,
+    frame: &crate::can::TxFrame,
+) -> Result<(), CanSelftestError> {
+    can.try_transmit_ptb(frame)?;
+    wait_can_tx(can, crate::can::TxBuffer::Primary)?;
+    crate::rtos::thread_delay_ms(2).expect("CAN selftest 必须在线程上下文运行");
+    if let Some(frame) = can.try_receive() {
+        return Err(CanSelftestError::FilterAcceptedUnexpectedFrame(frame));
+    }
+    Ok(())
+}
+
+fn restore_can(can: &crate::can::Can, xtal_was_enabled: bool) -> Result<(), CanSelftestError> {
+    can.deinit();
+    if !xtal_was_enabled {
+        crate::clk::xtal_cmd(false).map_err(CanSelftestError::RestoreClock)?;
+    }
+    Ok(())
+}
+
+/// Internal loopback does not drive the TX pin and automatically generates ACK, so it
+/// is safe on this board without a PHY. The test still exercises both TX buffer
+/// classes and the receive acceptance path used in normal operation.
+fn can_loopback_test() -> Result<crate::can_timing::BitTiming, CanSelftestError> {
+    if crate::config::CAN_ENABLE {
+        return Err(CanSelftestError::ApplicationCanEnabled);
+    }
+    let can = crate::board::BoardResources::get().can();
+    if can.irq_registered() {
+        return Err(CanSelftestError::IrqConsumerRegistered);
+    }
+    let xtal_was_enabled = crate::clk::xtal_enabled();
+    let test = (|| {
+        let timing = can.init(crate::can::Config {
+            mode: crate::can::WorkMode::InternalLoopback,
+            filters: &CAN_SELFTEST_FILTERS,
+            self_ack: false,
+            ptb_single_shot: false,
+            stb_single_shot: false,
+            stb_priority: crate::can::StbPriority::Fifo,
+            rx_warn_limit: 10,
+            rx_all_frames: false,
+            rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
+            interrupts: crate::can::Interrupts::ALL,
+            ..crate::config::CAN_CONFIG
+        })?;
+
+        while can.try_receive().is_some() {}
+        can.clear_status(can.status());
+        let before = can.error_info();
+
+        // Reject an unmatched ID and frames whose raw ID matches a filter of
+        // the opposite IDE type. Filter 0 also accepts 0x0A1 through mask bit 0.
+        for rejected in [
+            crate::can::TxFrame::data(
+                crate::can::Id::Standard(0x7AA),
+                1,
+                [0xE0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            crate::can::TxFrame::data(
+                crate::can::Id::Extended(0x0A1),
+                1,
+                [0xE1, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            crate::can::TxFrame::data(
+                crate::can::Id::Standard(0x5AA),
+                1,
+                [0xE2, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            expect_filter_rejection(can, &rejected)?;
+        }
+
+        can.try_transmit_ptb(&CAN_SELFTEST_FRAMES[0])?;
+        wait_can_tx(can, crate::can::TxBuffer::Primary)?;
+        can.enqueue_stb(&CAN_SELFTEST_FRAMES[1])?;
+        can.enqueue_stb(&CAN_SELFTEST_FRAMES[2])?;
+        can.start_stb(crate::can::StbTransmit::All)?;
+        wait_can_tx(can, crate::can::TxBuffer::Secondary)?;
+
+        let start = crate::rtos::uptime_ms();
+        let mut received = 0usize;
+        while received < CAN_SELFTEST_FRAMES.len() {
+            if abort_requested() {
+                can.abort(crate::can::TxBuffer::Primary);
+                can.abort(crate::can::TxBuffer::Secondary);
+                return Err(CanSelftestError::Aborted);
+            }
+            if let Some(frame) = can.try_receive() {
+                if !frame_matches(&frame, &CAN_SELFTEST_FRAMES[received]) {
+                    return Err(CanSelftestError::FrameMismatch {
+                        index: received as u8,
+                        frame,
+                    });
+                }
+                received += 1;
+                continue;
+            }
+            let status = can.status();
+            if status.intersects(crate::can::Status::TX_ERRORS) {
+                return Err(CanSelftestError::Controller(status, can.error_info()));
+            }
+            if crate::rtos::uptime_ms().wrapping_sub(start) >= crate::config::CAN_TIMEOUT_MS {
+                return Err(CanSelftestError::RxTimeout {
+                    received: received as u8,
+                });
+            }
+            crate::rtos::thread_delay_ms(1).expect("CAN selftest 必须在线程上下文运行");
+        }
+        if can.try_receive().is_some() || can.rx_buffer_status() != crate::can::BufferStatus::Empty
+        {
+            return Err(CanSelftestError::RxFifoNotEmpty);
+        }
+
+        let status = can.status();
+        if status.intersects(crate::can::Status::TX_ERRORS) {
+            return Err(CanSelftestError::Controller(status, can.error_info()));
+        }
+        let after = can.error_info();
+        if after.rx_count > before.rx_count || after.tx_count > before.tx_count {
+            return Err(CanSelftestError::ErrorCountersIncreased { before, after });
+        }
+        Ok(timing)
+    })();
+
+    match restore_can(can, xtal_was_enabled) {
+        Ok(()) => test,
+        Err(error) => Err(error),
+    }
+}
+
+/// Run only the CAN internal-loopback checks.
+pub(crate) fn run_can() {
+    if !crate::config::CAN_SELFTEST_ENABLE {
+        crate::println!("[selftest] CAN 已跳过 (CFG_CAN_SELFTEST_ENABLE=false)");
+        return;
+    }
+    if crate::config::CAN_ENABLE {
+        crate::println!("[selftest] CAN 已跳过 (应用 CAN 已启用，测试会清空收发队列)");
+        return;
+    }
+    if crate::board::BoardResources::get().can().irq_registered() {
+        crate::println!("[selftest] CAN 已跳过 (CAN IRQ consumer 仍已注册)");
+        return;
+    }
+    crate::log_info!("[selftest] 开始 CAN 内部回环自检");
+    match can_loopback_test() {
+        Ok(timing) => {
+            crate::log_info!("[PASS] CAN: 过滤器/PTB/STB/标准帧/扩展帧/RTR");
+            crate::println!(
+                "[selftest] CAN 完成: 1 通过, 0 失败 ({} bps, 采样点 {}‰)",
+                timing.actual_bitrate(crate::clk::XTAL_HZ),
+                timing.sample_point_permille()
+            );
+        }
+        Err(CanSelftestError::Aborted) => {
+            crate::println!("[selftest] CAN 已中断 (ESC)");
+        }
+        Err(error) => {
+            crate::log_info!("[FAIL] CAN: {}", error);
+            crate::println!("[selftest] CAN 完成: 0 通过, 1 失败 ({})", error);
+        }
+    }
 }
 
 /// 运行内核自检 (由 shell `selftest` 命令调用)
@@ -403,15 +660,28 @@ pub(crate) fn run() {
         );
     }
 
-    // CAN 控制器: 内部回环收发一致 (ILB 模式无需引脚/外部收发器;
-    // CANCLK = XTAL, 本配置下 8MHz → 500Kbps, 位时间 16 TQ)
+    // RESET 会清空硬件 RX/STB，应用 CAN/IRQ consumer 存在时不能安全接管。
     if !aborted.get() {
-        let ok = can_loopback_test();
-        check(
-            ok,
-            "CAN: 内部回环收发一致",
-            format_args!("ILB 500Kbps, 标准帧 ID=0x5A5, 8B 模式数据"),
-        );
+        let can = crate::board::BoardResources::get().can();
+        if !crate::config::CAN_SELFTEST_ENABLE {
+            crate::println!("[SKIP] CAN (CFG_CAN_SELFTEST_ENABLE=false)");
+        } else if crate::config::CAN_ENABLE {
+            crate::println!("[SKIP] CAN (应用 CAN 已启用，测试会清空收发队列)");
+        } else if can.irq_registered() {
+            crate::println!("[SKIP] CAN (CAN IRQ consumer 仍已注册)");
+        } else {
+            let result = can_loopback_test();
+            if matches!(result, Err(CanSelftestError::Aborted)) {
+                aborted.set(true);
+                crate::log_info!("[selftest] 收到 ESC, 中断剩余项");
+            } else {
+                check(
+                    result.is_ok(),
+                    "CAN: 内部回环过滤器/PTB/STB/帧格式",
+                    format_args!("{:?}", result),
+                );
+            }
+        }
     }
 
     // 汇总始终打印 (内核打印, 不受日志开关影响)

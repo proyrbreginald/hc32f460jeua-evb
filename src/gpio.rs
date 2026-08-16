@@ -190,48 +190,15 @@ pub mod func {
 
 // ================================ 寄存器层 ================================
 
-/// 内存映射寄存器。
+/// GPIO 寄存器句柄 (16 位宽, 见 [`crate::mmio::Reg`])。
 ///
 /// 偏移量在单态化后是常量表达式 (如 `P::PCR_OFFSET + N as usize * 4`),
 /// LLVM 会将其折叠为直接的易失性 load/store, 零运行时开销。
-struct Reg<T> {
-    offset: usize,
-    _marker: PhantomData<T>,
-}
-
-impl<T> Reg<T> {
-    const fn new(offset: usize) -> Self {
-        Self {
-            offset,
-            _marker: PhantomData,
-        }
-    }
-
-    fn addr(&self) -> *mut T {
-        (GPIO_BASE + self.offset) as *mut T
-    }
-}
-
-impl<T: Copy> Reg<T> {
-    /// 读取寄存器
-    fn read(&self) -> T {
-        unsafe { core::ptr::read_volatile(self.addr()) }
-    }
-
-    /// 写入寄存器
-    fn write(&self, value: T) {
-        unsafe { core::ptr::write_volatile(self.addr(), value) }
-    }
-
-    /// 读-改-写寄存器
-    fn modify(&self, f: impl FnOnce(T) -> T) {
-        self.write(f(self.read()));
-    }
-}
+type Reg = crate::mmio::Reg;
 
 /// PWPR: 端口写保护控制寄存器
-fn pwpr() -> Reg<u16> {
-    Reg::new(0x3FC)
+fn pwpr() -> Reg {
+    Reg::new(GPIO_BASE + 0x3FC)
 }
 
 /// 在解除 PWPR 写保护的状态下执行 `f`, 完成后立即恢复写保护。
@@ -251,9 +218,9 @@ fn pwpr() -> Reg<u16> {
 /// 本路径: 临界区仍保证中断不穿插, 代价可忽略。
 fn with_unlocked<T>(f: impl FnOnce() -> T) -> T {
     crate::critical_section::with(|_| {
-        pwpr().write(PWPR_UNLOCK);
+        pwpr().write_u16(PWPR_UNLOCK);
         let result = f();
-        pwpr().write(PWPR_LOCK);
+        pwpr().write_u16(PWPR_LOCK);
         result
     })
 }
@@ -416,36 +383,36 @@ impl<P: Port, const N: u8> Pin<P, N> {
     }
 
     /// 输入数据寄存器 PIDR (只读, 实时引脚电平)
-    fn pidr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + PIDR_OFF)
+    fn pidr(&self) -> Reg {
+        Reg::new(GPIO_BASE + P::DATA_OFFSET + PIDR_OFF)
     }
     /// 输出数据寄存器 PODR
-    fn podr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + PODR_OFF)
+    fn podr(&self) -> Reg {
+        Reg::new(GPIO_BASE + P::DATA_OFFSET + PODR_OFF)
     }
     /// 输出使能寄存器 POER
-    fn poer(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + POER_OFF)
+    fn poer(&self) -> Reg {
+        Reg::new(GPIO_BASE + P::DATA_OFFSET + POER_OFF)
     }
     /// 置位寄存器 POSR (写 1 输出高电平, 原子操作)
-    fn posr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + POSR_OFF)
+    fn posr(&self) -> Reg {
+        Reg::new(GPIO_BASE + P::DATA_OFFSET + POSR_OFF)
     }
     /// 复位寄存器 PORR (写 1 输出低电平, 原子操作)
-    fn porr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + PORR_OFF)
+    fn porr(&self) -> Reg {
+        Reg::new(GPIO_BASE + P::DATA_OFFSET + PORR_OFF)
     }
     /// 翻转寄存器 POTR (写 1 翻转电平, 原子操作)
-    fn potr(&self) -> Reg<u16> {
-        Reg::new(P::DATA_OFFSET + POTR_OFF)
+    fn potr(&self) -> Reg {
+        Reg::new(GPIO_BASE + P::DATA_OFFSET + POTR_OFF)
     }
     /// 引脚控制寄存器 PCRn
-    fn pcr(&self) -> Reg<u16> {
-        Reg::new(P::PCR_OFFSET + N as usize * 4)
+    fn pcr(&self) -> Reg {
+        Reg::new(GPIO_BASE + P::PCR_OFFSET + N as usize * 4)
     }
     /// 引脚功能选择寄存器 PFSRn
-    fn pfsr(&self) -> Reg<u16> {
-        Reg::new(P::PCR_OFFSET + N as usize * 4 + 2)
+    fn pfsr(&self) -> Reg {
+        Reg::new(GPIO_BASE + P::PCR_OFFSET + N as usize * 4 + 2)
     }
 
     /// 选择周边复用功能 (PFSR.FSEL)
@@ -461,7 +428,7 @@ impl<P: Port, const N: u8> Pin<P, N> {
     pub fn set_func(&self, fsel: u8) {
         with_unlocked(|| {
             let pfsr = self.pfsr();
-            pfsr.write((pfsr.read() & !PFSR_FSEL_MASK) | (fsel as u16 & PFSR_FSEL_MASK));
+            pfsr.write_u16((pfsr.read_u16() & !PFSR_FSEL_MASK) | (fsel as u16 & PFSR_FSEL_MASK));
         });
     }
 
@@ -480,16 +447,16 @@ impl<P: Port, const N: u8> Pin<P, N> {
         with_unlocked(|| {
             // PFSR.FSEL = 0: 选择 GPIO 功能 (仅改 FSEL 位域, 保留 BFE)
             let pfsr = self.pfsr();
-            pfsr.write(pfsr.read() & !PFSR_FSEL_MASK);
+            pfsr.write_u16(pfsr.read_u16() & !PFSR_FSEL_MASK);
 
             // POUT(输出数据) 与 POUTE(输出使能) 同一次写入, 使能瞬间即为目标电平
-            self.pcr().write(build_pcr_value(config));
+            self.pcr().write_u16(build_pcr_value(config));
 
             // 输出使能位同步到 POER
             if output {
-                self.poer().modify(|v| v | bit);
+                self.poer().modify_u16(|v| v | bit);
             } else {
-                self.poer().modify(|v| v & !bit);
+                self.poer().modify_u16(|v| v & !bit);
             }
         });
     }
@@ -499,22 +466,22 @@ impl<P: Port, const N: u8> Pin<P, N> {
     /// POSR/PORR/POTR 是"写 1 生效"的数据寄存器, **不受 PWPR 保护**,
     /// 单次 volatile 写天然原子, 无需临界区/解锁 (对齐 DDL `GPIO_SetPins`)。
     pub fn set_high(&self) {
-        self.posr().write(1u16 << N);
+        self.posr().write_u16(1u16 << N);
     }
 
     /// 输出低电平 (PORR 写 1, 原子操作)
     pub fn set_low(&self) {
-        self.porr().write(1u16 << N);
+        self.porr().write_u16(1u16 << N);
     }
 
     /// 翻转输出电平 (POTR 写 1, 原子操作)
     pub fn toggle(&self) {
-        self.potr().write(1u16 << N);
+        self.potr().write_u16(1u16 << N);
     }
 
     /// 读取引脚实时输入电平 (PIDR)
     pub fn is_high(&self) -> bool {
-        self.pidr().read() & (1u16 << N) != 0
+        self.pidr().read_u16() & (1u16 << N) != 0
     }
 
     /// 引脚是否为低电平
@@ -549,7 +516,7 @@ impl<P: Port, const N: u8> Pin<P, N> {
     /// 注意与 [`Pin::is_high`] (实时输入 PIDR) 的差别: 输入被外设占用/
     /// 引脚外部钳位时, 两者可能不同。
     pub fn output_is_high(&self) -> bool {
-        Reg::<u16>::new(P::DATA_OFFSET + PODR_OFF).read() & (1u16 << N) != 0
+        Reg::new(GPIO_BASE + P::DATA_OFFSET + PODR_OFF).read_u16() & (1u16 << N) != 0
     }
 
     /// 读取引脚输出电平 (PODR)
@@ -566,17 +533,17 @@ impl<P: Port, const N: u8> Pin<P, N> {
 
 /// 读取整个端口的实时输入状态 (PIDR, 对齐 DDL `GPIO_ReadInputPort`)
 pub fn read_input_port<P: Port>() -> u16 {
-    Reg::<u16>::new(P::DATA_OFFSET + PIDR_OFF).read()
+    Reg::new(GPIO_BASE + P::DATA_OFFSET + PIDR_OFF).read_u16()
 }
 
 /// 读取整个端口的输出状态 (PODR, 对齐 DDL `GPIO_ReadOutputPort`)
 pub fn read_output_port<P: Port>() -> u16 {
-    Reg::<u16>::new(P::DATA_OFFSET + PODR_OFF).read()
+    Reg::new(GPIO_BASE + P::DATA_OFFSET + PODR_OFF).read_u16()
 }
 
 /// 写入整个端口的输出数据 (PODR, 对齐 DDL `GPIO_WritePort`)
 pub fn write_output_port<P: Port>(value: u16) {
-    with_unlocked(|| Reg::<u16>::new(P::DATA_OFFSET + PODR_OFF).write(value));
+    with_unlocked(|| Reg::new(GPIO_BASE + P::DATA_OFFSET + PODR_OFF).write_u16(value));
 }
 
 /// 端口输出使能/失能 (POER, 对齐 DDL `GPIO_OutputCmd`)
@@ -584,11 +551,11 @@ pub fn write_output_port<P: Port>(value: u16) {
 /// `mask` 为引脚位掩码 (bit N = 引脚 N), 仅影响掩码位。
 pub fn set_output_enable_port<P: Port>(mask: u16, enable: bool) {
     with_unlocked(|| {
-        let poer = Reg::<u16>::new(P::DATA_OFFSET + POER_OFF);
+        let poer = Reg::new(GPIO_BASE + P::DATA_OFFSET + POER_OFF);
         if enable {
-            poer.modify(|v| v | mask);
+            poer.modify_u16(|v| v | mask);
         } else {
-            poer.modify(|v| v & !mask);
+            poer.modify_u16(|v| v & !mask);
         }
     });
 }

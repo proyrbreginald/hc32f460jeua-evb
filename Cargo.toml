@@ -24,7 +24,9 @@ opt-level = 1
 panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开
 
 [profile.release]
-# 体积优先；当前 `arm-none-eabi-size` 的 text+data 约为 96.5KiB。
+# 体积优先; 当前 `arm-none-eabi-size` 的 text+data 约为 96.5KiB。
 # 对性能敏感的版本应在真机基准后再改用 opt-level=2/3。
 opt-level = "z"
 panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开
+lto = "fat"     # 全程序 LTO: 跨 crate 消重/内联, 比 thin 再省 ~2KiB (配合 codegen-units=1 体积最优)
+codegen-units = 1

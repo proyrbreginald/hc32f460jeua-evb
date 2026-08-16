@@ -39,8 +39,10 @@ pub(crate) const STACK_PATTERN: u32 = 0xA5A5_A5A5;
 pub(crate) const CANARY_SIZE: usize = 4;
 
 /// CPU port 预留的栈守卫区: 位于栈区**下方** (线程自身分配内)。
-pub(crate) const GUARD_SIZE: usize = crate::arch::STACK_GUARD_SIZE;
-const GUARD_ALIGN: usize = crate::arch::STACK_GUARD_ALIGN;
+/// 大小与对齐来自编译期配置 `CFG_MPU_STACK_GUARD` (2 的幂, 区域须
+/// 按自身大小对齐)。
+pub(crate) const GUARD_SIZE: usize = crate::config::MPU_STACK_GUARD;
+const GUARD_ALIGN: usize = crate::config::MPU_STACK_GUARD;
 const _: () = assert!(GUARD_ALIGN.is_power_of_two(), "栈守卫对齐必须为 2 的幂");
 
 /// 构造线程栈分配布局。分配器直接满足 MPU 守卫的 32 字节对齐，布局为

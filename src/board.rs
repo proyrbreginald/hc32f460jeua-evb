@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::gpio::{Config, Drive, Gpio, Mode, Pin, PortA, PortC};
+use crate::gpio::{Config, Drive, Gpio, Mode, Pin, PortA, PortB, PortC};
 use crate::uart::UartConfig;
 
 /// 板载 LED: PC13，引脚号保留现有编译期配置校验。
@@ -21,11 +21,15 @@ pub struct Board {
 pub struct BoardResources {
     led: BoardLed,
     console: crate::config::ConsoleUart,
+    can: crate::can::Can,
 }
+
+static WDT_FEED_MAX_GAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 static RESOURCES: BoardResources = BoardResources {
     led: BoardLed::new(),
     console: crate::config::ConsoleUart::take(),
+    can: crate::can::Can::new(),
 };
 static BOARD_TAKEN: AtomicBool = AtomicBool::new(false);
 static BOARD_READY: AtomicBool = AtomicBool::new(false);
@@ -41,7 +45,7 @@ impl Board {
 
     /// 初始化开发板并返回静态板级资源。
     ///
-    /// 顺序保持为：时钟 -> MPU -> GPIO -> SysTick -> UART -> RTC。
+    /// 顺序保持为：时钟 -> MPU -> GPIO -> SysTick -> UART -> CAN -> RTC。
     pub fn init(self) -> &'static BoardResources {
         // 振荡器/PLL 失败时硬件仍保持或回退到可用源。先保存结果，等
         // UART 就绪后报告，后续外设一律按实际时钟计算分频。
@@ -65,6 +69,12 @@ impl Board {
             .set_func(crate::config::UART_TX_FSEL);
         gpio.pin::<PortA, { crate::config::UART_RX_PIN }>()
             .set_func(crate::config::UART_RX_FSEL);
+        if crate::config::CAN_ENABLE {
+            gpio.pin::<PortB, { crate::config::CAN_TX_PIN }>()
+                .set_func(crate::config::CAN_TX_FSEL);
+            gpio.pin::<PortB, { crate::config::CAN_RX_PIN }>()
+                .set_func(crate::config::CAN_RX_FSEL);
+        }
 
         crate::systick::init(crate::config::SYSTICK_FREQ_HZ).expect("SysTick 配置失败!");
         crate::log_debug!("SysTick: {} Hz", crate::config::SYSTICK_FREQ_HZ);
@@ -117,6 +127,45 @@ impl Board {
             crate::config::UART_OVERSAMPLE,
             crate::config::UART_CLOCK_DIV
         );
+
+        // DMA: 外设时钟使能 + 控制台 UART 发送卸载 (USART_TI 事件触发)。
+        // 输出达标时 `Uart::write` 自动改用 DMA 整块发送, 长输出不再
+        // 逐字节轮询 TXE。
+        if crate::config::DMA_ENABLE {
+            crate::dma::init();
+            crate::dma::uart_tx_init();
+            crate::log_debug!(
+                "DMA: 控制台 TX 卸载到 DMA{} CH{} (USART{} TI 事件, 阈值 {}B)",
+                crate::config::DMA_TX_UNIT,
+                crate::config::DMA_TX_CHANNEL,
+                crate::config::UART_UNIT,
+                crate::config::DMA_TX_MIN
+            );
+        }
+
+        if crate::config::CAN_ENABLE {
+            let timing = RESOURCES
+                .can
+                .init(crate::config::CAN_CONFIG)
+                .expect("CAN 初始化失败");
+            assert_eq!(
+                timing,
+                crate::config::CAN_BIT_TIMING,
+                "CAN 运行时与编译期位时序不一致"
+            );
+            crate::log_debug!(
+                "CAN: {} bps (实际 {} bps, 误差 {}ppm, 采样点 {}‰, {}TQ, PRESC={}, SEG1={}, SEG2={}, SJW={})",
+                crate::config::CAN_BITRATE,
+                timing.actual_bitrate(crate::clk::XTAL_HZ),
+                timing.error_ppm(crate::clk::XTAL_HZ, crate::config::CAN_BITRATE),
+                timing.sample_point_permille(),
+                timing.total_time_quanta(),
+                timing.prescaler,
+                timing.time_seg1,
+                timing.time_seg2,
+                timing.sjw
+            );
+        }
 
         if crate::config::RTC_ENABLE {
             crate::rtc::init(crate::rtc::Config {
@@ -184,6 +233,27 @@ impl BoardResources {
         &self.console
     }
 
+    /// 检测用户是否按下 ESC (0x1B): 轮询并清空接收缓冲。
+    ///
+    /// 长时间运行的测试 (自检/soak) 期间终端输入一律丢弃 (ESC 除外);
+    /// 返回 true 表示请求中断。放在本模块以便 selftest 与 soak 共享。
+    #[cfg(shell_selftest)]
+    pub(crate) fn abort_requested(&self) -> bool {
+        let mut esc = false;
+        while let Some(b) = self.console.read_rx() {
+            if b == 0x1B {
+                esc = true;
+            }
+        }
+        esc
+    }
+
+    /// 板级唯一 CAN 控制器句柄。
+    #[cfg(shell_selftest)]
+    pub(crate) fn can(&self) -> &crate::can::Can {
+        &self.can
+    }
+
     /// 注册并使能控制台 UART 接收中断。
     pub fn enable_console_rx_interrupt(&self) {
         self.console.enable_rx_interrupt(
@@ -237,12 +307,37 @@ fn apply_thread_memory_protection(next: crate::rtos::ContextSwitchInfo) {
     crate::mpu::set_thread_guard(next.guard_base);
 }
 
+/// 检测用户是否按下 ESC (0x1B): 轮询并清空接收缓冲。
+///
+/// 长时间运行的测试 (自检/soak) 期间终端输入一律丢弃 (ESC 除外);
+/// 返回 true 表示请求中断。selftest 与 soak 均通过本函数共享。
+#[cfg(shell_selftest)]
+pub(crate) fn abort_requested() -> bool {
+    BoardResources::get().abort_requested()
+}
+
 /// 最高优先级 WDT supervisor：周期休眠，避免合法的长时间轮询输出因
 /// idle 无法运行而误触发复位，同时验证 SysTick/PendSV 仍可调度线程。
 extern "C" fn watchdog_supervisor(_param: usize) {
+    let mut last = crate::rtos::uptime_ms();
     loop {
         crate::wdt::feed();
         crate::rtos::thread_delay_ms(crate::config::WDT_FEED_INTERVAL_MS)
             .expect("WDT supervisor 必须在线程上下文运行");
+        // 记录实测最大喂狗间隔 (供压力测试报告证明余量): supervisor
+        // 为最高优先级, 实际间隔 ≈ 周期 + 节拍抖动
+        let now = crate::rtos::uptime_ms();
+        let gap = now.wrapping_sub(last);
+        last = now;
+        WDT_FEED_MAX_GAP.fetch_max(
+            gap.max(crate::config::WDT_FEED_INTERVAL_MS),
+            Ordering::Relaxed,
+        );
     }
+}
+
+/// 实测最大喂狗间隔 (毫秒; supervisor 运行后累计的最大值)
+#[cfg(shell_soak)]
+pub fn wdt_feed_max_gap_ms() -> u32 {
+    WDT_FEED_MAX_GAP.load(Ordering::Relaxed)
 }

@@ -33,38 +33,12 @@ const SYST_BASE: usize = 0xE000_E010;
 /// 重装载值寄存器宽度 (24 位)
 const RELOAD_MASK: u32 = 0x00FF_FFFF;
 
-/// 内存映射寄存器 (绝对地址, 32 位)
-struct Reg {
-    addr: usize,
-}
-
-impl Reg {
-    const fn new(offset: usize) -> Self {
-        Self {
-            addr: SYST_BASE + offset,
-        }
-    }
-
-    fn read(&self) -> u32 {
-        unsafe { core::ptr::read_volatile(self.addr as *mut u32) }
-    }
-
-    fn write(&self, value: u32) {
-        unsafe { core::ptr::write_volatile(self.addr as *mut u32, value) }
-    }
-
-    /// 读-改-写寄存器
-    fn modify(&self, f: impl FnOnce(u32) -> u32) {
-        self.write(f(self.read()));
-    }
-}
-
-/// 控制与状态寄存器 (CSR)
-const CSR: Reg = Reg::new(0x00);
+/// 控制与状态寄存器 (CSR; 寄存器句柄见 [`crate::mmio::Reg`])
+const CSR: crate::mmio::Reg = crate::mmio::Reg::new(SYST_BASE + 0x00);
 /// 重装载值寄存器 (RVR)
-const RVR: Reg = Reg::new(0x04);
+const RVR: crate::mmio::Reg = crate::mmio::Reg::new(SYST_BASE + 0x04);
 /// 当前值寄存器 (CVR)
-const CVR: Reg = Reg::new(0x08);
+const CVR: crate::mmio::Reg = crate::mmio::Reg::new(SYST_BASE + 0x08);
 
 /// CSR 位定义
 const CSR_ENABLE: u32 = 1 << 0; // 计数器使能

@@ -4,17 +4,31 @@
 //! board partition and narrows the permissive EFM driver to the filesystem's
 //! NOR contract: relative addresses, one owner, aligned one-shot programming,
 //! and mandatory erase/program readback.
+//!
+//! # 线程模型
+//!
+//! 挂载后的文件系统实例存放在全局 [`FILESYSTEM`] (`rtos::Mutex`, 优先级
+//! 继承), 任意线程可经 [`mounted`] 获取独占守卫后使用 — shell 命令与
+//! 日志落盘线程 (见 [`crate::logfile`]) 共享同一个实例。
+//!
+//! [`InternalFlash`] 原本以 `PhantomData<*mut ()>` 声明 `!Send + !Sync`
+//! 把 Flash 访问限定在单线程; 现在经 `unsafe impl Send` 放宽, 安全契约:
+//! - 所有 `FileSystem`/`InternalFlash` 访问都发生在 `rtos::Mutex` 保护内
+//!   (持锁期间互斥, 锁有优先级继承, 高优先级等待者不会无界阻塞);
+//! - 阻塞取锁在中断上下文会返回错误, 未挂载/ISR 访问被明确拒绝;
+//! - 单核系统上临界区原语保证锁状态与 Flash 控制器状态一致。
 #![allow(dead_code)]
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::rtos::{Mutex, Timeout};
 use littlefs::BlockDevice;
 
-/// First filesystem sector (sector 54).
-pub const PARTITION_START: u32 = 0x0006_C000;
-/// Filesystem partition size: sectors 54 through 61.
-pub const PARTITION_SIZE: u32 = 64 * 1024;
+/// First filesystem sector (sector 46).
+pub const PARTITION_START: u32 = 0x0005_C000;
+/// Filesystem partition size: sectors 46 through 61 (128KiB).
+pub const PARTITION_SIZE: u32 = 128 * 1024;
 /// HC32F460 main-Flash erase sector size.
 pub const BLOCK_SIZE: u32 = crate::efm::SECTOR_SIZE;
 /// Number of sectors in the filesystem partition.
@@ -24,9 +38,12 @@ pub const PARTITION_END: u32 = PARTITION_START + PARTITION_SIZE;
 
 const _: () = assert!(PARTITION_START.is_multiple_of(crate::efm::SECTOR_SIZE));
 const _: () = assert!(PARTITION_END == 0x0007_C000);
-const _: () = assert!(BLOCK_COUNT == 8);
+const _: () = assert!(BLOCK_COUNT == 16);
 
 static TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// 全局文件系统实例 (唯一所有者; 经 [`mounted`] 获取)
+static FILESYSTEM: Mutex<Option<FileSystem>> = Mutex::new(None);
 
 /// Filesystem-specific internal-Flash failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +64,17 @@ pub enum FlashError {
 
 /// Unique owner of sectors 54 through 61.
 ///
-/// `PhantomData<*mut ()>` intentionally keeps this token `!Send + !Sync`:
-/// Flash operations stall the executing bus and are confined to one thread.
+/// SAFETY (`unsafe impl Send`): 本类型原以 `PhantomData<*mut ()>` 声明
+/// `!Send + !Sync` 以把 Flash 访问限定在单线程。放宽为 `Send` 的前提是
+/// 模块级契约: 实例只能存放在 [`FILESYSTEM`] 中, 一切访问必须经由
+/// `rtos::Mutex` 串行化 (见模块文档"线程模型"); 该契约由 [`mounted`]
+/// 的守卫类型强制, `InternalFlash`/`FileSystem` 无任何脱离锁的访问路径。
 pub struct InternalFlash {
     _not_send_or_sync: PhantomData<*mut ()>,
 }
+
+// SAFETY: 见结构体文档 —— 所有访问经 `FILESYSTEM` 互斥量串行化
+unsafe impl Send for InternalFlash {}
 
 impl InternalFlash {
     /// Acquires the filesystem partition once. Dropping the token releases it.
@@ -94,24 +117,46 @@ impl InternalFlash {
 
     fn verify_erased(block: u32) -> Result<(), FlashError> {
         let base = Self::address(block, 0, BLOCK_SIZE as usize)?;
-        let mut offset = 0;
-        while offset < BLOCK_SIZE {
-            if crate::efm::read_word(base + offset).map_err(FlashError::Controller)? != u32::MAX {
-                return Err(FlashError::VerifyFailed);
-            }
-            offset += 4;
+        if !Self::region_erased(base, BLOCK_SIZE as usize)? {
+            return Err(FlashError::VerifyFailed);
         }
         Ok(())
     }
 
     fn partition_is_erased(&self) -> Result<bool, FlashError> {
         Self::check_thread_context()?;
-        let mut address = PARTITION_START;
-        while address < PARTITION_END {
-            if crate::efm::read_word(address).map_err(FlashError::Controller)? != u32::MAX {
-                return Ok(false);
+        Self::region_erased(PARTITION_START, PARTITION_SIZE as usize)
+    }
+
+    /// 校验 [address, address+len) 是否全部为擦除态 (0xFF)。
+    ///
+    /// 优先 DMA 整块读回 (Flash→RAM, 见 [`crate::dma::copy_try`]),
+    /// 回退逐字轮询; 逐 1KiB 分块, 栈缓冲零分配。
+    fn region_erased(address: u32, len: usize) -> Result<bool, FlashError> {
+        let mut scratch = [0xFFu8; 1024];
+        let mut offset = 0;
+        while offset < len {
+            let chunk = (len - offset).min(scratch.len());
+            if crate::dma::copy_try(
+                (address + offset as u32) as *const u8,
+                scratch.as_mut_ptr(),
+                chunk,
+            ) {
+                if scratch[..chunk].iter().any(|&b| b != 0xFF) {
+                    return Ok(false);
+                }
+            } else {
+                let mut i = 0;
+                while i < chunk {
+                    let actual = crate::efm::read_word(address + offset as u32 + i as u32)
+                        .map_err(FlashError::Controller)?;
+                    if actual != u32::MAX {
+                        return Ok(false);
+                    }
+                    i += 4;
+                }
             }
-            address += 4;
+            offset += chunk;
         }
         Ok(true)
     }
@@ -137,6 +182,11 @@ impl BlockDevice for InternalFlash {
     fn read(&mut self, block: u32, offset: u32, buffer: &mut [u8]) -> Result<(), Self::Error> {
         Self::check_thread_context()?;
         let address = Self::address(block, offset, buffer.len())?;
+        // 大块读取走 DMA 整块拷贝 (Flash→RAM, 比逐字节循环快约一个数量级);
+        // 未接管 (过短/通道忙) 时回退逐字节轮询。
+        if crate::dma::copy_try(address as *const u8, buffer.as_mut_ptr(), buffer.len()) {
+            return Ok(());
+        }
         for (index, byte) in buffer.iter_mut().enumerate() {
             *byte =
                 crate::efm::read_byte(address + index as u32).map_err(FlashError::Controller)?;
@@ -163,12 +213,30 @@ impl BlockDevice for InternalFlash {
 
         crate::efm::program(address, data).map_err(FlashError::Controller)?;
 
-        for (index, expected) in data.chunks_exact(4).enumerate() {
-            let actual = crate::efm::read_word(address + (index * 4) as u32)
-                .map_err(FlashError::Controller)?;
-            if actual.to_le_bytes() != expected {
-                return Err(FlashError::VerifyFailed);
+        // 写后回读校验: 优先 DMA 整块回读 (Flash→RAM) 后比较, 回退逐字。
+        let mut scratch = [0u8; 1024];
+        let mut offset = 0;
+        while offset < data.len() {
+            let chunk = (data.len() - offset).min(scratch.len());
+            if crate::dma::copy_try(
+                (address + offset as u32) as *const u8,
+                scratch.as_mut_ptr(),
+                chunk,
+            ) {
+                if scratch[..chunk] != data[offset..offset + chunk] {
+                    return Err(FlashError::VerifyFailed);
+                }
+            } else {
+                for (index, expected) in data[offset..offset + chunk].chunks_exact(4).enumerate() {
+                    let actual =
+                        crate::efm::read_word(address + offset as u32 + (index * 4) as u32)
+                            .map_err(FlashError::Controller)?;
+                    if actual.to_le_bytes() != expected {
+                        return Err(FlashError::VerifyFailed);
+                    }
+                }
             }
+            offset += chunk;
         }
         Ok(())
     }
@@ -193,12 +261,51 @@ impl BlockDevice for InternalFlash {
 /// Mounted filesystem over the board's fixed internal-Flash partition.
 pub type FileSystem = littlefs::FileSystem<InternalFlash>;
 
+/// 挂载句柄: 持锁期间独占文件系统实例 (`Deref`/`DerefMut` → `FileSystem`)。
+/// 守卫析构即释放互斥量; 在 shell 线程持有期间, 日志落盘线程会阻塞等待。
+pub struct MountGuard {
+    inner: crate::rtos::MutexGuard<'static, Option<FileSystem>>,
+}
+
+impl core::ops::Deref for MountGuard {
+    type Target = FileSystem;
+
+    fn deref(&self) -> &FileSystem {
+        self.inner.as_ref().expect("MountGuard 仅来自已挂载状态")
+    }
+}
+
+impl core::ops::DerefMut for MountGuard {
+    fn deref_mut(&mut self) -> &mut FileSystem {
+        self.inner.as_mut().expect("MountGuard 仅来自已挂载状态")
+    }
+}
+
+/// 获取已挂载文件系统的独占访问守卫 (未挂载返回 `None`)。
+///
+/// 阻塞等待互斥量 (优先级继承); 仅可在线程上下文调用。
+pub fn mounted() -> Option<MountGuard> {
+    let guard = FILESYSTEM.lock(Timeout::Forever).ok()?;
+    if guard.is_none() {
+        return None;
+    }
+    Some(MountGuard { inner: guard })
+}
+
+/// 把新实例发布到全局槽位 (替换旧实例, 旧实例析构释放分区 token)
+fn publish(filesystem: FileSystem) {
+    let mut guard = FILESYSTEM
+        .lock(Timeout::Forever)
+        .expect("发布文件系统必须在线程上下文");
+    drop(guard.replace(filesystem));
+}
+
 /// Result of starting the filesystem during boot.
 pub enum Startup {
     /// An existing committed snapshot was mounted without writing Flash.
-    Mounted(FileSystem),
+    Mounted,
     /// A completely erased partition was initialized with an empty snapshot.
-    Formatted(FileSystem),
+    Formatted,
 }
 
 /// Starts the filesystem during boot.
@@ -207,10 +314,13 @@ pub enum Startup {
 /// when every word in the partition is still erased; non-erased invalid media
 /// is preserved for explicit diagnosis or recovery.
 pub fn start(
-    resources: &crate::board::BoardResources,
+    _resources: &crate::board::BoardResources,
 ) -> Result<Startup, littlefs::Error<FlashError>> {
-    match mount(resources) {
-        Ok(filesystem) => Ok(Startup::Mounted(filesystem)),
+    match mount() {
+        Ok(filesystem) => {
+            publish(filesystem);
+            Ok(Startup::Mounted)
+        }
         Err(littlefs::Error::NotFormatted) => {
             let device = InternalFlash::take().ok_or(littlefs::Error::DeviceBusy)?;
             if !device
@@ -219,24 +329,34 @@ pub fn start(
             {
                 return Err(littlefs::Error::NotFormatted);
             }
-            littlefs::FileSystem::format(device).map(Startup::Formatted)
+            let filesystem = littlefs::FileSystem::format(device)?;
+            publish(filesystem);
+            Ok(Startup::Formatted)
         }
         Err(error) => Err(error),
     }
 }
 
-/// Mounts the existing internal filesystem after board initialization.
-pub fn mount(
-    _resources: &crate::board::BoardResources,
-) -> Result<FileSystem, littlefs::Error<FlashError>> {
+/// Mounts the existing internal filesystem (独占分区 token, 替换全局实例)。
+pub fn mount() -> Result<FileSystem, littlefs::Error<FlashError>> {
     let device = InternalFlash::take().ok_or(littlefs::Error::DeviceBusy)?;
     littlefs::FileSystem::mount(device)
 }
 
-/// Atomically formats the internal filesystem after board initialization.
-pub fn format(
-    _resources: &crate::board::BoardResources,
-) -> Result<FileSystem, littlefs::Error<FlashError>> {
+/// Atomically formats the internal filesystem (独占分区 token)。
+pub fn format() -> Result<FileSystem, littlefs::Error<FlashError>> {
     let device = InternalFlash::take().ok_or(littlefs::Error::DeviceBusy)?;
     littlefs::FileSystem::format(device)
+}
+
+/// 丢弃当前实例并重新挂载 (shell `mount` 命令与写错误恢复用)。
+pub fn remount() -> Result<(), littlefs::Error<FlashError>> {
+    let mut guard = FILESYSTEM
+        .lock(Timeout::Forever)
+        .map_err(|_| littlefs::Error::DeviceBusy)?;
+    drop(guard.take()); // 释放旧实例的 InternalFlash token
+    let device = InternalFlash::take().ok_or(littlefs::Error::DeviceBusy)?;
+    let filesystem = littlefs::FileSystem::mount(device)?;
+    *guard = Some(filesystem);
+    Ok(())
 }

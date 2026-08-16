@@ -2,14 +2,17 @@ mod common;
 
 use common::{RamError, RamNor, read_all};
 use littlefs::format::{
-    COMMIT_OFFSET, HEADER_SIZE, RECORD_FLAG_DIRECTORY, RECORD_HEADER_SIZE, RecordHeader,
-    SnapshotHeader, crc32_mpeg2, generation_is_newer,
+    COMMIT_OFFSET, HEADER_SIZE, MAX_WEAR_TABLE_SIZE, RECORD_FLAG_DIRECTORY, RECORD_HEADER_SIZE,
+    RecordHeader, SnapshotHeader, crc32_mpeg2, encode_wear_table, generation_is_newer,
 };
 use littlefs::{EntryKind, Error, FileSystem, Geometry, MAX_FILES};
 
 fn raw_snapshot(records: &[(&str, u16, &[u8])]) -> RamNor {
     let geometry = Geometry::new(512, 8);
     let mut payload = Vec::new();
+    let mut table = [0u8; MAX_WEAR_TABLE_SIZE];
+    let table_size = encode_wear_table(&[0; 64], geometry.block_count, &mut table).unwrap();
+    payload.extend_from_slice(&table[..table_size]);
     for &(name, flags, data) in records {
         let header = RecordHeader::new(
             name.len() as u16,

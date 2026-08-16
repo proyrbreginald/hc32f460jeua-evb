@@ -15,8 +15,8 @@ pub const ERASED_WORD: u32 = 0xffff_ffff;
 pub const MAGIC: u32 = 0x3153_4652;
 /// Alias that makes the kind of [`MAGIC`] explicit at call sites.
 pub const SNAPSHOT_MAGIC: u32 = MAGIC;
-/// On-disk format version 1.0.
-pub const DISK_VERSION: u32 = 0x0001_0000;
+/// On-disk format version 1.1 (adds the per-block wear table to the payload).
+pub const DISK_VERSION: u32 = 0x0001_0001;
 /// The word programmed last to make a snapshot visible to recovery.
 pub const COMMIT_MARKER: u32 = 0xc35a_6f91;
 
@@ -47,6 +47,28 @@ pub const SUPPORTED_FEATURES: u32 = 0;
 pub const RECORD_FLAG_DIRECTORY: u16 = 1 << 0;
 /// Record flag bits understood by this format version.
 pub const SUPPORTED_RECORD_FLAGS: u16 = RECORD_FLAG_DIRECTORY;
+
+/// Width in bytes of one on-disk per-block erase counter.
+pub const WEAR_ENTRY_SIZE: usize = 2;
+/// Upper bound on device block count accepted by the wear-leveling codec.
+pub const MAX_WEAR_BLOCKS: usize = 64;
+/// Maximum on-disk wear-table size in bytes.
+pub const MAX_WEAR_TABLE_SIZE: usize = MAX_WEAR_BLOCKS * WEAR_ENTRY_SIZE;
+
+/// Return the fixed on-disk wear-table size for a device geometry.
+///
+/// The table holds one little-endian `u16` erase counter per block and is
+/// padded to a program-unit boundary. It is the first bytes of every snapshot
+/// payload and is covered by the snapshot payload CRC.
+pub const fn wear_table_size(block_count: u32) -> u32 {
+    match block_count.checked_mul(WEAR_ENTRY_SIZE as u32) {
+        Some(size) => match checked_align_4(size) {
+            Some(size) => size,
+            None => u32::MAX,
+        },
+        None => u32::MAX,
+    }
+}
 
 /// Runtime geometry reported by a block device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,6 +272,24 @@ impl SnapshotHeader {
         Geometry::new(self.block_size, self.block_count)
     }
 
+    /// Logical offset of the record area within the snapshot segment.
+    ///
+    /// The payload begins with the fixed wear table (see [`wear_table_size`])
+    /// immediately after the snapshot header; entry records follow it.
+    /// Logical offset of the entry-record area within the snapshot segment.
+    ///
+    /// The payload begins at [`HEADER_SIZE`] with the fixed wear table (see
+    /// [`wear_table_size`]); entry records follow the table. Record-relative
+    /// offsets in the record codec are relative to this position.
+    pub const fn records_base(&self) -> u32 {
+        HEADER_SIZE as u32 + wear_table_size(self.block_count)
+    }
+
+    /// Length of the record area in bytes (payload minus the wear table).
+    pub const fn records_len(&self) -> u32 {
+        self.payload_len - wear_table_size(self.block_count)
+    }
+
     /// Validate fields that can be checked without consulting a live device.
     pub fn validate(&self) -> Result<(), FormatError> {
         validate_block_geometry(self.geometry())?;
@@ -263,6 +303,9 @@ impl SnapshotHeader {
             return Err(FormatError::TooManyFiles {
                 found: self.file_count,
             });
+        }
+        if self.payload_len < wear_table_size(self.block_count) {
+            return Err(FormatError::SnapshotOutOfBounds);
         }
 
         let expected_span = checked_snapshot_span(self.payload_len, self.block_size)
@@ -430,6 +473,57 @@ pub const fn commit_marker_bytes() -> [u8; PROGRAM_SIZE] {
     COMMIT_MARKER.to_le_bytes()
 }
 
+/// Encode the per-block erase counts as a little-endian table.
+///
+/// `wear` must be at least `block_count` entries; entries beyond the count are
+/// ignored, so the whole fixed-size RAM array can be passed directly.
+/// Returns the padded table size, which equals [`wear_table_size`].
+pub fn encode_wear_table(
+    wear: &[u16],
+    block_count: u32,
+    out: &mut [u8],
+) -> Result<usize, FormatError> {
+    let size = wear_table_size(block_count);
+    let size = usize::try_from(size).map_err(|_| FormatError::BufferTooSmall {
+        required: usize::MAX,
+        actual: out.len(),
+    })?;
+    if out.len() < size || wear.len() < block_count as usize {
+        return Err(FormatError::BufferTooSmall {
+            required: size,
+            actual: out.len(),
+        });
+    }
+    for (index, &count) in wear[..block_count as usize].iter().enumerate() {
+        write_u16(out, index * WEAR_ENTRY_SIZE, count);
+    }
+    // The padding to the program-unit boundary is already zero.
+    Ok(size)
+}
+
+/// Decode a little-endian per-block erase-count table.
+pub fn decode_wear_table(
+    bytes: &[u8],
+    block_count: u32,
+    out: &mut [u16],
+) -> Result<usize, FormatError> {
+    let size = wear_table_size(block_count);
+    let size = usize::try_from(size).map_err(|_| FormatError::BufferTooSmall {
+        required: usize::MAX,
+        actual: bytes.len(),
+    })?;
+    if bytes.len() < size || out.len() < block_count as usize {
+        return Err(FormatError::BufferTooSmall {
+            required: size,
+            actual: bytes.len(),
+        });
+    }
+    for (index, count) in out[..block_count as usize].iter_mut().enumerate() {
+        *count = read_u16(bytes, index * WEAR_ENTRY_SIZE);
+    }
+    Ok(size)
+}
+
 /// Fields stored in each 20-byte entry-record header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordHeader {
@@ -565,12 +659,15 @@ pub const fn generation_is_newer(candidate: u32, reference: u32) -> bool {
 }
 
 fn validate_block_geometry(geometry: Geometry) -> Result<(), FormatError> {
-    if geometry.block_size < HEADER_SIZE as u32 || !is_aligned_4(geometry.block_size) {
+    if geometry.block_size < HEADER_SIZE as u32
+        || !is_aligned_4(geometry.block_size)
+        || geometry.block_size < wear_table_size(geometry.block_count)
+    {
         return Err(FormatError::InvalidBlockSize {
             found: geometry.block_size,
         });
     }
-    if geometry.block_count < 2 {
+    if geometry.block_count < 2 || geometry.block_count > MAX_WEAR_BLOCKS as u32 {
         return Err(FormatError::InvalidBlockCount {
             found: geometry.block_count,
         });
@@ -816,6 +913,67 @@ mod tests {
         assert_eq!(checked_record_len(1, u32::MAX), None);
         assert_eq!(checked_snapshot_span(u32::MAX, 64), None);
         assert_eq!(checked_snapshot_span(0, 0), None);
+    }
+
+    #[test]
+    fn wear_table_size_is_padded_and_bounded() {
+        assert_eq!(wear_table_size(0), 0);
+        assert_eq!(wear_table_size(8), 16);
+        assert_eq!(wear_table_size(16), 32);
+        assert_eq!(wear_table_size(9), 20);
+        assert_eq!(wear_table_size(MAX_WEAR_BLOCKS as u32), 128);
+        assert_eq!(wear_table_size(u32::MAX), u32::MAX);
+        assert_eq!(MAX_WEAR_TABLE_SIZE, 128);
+    }
+
+    #[test]
+    fn wear_table_codec_round_trips_and_pads() {
+        let mut wear = [0u16; MAX_WEAR_BLOCKS];
+        wear[0] = 0x1234;
+        wear[1] = 0x0055;
+        wear[2] = 0xffff;
+        wear[3] = 0x0000;
+        let mut bytes = [0u8; MAX_WEAR_TABLE_SIZE];
+        let size = encode_wear_table(&wear, 8, &mut bytes).unwrap();
+        assert_eq!(size, 16);
+        assert_eq!(&bytes[0..2], &0x1234u16.to_le_bytes());
+        assert_eq!(&bytes[2..4], &0x0055u16.to_le_bytes());
+        assert_eq!(&bytes[4..6], &0xffffu16.to_le_bytes());
+        assert_eq!(&bytes[6..8], &0x0000u16.to_le_bytes());
+        assert_eq!(&bytes[8..16], &[0u8; 8]);
+
+        let mut decoded = [0u16; MAX_WEAR_BLOCKS];
+        assert_eq!(decode_wear_table(&bytes, 8, &mut decoded).unwrap(), 16);
+        assert_eq!(&decoded[..4], &wear[..4]);
+        assert_eq!(decoded[7], 0);
+        assert!(decoded[8..].iter().all(|count| *count == 0));
+
+        assert!(encode_wear_table(&wear, 8, &mut bytes[..8]).is_err());
+        assert!(decode_wear_table(&bytes[..8], 8, &mut decoded).is_err());
+        assert!(encode_wear_table(&[0u16; 8], 9, &mut bytes).is_err());
+        assert!(decode_wear_table(&bytes, 9, &mut [0u16; 8]).is_err());
+    }
+
+    #[test]
+    fn records_base_follows_the_wear_table() {
+        let header = sample_header();
+        assert_eq!(header.records_base(), (HEADER_SIZE + 16) as u32);
+        let big = SnapshotHeader::new(0, 0, 32, 0, 0, Geometry::new(8192, 16)).unwrap();
+        assert_eq!(big.records_base(), (HEADER_SIZE + 32) as u32);
+        assert_eq!(big.records_len(), 0);
+        assert_eq!(sample_header().records_len(), 64 - 16);
+    }
+
+    #[test]
+    fn geometry_rejects_oversized_block_counts_and_tables() {
+        assert_eq!(
+            SnapshotHeader::new(0, 0, 0, 0, 0, Geometry::new(8192, 65)),
+            Err(FormatError::InvalidBlockCount { found: 65 })
+        );
+        assert_eq!(
+            SnapshotHeader::new(0, 0, 0, 0, 0, Geometry::new(64, 64)),
+            Err(FormatError::InvalidBlockSize { found: 64 })
+        );
     }
 
     #[test]

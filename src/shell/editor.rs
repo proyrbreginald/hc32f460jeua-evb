@@ -131,13 +131,13 @@ fn parse_cursor_report(bytes: &[u8]) -> CursorReport {
 }
 
 pub(super) fn run(state: &mut ShellState, name: &str) {
-    if state.filesystem.is_none() {
+    let Some(mut filesystem) = crate::filesystem::mounted() else {
         super::print_mount_error(state, "nano");
         return;
-    }
+    };
 
     let (buffer, exists, max_bytes) = {
-        let filesystem = state.filesystem.as_mut().unwrap();
+        let filesystem = &mut filesystem;
         match load_document(filesystem, name) {
             Ok(document) => document,
             Err(error) => {
@@ -146,6 +146,7 @@ pub(super) fn run(state: &mut ShellState, name: &str) {
             }
         }
     };
+    drop(filesystem); // 释放文件系统锁: 编辑会话期间不持有 (保存时重新取锁)
 
     let mut input = core::mem::replace(&mut state.pending_rx, PendingRx::new());
     let uart = crate::board::BoardResources::get().console();
@@ -414,27 +415,32 @@ fn save_document(state: &mut ShellState, editor: &mut Editor<'_>) -> bool {
         return true;
     }
 
-    if state.filesystem.is_none() && !state.remount() {
-        editor.status = Some("Filesystem unavailable; buffer kept");
-        return false;
-    }
+    let mut filesystem = match crate::filesystem::mounted() {
+        Some(filesystem) => filesystem,
+        None => {
+            if !state.remount() {
+                editor.status = Some("Filesystem unavailable; buffer kept");
+                return false;
+            }
+            match crate::filesystem::mounted() {
+                Some(filesystem) => filesystem,
+                None => {
+                    editor.status = Some("Filesystem unavailable; buffer kept");
+                    return false;
+                }
+            }
+        }
+    };
 
-    let result = state
-        .filesystem
-        .as_mut()
-        .unwrap()
-        .write(editor.name, &editor.buffer);
+    let result = filesystem.write(editor.name, &editor.buffer);
+    drop(filesystem); // 释放文件系统锁, 允许下面的 remount 重新取锁
     match result {
         Ok(()) => {
             editor.mark_saved("Saved atomically and verified");
             true
         }
         Err(error) => {
-            let recovery_required = state
-                .filesystem
-                .as_ref()
-                .is_some_and(littlefs::FileSystem::recovery_required);
-            if !recovery_required {
+            if !filesystem_recovery_required() {
                 editor.status = Some(save_error_message(&error));
                 return false;
             }
@@ -445,7 +451,9 @@ fn save_document(state: &mut ShellState, editor: &mut Editor<'_>) -> bool {
             }
 
             let matches = durable_file_matches(
-                state.filesystem.as_mut().unwrap(),
+                crate::filesystem::mounted()
+                    .as_mut()
+                    .expect("remount 后已挂载"),
                 editor.name,
                 &editor.buffer,
             );
@@ -465,6 +473,13 @@ fn save_document(state: &mut ShellState, editor: &mut Editor<'_>) -> bool {
             }
         }
     }
+}
+
+/// 只读检查文件系统是否需要恢复性重挂载 (在未持有文件系统锁时调用)
+fn filesystem_recovery_required() -> bool {
+    crate::filesystem::mounted()
+        .map(|filesystem| filesystem.recovery_required())
+        .unwrap_or(false)
 }
 
 fn save_error_message(error: &FsError) -> &'static str {

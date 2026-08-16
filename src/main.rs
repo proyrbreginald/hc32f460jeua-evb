@@ -10,6 +10,7 @@
 extern crate alloc;
 
 // ---- 编译期配置 (.cargo/config.toml [env] → env!) ----
+mod can_timing; // CAN 位时序纯算法 (与主机单测共享)
 mod config;
 
 // ---- 板级支持 (HC32F460JEUA-EVB 资源与初始化编排) ----
@@ -20,12 +21,15 @@ mod arch; // CPU 架构原语 facade (PRIMASK / WFI / DSB / 系统复位)
 mod critical_section; // PRIMASK 临界区 + 中断上下文检测 (ISR 误用防护)
 mod heap; // 全局堆分配器 (边界标记 + 首次适配)
 mod heap_layout; // 堆分配布局规划 (纯逻辑, 可在主机测试)
+mod mmio; // 内存映射寄存器访问原语 (各外设驱动共用)
+mod notify; // 原子回调槽: ISR → 应用无锁通知 (可在主机测试)
 mod panic; // panic/fault 诊断: 寄存器解码 + 栈回溯 + 停机/复位策略
 mod startup; // 复位入口: SRAM/FPU/时钟等待周期 + .data/.bss
 mod vector_table; // 复位/异常/144 外设中断向量表 (原子回调槽)
 
 // ---- 片内资源驱动 (寄存器级, 零依赖) ----
 mod crc; // CRC 硬件加速器: CRC16/32 (X25/CCITT/IEEE), 累加模式
+mod dma; // DMA1/DMA2: 外设触发/软件触发传输 + 控制台 UART 发送卸载
 mod efm; // 片内 Flash (EFM): 擦除/编程/读等待/缓存/引导交换
 mod filesystem; // 断电安全的精简文件系统 + 片内 Flash 分区适配
 mod icg; // ICG 硬件配置段 (flash 0x400, 复位时硬件载入)
@@ -45,6 +49,9 @@ mod uart; // USART1~4: 波特率/过采样/小数分频 + 无锁原子接收环
 // ---- 输出通道 ----
 mod console; // 控制台: 打印锁 (优先级继承) + 原子整行输出
 mod log; // 应用日志: 可开关+分级+彩色, 与内核打印分离
+mod logfile; // 日志落盘线程: RAM 缓冲 → /log/ 轮转文件
+mod logfile_core; // 日志轮转纯逻辑 (槽标记/扫描, 主机单测)
+mod logring; // 日志 RAM 缓冲 (纯逻辑, 主机单测)
 
 // ---- RTOS 内核 (RT-Thread 架构移植) ----
 mod rtos;
@@ -52,8 +59,17 @@ mod uart_rtos; // UART 的 RTOS 阻塞接收适配层
 
 // ---- 应用 ----
 mod banner; // 启动横幅 (依赖 clk/heap/rtos 公共状态)
+#[cfg(shell_selftest)]
 mod selftest; // 内核自检 (shell `selftest` 命令同步执行)
 mod shell; // 仿 Ubuntu 终端: 登录 + 命令提示符 + 系统信息命令
+#[cfg(shell_soak)]
+mod soak; // 长期稳定性测试 (shell `soak` 命令同步执行)
+#[cfg(shell_soak)]
+mod soak_report; // soak 测试结果 → /test/ 单文件 HTML 报告
+#[cfg(shell_soak)]
+mod soak_report_core; // soak 报告纯逻辑 (HTML 构建/文件名, 与 lib 同源, 主机单测)
+#[cfg(shell_zmodem)]
+mod zmodem; // ZMODEM 文件传输协议 (纯逻辑, 主机单测与真实 lrzsz 互通)
 
 use core::sync::atomic::{AtomicU32, Ordering};
 /// 全局堆分配器 (边界标记 + 首次适配, 见 heap 模块)
@@ -99,6 +115,16 @@ pub(crate) fn main() -> ! {
         config::APP_SHELL_PRIORITY,
         config::APP_SHELL_TIMESLICE,
         shell::shell_entry,
+        0,
+    );
+    // 日志落盘线程: 周期性把 RAM 日志缓冲写入 /log/ (文件系统经全局
+    // 互斥量与 shell 共享; 挂载完成前自动跳过)
+    rtos::thread_create(
+        "logfile",
+        config::APP_LOGFILE_STACK,
+        config::APP_LOGFILE_PRIORITY,
+        config::APP_LOGFILE_TIMESLICE,
+        logfile::logfile_entry,
         0,
     );
 

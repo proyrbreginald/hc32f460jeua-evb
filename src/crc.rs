@@ -33,16 +33,12 @@
 
 /// CRC 基址
 const CRC_BASE: usize = 0x4000_8C00;
-/// PWC 基址 (FCG 时钟门控)
-const PWC_BASE: usize = 0x4004_8000;
 
 // ---- 寄存器偏移 (SVD/DDL 逐项核对) ----
 const CR: usize = 0x00; // 协议/格式配置
 const RESLT: usize = 0x04; // 结果/初值 (bit16 = CRC16 完成标志)
 const FLG: usize = 0x0C; // bit0 = CRC32 完成标志
 const DAT0: usize = 0x80; // 数据输入 (写任一即触发计算)
-const FCG0: usize = 0x00; // PWC.FC0: 外设时钟门控 (清位 = 使能)
-const FCG0PC: usize = 0x10; // FCG0 写保护键
 
 // ---- CR 位 ----
 const CR_CRC32: u32 = 1 << 1; // 协议: 0=CRC16, 1=CRC32
@@ -55,9 +51,8 @@ const RESLT_CRCFLAG16: u32 = 1 << 16; // CRC16 完成标志
 const FLG_CRCFLAG32: u32 = 1 << 0; // CRC32 完成标志
 
 // ---- FCG ----
-const FCG0_CRC: u32 = 1 << 23; // CRC 时钟门控 (清位 = 使能)
-const FCG0PC_UNLOCK: u32 = 0xA5A5_0001; // PRT0=1 解除保护
-const FCG0PC_LOCK: u32 = 0xA5A5_0000; // PRT0=0 恢复保护
+/// CRC 时钟门控位 (FCG0, 清位 = 使能; 写保护解锁见 [`crate::clk::fcg0_enable`])
+const FCG0_CRC: u32 = 1 << 23;
 
 /// CRC 协议 (多项式硬件固定)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -143,15 +138,15 @@ impl Config {
 // ============================== 底层寄存器访问 ==============================
 
 fn read32(offset: usize) -> u32 {
-    unsafe { core::ptr::read_volatile((CRC_BASE + offset) as *const u32) }
+    crate::mmio::Reg::new(CRC_BASE + offset).read()
 }
 
 fn write32(offset: usize, value: u32) {
-    unsafe { core::ptr::write_volatile((CRC_BASE + offset) as *mut u32, value) };
+    crate::mmio::Reg::new(CRC_BASE + offset).write(value);
 }
 
 fn write_u16(offset: usize, value: u16) {
-    unsafe { core::ptr::write_volatile((CRC_BASE + offset) as *mut u16, value) };
+    crate::mmio::Reg::new(CRC_BASE + offset).write_u16(value);
 }
 
 /// 当前协议 (读 CR.bit1, 对齐 DDL CRC_GetResult 的 READ_REG32_BIT)
@@ -163,14 +158,9 @@ fn protocol_now() -> Protocol {
     }
 }
 
-/// 使能 CRC 时钟 (FCG0.bit23 清位; FCG0 受 FCG0PC 写保护)
+/// 使能 CRC 时钟 (FCG0 清位; 写保护解锁经 clk 模块共用助手)
 fn clock_enable() {
-    unsafe {
-        core::ptr::write_volatile((PWC_BASE + FCG0PC) as *mut u32, FCG0PC_UNLOCK);
-        let fcg0 = core::ptr::read_volatile((PWC_BASE + FCG0) as *const u32);
-        core::ptr::write_volatile((PWC_BASE + FCG0) as *mut u32, fcg0 & !FCG0_CRC);
-        core::ptr::write_volatile((PWC_BASE + FCG0PC) as *mut u32, FCG0PC_LOCK);
-    }
+    crate::clk::fcg0_enable(FCG0_CRC);
 }
 
 // ============================== 配置与计算 ==============================
@@ -218,16 +208,17 @@ pub fn set_init_value(value: u32) {
 /// 总线字节选通判断元素宽度, 统一 32 位写会把 8 位数据误算成 32 位
 /// 元素。尾部不完整元素忽略 (与 DDL 按元素计数的语义一致)。
 pub fn accumulate(data: &[u8], width: DataWidth) {
+    let dat0 = crate::mmio::Reg::new(CRC_BASE + DAT0);
     match width {
         DataWidth::Byte => {
             for &b in data {
-                unsafe { core::ptr::write_volatile((CRC_BASE + DAT0) as *mut u8, b) };
+                dat0.write_u8(b);
             }
         }
         DataWidth::HalfWord => {
             for chunk in data.chunks_exact(2) {
                 let v = u16::from_le_bytes([chunk[0], chunk[1]]);
-                unsafe { core::ptr::write_volatile((CRC_BASE + DAT0) as *mut u16, v) };
+                dat0.write_u16(v);
             }
         }
         DataWidth::Word => {
@@ -235,7 +226,7 @@ pub fn accumulate(data: &[u8], width: DataWidth) {
                 let mut b = [0u8; 4];
                 b.copy_from_slice(chunk);
                 let v = u32::from_le_bytes(b);
-                unsafe { core::ptr::write_volatile((CRC_BASE + DAT0) as *mut u32, v) };
+                dat0.write(v);
             }
         }
     }

@@ -1,8 +1,7 @@
 //! Cortex-M architecture primitives.
-
-/// Cortex-M MPU 的最小保护区域与基址对齐要求。
-pub(crate) const STACK_GUARD_SIZE: usize = 32;
-pub(crate) const STACK_GUARD_ALIGN: usize = 32;
+//!
+//! 架构层不持有工程配置: 栈守卫尺寸 (CFG_MPU_STACK_GUARD) 等编译期
+//! 常量由 `config` 模块统一提供, 消费方 (rtos/mpu) 直接引用。
 
 /// 进入架构临界区前捕获的不透明中断状态。
 pub(crate) struct InterruptState(u32);
@@ -71,17 +70,16 @@ pub(crate) fn data_sync_barrier() {
 
 /// Request a full system reset through SCB.AIRCR.
 pub(crate) fn system_reset() -> ! {
-    const AIRCR: *mut u32 = 0xE000_ED0C as *mut u32;
+    const AIRCR_ADDR: usize = 0xE000_ED0C;
     const PRIGROUP_MASK: u32 = 0x7 << 8;
     const VECTKEY: u32 = 0x05FA << 16;
     const SYSRESETREQ: u32 = 1 << 2;
 
     disable_interrupts();
     data_sync_barrier();
-    unsafe {
-        let priority_group = core::ptr::read_volatile(AIRCR) & PRIGROUP_MASK;
-        core::ptr::write_volatile(AIRCR, VECTKEY | priority_group | SYSRESETREQ);
-    }
+    let aircr = crate::mmio::Reg::new(AIRCR_ADDR);
+    let priority_group = aircr.read() & PRIGROUP_MASK;
+    aircr.write(VECTKEY | priority_group | SYSRESETREQ);
     data_sync_barrier();
     loop {
         unsafe {

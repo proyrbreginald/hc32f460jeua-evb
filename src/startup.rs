@@ -96,6 +96,8 @@ unsafe extern "C" {
     unsafe static mut _data_ram_end: u32;
     unsafe static mut _bss_ram_start: u32;
     unsafe static mut _bss_ram_end: u32;
+    /// 堆下界 (link.ld: .bss 之后)
+    unsafe static _heap_start: u8;
     /// 堆上界 (link.ld: RAM 顶 - 栈预留 - 主栈 canary)
     static _heap_end: u8;
 }
@@ -132,6 +134,22 @@ pub unsafe extern "C" fn reset_handler_rust() -> ! {
 
         while dest < end {
             core::ptr::write_volatile(dest, 0);
+            dest = dest.add(1);
+        }
+    }
+
+    // 堆区整片预填充 (奇偶校验完整性): SRAMH/SRAM1/2 的偶校验恒使能,
+    // **读取从未写过的字即置奇偶错误标志** (DDL 示例确认: "读取未初始化
+    // SRAM 产生奇偶校验错误")。堆是运行期唯一持续切出新块的区域 ——
+    // 若不预填充, 分配器把从未写过的堆字交给 vec!/String/消息队列等做
+    // 字节粒度写入 (内部读-改-写会先读) 或数据读取时, 会误报奇偶错误。
+    // 整字写入本身不触发校验, 此处一次性写满全堆, 保证后续任何访问都
+    // 命中已写过、奇偶有效的字。
+    unsafe {
+        let mut dest = core::ptr::addr_of!(_heap_start) as *mut u32;
+        let end = core::ptr::addr_of!(_heap_end) as *mut u32;
+        while dest < end {
+            core::ptr::write_volatile(dest, crate::rtos::thread::STACK_PATTERN);
             dest = dest.add(1);
         }
     }

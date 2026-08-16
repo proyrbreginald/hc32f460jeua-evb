@@ -28,14 +28,18 @@
 //! | R0 | FLASH 0x0000_0000, 512KB | RO + 可执行 |
 //! | R1 | 外设 0x4000_0000, 512MB | Device RW + XN |
 //! | R2 | SRAM1/2/3 0x2000_0000, 256KB | RW + XN |
-//! | R3 | SRAMH 0x1FFF_8000, 32KB | RW + XN |
+//! | R3 | 系统 ROM + SRAMH 0x1FFF_0000, 64KB | RW + XN |
 //! | R4 | RET_RAM 0x200F_0000, 4KB | RW + XN |
 //! | R5 | **线程栈守卫 (动态)** | 无访问 + XN |
+//! | R6 | **主栈守卫 (静态)** | 无访问 + XN |
+//! | R7 | SRAM 位带别名 0x2200_0000, 32MB | RW + XN |
 //!
 //! # 开关
 //!
 //! `.cargo/config.toml` `CFG_MPU_ENABLE` (默认开启; 正确代码不受
-//! 影响, 关闭仅用于排查 MPU 相关故障)。
+//! 影响, 关闭仅用于排查 MPU 相关故障)。守卫区大小由
+//! `CFG_MPU_STACK_GUARD` 配置 (2 的幂, 32 字节起; 线程栈与主栈
+//! 共用同一尺寸, 须与 `link.ld` 的 `MPU_GUARD_SIZE` 一致)。
 
 // 完整 API 供应用按需选用 (子区域/缓存属性/守卫开关), 忽略未使用项
 #![allow(dead_code)]
@@ -109,15 +113,24 @@ const fn size_code(bytes: u32) -> u32 {
     bytes.trailing_zeros() - 1
 }
 
-/// 线程栈守卫区大小 (32B, MPU 最小区域粒度)
-pub const STACK_GUARD_SIZE: usize = crate::arch::STACK_GUARD_SIZE;
+/// 线程/主栈守卫区大小 (编译期配置 `CFG_MPU_STACK_GUARD`, 2 的幂)
+pub const STACK_GUARD_SIZE: usize = crate::config::MPU_STACK_GUARD;
+
+/// 主栈 (MSP: 启动/中断栈) 守卫区基址: 由 link.ld 计算
+/// (`RAM 顶 - STACK_SIZE - MPU_GUARD_SIZE`, 见 `_main_stack_guard_base`)
+fn main_stack_guard_base() -> usize {
+    unsafe extern "C" {
+        static _main_stack_guard_base: u8;
+    }
+    core::ptr::addr_of!(_main_stack_guard_base) as usize
+}
 
 fn write32(addr: usize, value: u32) {
-    unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
+    crate::mmio::Reg::new(addr).write(value);
 }
 
 fn read32(addr: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(addr as *const u32) }
+    crate::mmio::Reg::new(addr).read()
 }
 
 /// 完成先前显式内存访问后再修改 MPU 配置 (对齐 CMSIS ARM_MPU_Enable)。
@@ -229,11 +242,13 @@ pub fn init() {
         true,
         NORMAL_WT_SHAREABLE,
     );
-    // R3: SRAMH (32KB) RW + XN
+    // R3: 系统 ROM (0x1FFF_0000, 32KB) + SRAMH (0x1FFF_8000, 32KB)
+    //     RW + XN —— ROM 硬件只读 (写入 BusFault), XN 同时覆盖两者,
+    //     闭合"后台区可执行系统 ROM"的空洞 (应用永不执行 ROM)
     set_region(
         3,
-        0x1FFF_8000,
-        32 * 1024,
+        0x1FFF_0000,
+        64 * 1024,
         AP_FULL,
         true,
         NORMAL_WT_SHAREABLE,
@@ -244,6 +259,32 @@ pub fn init() {
     // **初始必须禁用**: 若以基址 0 配置无访问区域, 会覆盖向量表
     // (0x0~0x20) 导致启动即 MemManage 故障。
     disable_region(5);
+
+    // R6: 主栈 (MSP: 启动/中断栈) 守卫 —— 静态配置一次: 主栈底下方
+    // 一块无访问区域, ISR 深度嵌套溢出立即 MemManage 故障 (原仅有
+    // 4B 软件 canary 兜底)。守卫区下方才是堆, 堆上界经 link.ld
+    // 下移, 堆分配不会落入守卫区。
+    let guard_base = main_stack_guard_base();
+    debug_assert!(guard_base.is_multiple_of(STACK_GUARD_SIZE));
+    set_region(
+        6,
+        guard_base,
+        STACK_GUARD_SIZE as u32,
+        AP_NO_ACCESS,
+        true,
+        STRONGLY_ORDERED_SHAREABLE,
+    );
+    // R7: SRAM 位带别名 (0x2200_0000, 32MB) RW + XN —— 闭合 R2 的 XN
+    // 旁路口: 返回地址损坏到别名区 (0x22000000+偏移) 也能执行 SRAM
+    // 内容; 别名访问在底层 SRAM 上做原子位操作, 属性同 R2。
+    set_region(
+        7,
+        0x2200_0000,
+        32 * 1024 * 1024,
+        AP_FULL,
+        true,
+        NORMAL_WT_SHAREABLE,
+    );
 
     set_enable(true);
 }

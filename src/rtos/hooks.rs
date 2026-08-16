@@ -8,6 +8,7 @@ use crate::critical_section;
 use crate::critical_section::CriticalSection;
 use crate::rtos::klist::KCell;
 use crate::rtos::thread::ThreadInner;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Function invoked once per idle-loop iteration.
 pub type IdleHook = fn();
@@ -30,6 +31,31 @@ pub type ContextSwitchHook = fn(ContextSwitchInfo);
 
 static IDLE_HOOK: KCell<Option<IdleHook>> = KCell::new(None);
 static CONTEXT_SWITCH_HOOK: KCell<Option<ContextSwitchHook>> = KCell::new(None);
+
+/// 空闲线程循环迭代次数 (内置统计: 供 CPU 利用率估算)
+static IDLE_ITERATIONS: AtomicU32 = AtomicU32::new(0);
+/// 上下文切换次数 (内置统计: 供调度器负载评估)
+static CONTEXT_SWITCHES: AtomicU32 = AtomicU32::new(0);
+
+/// 空闲线程循环迭代计数 (自调度器启动累计)。
+///
+/// 空闲循环在系统完全空闲时约每个节拍迭代一次, 可据此估算 CPU
+/// 利用率: `利用率 ≈ 1 − Δ迭代/Δtick` (非精确, 中断唤醒会引入偏差)。
+pub fn idle_iterations() -> u32 {
+    IDLE_ITERATIONS.load(Ordering::Relaxed)
+}
+
+/// 上下文切换计数 (自调度器启动累计; 用户 hook 存在与否均计数)。
+pub fn context_switch_count() -> u32 {
+    CONTEXT_SWITCHES.load(Ordering::Relaxed)
+}
+
+/// 重置内置统计 (仅供压力测试在运行开始对齐基线; 正常情况下
+/// 统计自启动累计, 供长期诊断)。
+pub fn reset_stats() {
+    IDLE_ITERATIONS.store(0, Ordering::Relaxed);
+    CONTEXT_SWITCHES.store(0, Ordering::Relaxed);
+}
 
 /// Install or remove the idle hook.
 ///
@@ -65,6 +91,7 @@ pub fn set_context_switch_hook(hook: Option<ContextSwitchHook>) {
 }
 
 pub(crate) fn run_idle_hook() {
+    IDLE_ITERATIONS.fetch_add(1, Ordering::Relaxed);
     let hook = critical_section::with(|cs| unsafe { *IDLE_HOOK.get(cs) });
     if let Some(hook) = hook {
         hook();
@@ -78,6 +105,7 @@ pub(crate) fn run_idle_hook() {
 /// `next` must point to a live TCB selected by the scheduler, and `cs` must be
 /// the token for the scheduler's active critical section.
 pub(crate) unsafe fn run_context_switch_hook(next: *mut ThreadInner, cs: CriticalSection<'_>) {
+    CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
     let hook = unsafe { *CONTEXT_SWITCH_HOOK.get(cs) };
     if let Some(hook) = hook {
         let info = unsafe {

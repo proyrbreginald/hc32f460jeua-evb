@@ -231,6 +231,10 @@ pub mod src {
     pub const ADC2_EOCA: u32 = 452;
     pub const ADC2_EOCB: u32 = 453;
     pub const TRNG_END: u32 = 456;
+
+    // ---- CAN ----
+    /// CAN 聚合中断源 (接收、发送和错误事件共用一个源)。
+    pub const CAN_INT: u32 = 486;
 }
 
 // ============================== INTC (SEL 路由) ==============================
@@ -241,18 +245,18 @@ const INTC_SEL0_OFF: usize = 0x5C;
 /// SEL 复位值: 0x1FF = 未映射 (DDL INTSEL_RST_VALUE)
 const SEL_UNMAPPED: u32 = 0x1FF;
 
-fn sel_addr(n: u8) -> *mut u32 {
-    (INTC_BASE + INTC_SEL0_OFF + 4 * n as usize) as *mut u32
+fn sel_reg(n: u8) -> crate::mmio::Reg {
+    crate::mmio::Reg::new(INTC_BASE + INTC_SEL0_OFF + 4 * n as usize)
 }
 
 /// 路由事件源到中断线 (写 INTC.SELx = 事件源编号)
 fn route(source: u32, line: Line) {
-    unsafe { core::ptr::write_volatile(sel_addr(line.n()), source) };
+    sel_reg(line.n()).write(source);
 }
 
 /// 解除路由 (SEL 恢复 0x1FF)
 fn unroute(line: Line) {
-    unsafe { core::ptr::write_volatile(sel_addr(line.n()), SEL_UNMAPPED) };
+    sel_reg(line.n()).write(SEL_UNMAPPED);
 }
 
 // ============================== NVIC 操作 (对齐 CMSIS NVIC_*) ==============================
@@ -263,8 +267,8 @@ const NVIC_ISPR: usize = 0xE000_E200; // 挂起置位 (W1S)
 const NVIC_ICPR: usize = 0xE000_E280; // 挂起清除 (W1C)
 const NVIC_IPR: usize = 0xE000_E400; // 优先级 (每线 1 字节)
 
-fn nvic_reg(addr: usize, line: Line) -> *mut u32 {
-    (addr + 4 * (line.n() as usize / 32)) as *mut u32
+fn nvic_reg(addr: usize, line: Line) -> crate::mmio::Reg {
+    crate::mmio::Reg::new(addr + 4 * (line.n() as usize / 32))
 }
 
 fn nvic_bit(line: Line) -> u32 {
@@ -273,46 +277,33 @@ fn nvic_bit(line: Line) -> u32 {
 
 /// 使能中断 (NVIC ISER, 对齐 CMSIS `NVIC_EnableIRQ`)
 pub fn enable(line: Line) {
-    unsafe {
-        core::ptr::write_volatile(nvic_reg(NVIC_ISER, line), nvic_bit(line));
-    }
+    nvic_reg(NVIC_ISER, line).write(nvic_bit(line));
 }
 
 /// 失能中断 (NVIC ICER)
 pub fn disable(line: Line) {
-    unsafe {
-        core::ptr::write_volatile(nvic_reg(NVIC_ICER, line), nvic_bit(line));
-    }
+    nvic_reg(NVIC_ICER, line).write(nvic_bit(line));
 }
 
 /// 挂起中断 (NVIC ISPR; 也可作为**软件触发**测试手段)
 pub fn pend(line: Line) {
-    unsafe {
-        core::ptr::write_volatile(nvic_reg(NVIC_ISPR, line), nvic_bit(line));
-    }
+    nvic_reg(NVIC_ISPR, line).write(nvic_bit(line));
 }
 
 /// 清除中断挂起 (NVIC ICPR; 注册/初始化时先清残留挂起)
 pub fn clear_pend(line: Line) {
-    unsafe {
-        core::ptr::write_volatile(nvic_reg(NVIC_ICPR, line), nvic_bit(line));
-    }
+    nvic_reg(NVIC_ICPR, line).write(nvic_bit(line));
 }
 
 /// 设置中断优先级 (NVIC IPR, 0~15, 越小越高; 写高半字节)
 pub fn set_priority(line: Line, priority: u8) {
     assert!(priority <= 15, "优先级必须为 0~15");
-    unsafe {
-        core::ptr::write_volatile(
-            (NVIC_IPR + line.n() as usize) as *mut u8,
-            (priority & 0x0F) << 4,
-        );
-    }
+    crate::mmio::Reg::new(NVIC_IPR + line.n() as usize).write_u8((priority & 0x0F) << 4);
 }
 
 /// 读取中断优先级 (0~15)
 pub fn priority(line: Line) -> u8 {
-    unsafe { core::ptr::read_volatile((NVIC_IPR + line.n() as usize) as *const u8) >> 4 }
+    crate::mmio::Reg::new(NVIC_IPR + line.n() as usize).read_u8() >> 4
 }
 
 // ============================== 注册 API ==============================
@@ -338,7 +329,7 @@ pub fn register(source: u32, line: Line, priority: u8, handler: Handler) -> Resu
         return Err(IrqError::PriorityInvalid);
     }
     crate::critical_section::with(|_| {
-        let sel = unsafe { core::ptr::read_volatile(sel_addr(n)) };
+        let sel = sel_reg(n).read();
         if sel != SEL_UNMAPPED && sel != source {
             return Err(IrqError::LineTaken);
         }

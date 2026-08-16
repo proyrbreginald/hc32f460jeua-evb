@@ -76,4 +76,8 @@ pub struct FsInfo {
     pub serialized_bytes: u32,
     pub active_blocks: u32,
     pub capacity_bytes: u32,
+    /// Least erased block count across the partition (wear table minimum).
+    pub min_erase_count: u32,
+    /// Most erased block count across the partition (wear table maximum).
+    pub max_erase_count: u32,
 }

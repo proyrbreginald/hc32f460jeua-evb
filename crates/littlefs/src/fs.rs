@@ -1,9 +1,10 @@
 use core::str;
 
 use crate::format::{
-    BlockDevice, Crc32Mpeg2, Geometry, HEADER_SIZE, MAX_FILES, MAX_NAME_LEN, PROGRAM_SIZE,
-    RECORD_FLAG_DIRECTORY, RECORD_HEADER_SIZE, RecordHeader, SnapshotHeader, commit_marker_bytes,
-    crc32_mpeg2, generation_is_newer,
+    BlockDevice, Crc32Mpeg2, Geometry, HEADER_SIZE, MAX_FILES, MAX_NAME_LEN, MAX_WEAR_BLOCKS,
+    MAX_WEAR_TABLE_SIZE, PROGRAM_SIZE, RECORD_FLAG_DIRECTORY, RECORD_HEADER_SIZE, RecordHeader,
+    SnapshotHeader, checked_snapshot_span, commit_marker_bytes, crc32_mpeg2, decode_wear_table,
+    encode_wear_table, generation_is_newer, wear_table_size,
 };
 
 use crate::{EntryKind, Error, FileInfo, FsInfo};
@@ -50,11 +51,18 @@ impl Record {
 }
 
 /// Mounted snapshot filesystem that exclusively owns its block device.
+///
+/// The in-RAM `wear` array mirrors the per-block erase counters of the active
+/// snapshot. Placement of every new snapshot (see [`Self::mutate`]) chooses the
+/// least-worn non-overlapping run, which is dynamic wear leveling; the explicit
+/// [`Self::level`] performs static wear leveling by relocating an idle snapshot
+/// to the least-worn area without changing any data.
 pub struct FileSystem<D: BlockDevice> {
     device: D,
     geometry: Geometry,
     active: SnapshotHeader,
     recovery_required: bool,
+    wear: [u16; MAX_WEAR_BLOCKS],
 }
 
 impl<D: BlockDevice> FileSystem<D> {
@@ -62,36 +70,66 @@ impl<D: BlockDevice> FileSystem<D> {
     pub fn mount(mut device: D) -> Result<Self, Error<D::Error>> {
         let geometry = checked_geometry(&device)?;
         let active = scan_active(&mut device, geometry)?.ok_or(Error::NotFormatted)?;
+        let wear = read_wear_table(&mut device, &active)?;
         Ok(Self {
             device,
             geometry,
             active,
             recovery_required: false,
+            wear,
         })
     }
 
     /// Atomically publish an empty filesystem.
     ///
     /// If a valid filesystem already exists, it remains mountable until the
-    /// empty snapshot is completely written and committed.
+    /// empty snapshot is completely written and committed. Erase counters are
+    /// monotonic across formats: the previous table is carried over and only
+    /// the destination blocks are incremented.
     pub fn format(mut device: D) -> Result<Self, Error<D::Error>> {
         let geometry = checked_geometry(&device)?;
         let previous = scan_active(&mut device, geometry)?;
+        let previous_wear = match previous {
+            Some(header) => read_wear_table(&mut device, &header)?,
+            None => [0u16; MAX_WEAR_BLOCKS],
+        };
         let generation = previous
             .map(|header| header.generation.wrapping_add(1))
             .unwrap_or(0);
-        let start_block = previous
-            .map(|header| (header.start_block + header.block_span) % geometry.block_count)
-            .unwrap_or(0);
-        let header = SnapshotHeader::new(generation, start_block, 0, crc32_mpeg2(&[]), 0, geometry)
+        let table_size = wear_table_size(geometry.block_count);
+        let span =
+            checked_snapshot_span(table_size, geometry.block_size).ok_or(Error::InvalidGeometry)?;
+        let start_block = match &previous {
+            Some(active) => choose_start_block(active, span, &previous_wear, geometry.block_count),
+            None => 0,
+        };
+        let wear = incremented_wear(&previous_wear, start_block, span, geometry.block_count);
+        let mut table = [0u8; MAX_WEAR_TABLE_SIZE];
+        encode_wear_table(&wear, geometry.block_count, &mut table)
             .map_err(|_| Error::InvalidGeometry)?;
+        let header = SnapshotHeader::new(
+            generation,
+            start_block,
+            table_size,
+            crc32_mpeg2(&table[..table_size as usize]),
+            0,
+            geometry,
+        )
+        .map_err(|_| Error::InvalidGeometry)?;
 
-        write_candidate(&mut device, &header, previous.as_ref(), Change::Clear)?;
+        write_candidate(
+            &mut device,
+            &header,
+            previous.as_ref(),
+            Change::Clear,
+            &table[..table_size as usize],
+        )?;
         Ok(Self {
             device,
             geometry,
             active: header,
             recovery_required: false,
+            wear,
         })
     }
 
@@ -107,14 +145,50 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     pub fn info(&self) -> FsInfo {
+        let (minimum, maximum) = self.wear_bounds();
         FsInfo {
             generation: self.active.generation,
             entry_count: self.active.file_count,
             file_count: self.active.file_count,
             serialized_bytes: self.active.payload_len,
             active_blocks: self.active.block_span,
-            capacity_bytes: snapshot_capacity(self.geometry).unwrap_or(0),
+            capacity_bytes: snapshot_capacity(self.geometry)
+                .and_then(|capacity| {
+                    capacity.checked_sub(wear_table_size(self.geometry.block_count))
+                })
+                .unwrap_or(0),
+            min_erase_count: minimum,
+            max_erase_count: maximum,
         }
+    }
+
+    /// Static wear leveling: relocate the active snapshot to the least-worn
+    /// non-overlapping run without changing any data.
+    ///
+    /// This is a no-op when the per-block erase counts are already within one
+    /// of each other. Relocation advances the generation exactly like a normal
+    /// mutation and remains a single atomic commit; a torn relocation mounts
+    /// back to the previous snapshot.
+    pub fn level(&mut self) -> Result<(), Error<D::Error>> {
+        if self.recovery_required {
+            return Err(Error::RecoveryRequired);
+        }
+        let (minimum, maximum) = self.wear_bounds();
+        if maximum.saturating_sub(minimum) <= 1 {
+            return Ok(());
+        }
+        self.mutate(Change::Level)
+    }
+
+    /// Smallest and largest erase count over all blocks.
+    pub fn wear_bounds(&self) -> (u32, u32) {
+        let mut minimum = u16::MAX;
+        let mut maximum = 0;
+        for count in self.wear[..self.geometry.block_count as usize].iter() {
+            minimum = minimum.min(*count);
+            maximum = maximum.max(*count);
+        }
+        (minimum as u32, maximum as u32)
     }
 
     /// Re-read and validate the complete active snapshot.
@@ -191,7 +265,9 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let remaining = (record.data_len - offset) as usize;
         let read_len = remaining.min(buffer.len());
-        let logical = (HEADER_SIZE as u32)
+        let logical = self
+            .active
+            .records_base()
             .checked_add(record.data_offset)
             .and_then(|value| value.checked_add(offset))
             .ok_or(Error::Corrupt)?;
@@ -224,7 +300,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 .ok_or(Error::Corrupt)?;
             index += 1;
         }
-        if offset != self.active.payload_len {
+        if offset != self.active.records_len() {
             return Err(Error::Corrupt);
         }
         Ok(())
@@ -261,7 +337,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 .ok_or(Error::Corrupt)?;
             index += 1;
         }
-        if offset != self.active.payload_len {
+        if offset != self.active.records_len() {
             return Err(Error::Corrupt);
         }
         Ok(())
@@ -360,21 +436,53 @@ impl<D: BlockDevice> FileSystem<D> {
 
         // Preflight is read-only. Invalid/corrupt input and NoSpace leave the
         // mounted state usable because no destination block has been erased.
-        let stats = calculate_change(&mut self.device, &self.active, change)?;
+        let stats = calculate_change(&mut self.device, &self.active, change, Crc32Mpeg2::new())?;
+
+        // The wear table is the first bytes of the payload, so the snapshot
+        // span (and therefore the placement freedom) depends on it.
+        let table_size = wear_table_size(self.geometry.block_count);
+        let payload_len = table_size
+            .checked_add(stats.payload_len)
+            .ok_or(Error::NoSpace)?;
+        let span =
+            checked_snapshot_span(payload_len, self.geometry.block_size).ok_or(Error::Corrupt)?;
+
+        // Dynamic wear leveling: among all non-overlapping destinations pick
+        // the one whose blocks were erased the least. The old sequential
+        // sweep remains the tie-break, so uniform workloads keep rotating.
         let generation = self.active.generation.wrapping_add(1);
         let start_block =
-            (self.active.start_block + self.active.block_span) % self.geometry.block_count;
+            choose_start_block(&self.active, span, &self.wear, self.geometry.block_count);
+        let wear = incremented_wear(&self.wear, start_block, span, self.geometry.block_count);
+        let mut table = [0u8; MAX_WEAR_TABLE_SIZE];
+        encode_wear_table(&wear, self.geometry.block_count, &mut table)
+            .map_err(|_| Error::Corrupt)?;
+
+        // The payload CRC covers the wear table followed by the records; the
+        // record pass continues from the table's CRC state.
+        let stats = calculate_change(
+            &mut self.device,
+            &self.active,
+            change,
+            Crc32Mpeg2::from_state(crc32_mpeg2(&table[..table_size as usize])),
+        )?;
         let next = SnapshotHeader::new(
             generation,
             start_block,
-            stats.payload_len,
+            payload_len,
             stats.payload_crc,
             stats.file_count,
             self.geometry,
         )
         .map_err(|_| Error::NoSpace)?;
 
-        let result = write_candidate(&mut self.device, &next, Some(&self.active), change);
+        let result = write_candidate(
+            &mut self.device,
+            &next,
+            Some(&self.active),
+            change,
+            &table[..table_size as usize],
+        );
         if let Err(error) = result {
             // A device may report failure after physically completing the
             // commit word. Do not issue another erase/program from stale RAM.
@@ -382,6 +490,7 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(error);
         }
         self.active = next;
+        self.wear = wear;
         Ok(())
     }
 }
@@ -404,6 +513,9 @@ enum Change<'a> {
         recursive: bool,
     },
     Clear,
+    /// Static wear leveling: rewrite every record unchanged at a less-worn
+    /// location. Never carries an added or removed record.
+    Level,
 }
 
 #[derive(Clone, Copy)]
@@ -430,6 +542,9 @@ impl<'a> Change<'a> {
                 ExistingAction::Rename(renamed.replace_prefix(name, old_name, new_name)?)
             }
             Self::Clear => ExistingAction::Skip,
+            // Level rewrites every record unchanged at the new location.
+            Self::Level => ExistingAction::Keep,
+            // Mkdir and unrelated Write/Rename records are copied verbatim.
             _ => ExistingAction::Keep,
         };
         Ok(action)
@@ -516,7 +631,9 @@ fn checked_geometry<D: BlockDevice>(device: &D) -> Result<Geometry, Error<D::Err
     let geometry = device.geometry();
     if geometry.block_size < HEADER_SIZE as u32
         || !geometry.block_size.is_multiple_of(PROGRAM_SIZE as u32)
+        || geometry.block_size < wear_table_size(geometry.block_count)
         || geometry.block_count < 2
+        || geometry.block_count > MAX_WEAR_BLOCKS as u32
         || geometry
             .block_size
             .checked_mul(geometry.block_count)
@@ -654,7 +771,8 @@ fn read_record<D: BlockDevice>(
     }
 
     let mut encoded = [0u8; RECORD_HEADER_SIZE];
-    let logical = (HEADER_SIZE as u32)
+    let logical = snapshot
+        .records_base()
         .checked_add(payload_offset)
         .ok_or(Error::Corrupt)?;
     segment_read(device, snapshot, logical, &mut encoded)?;
@@ -674,7 +792,8 @@ fn read_record<D: BlockDevice>(
     let name_len = header.name_len as usize;
     let mut name = [0u8; MAX_NAME_LEN];
     let name_offset = header_end;
-    let name_logical = (HEADER_SIZE as u32)
+    let name_logical = snapshot
+        .records_base()
         .checked_add(name_offset)
         .ok_or(Error::Corrupt)?;
     segment_read(device, snapshot, name_logical, &mut name[..name_len])?;
@@ -720,7 +839,7 @@ fn find_record<D: BlockDevice>(
             .ok_or(Error::Corrupt)?;
         index += 1;
     }
-    if offset != snapshot.payload_len {
+    if offset != snapshot.records_len() {
         return Err(Error::Corrupt);
     }
     Ok(None)
@@ -759,7 +878,7 @@ fn snapshot_has_descendant<D: BlockDevice>(
             .ok_or(Error::Corrupt)?;
         index += 1;
     }
-    if offset != snapshot.payload_len {
+    if offset != snapshot.records_len() {
         return Err(Error::Corrupt);
     }
     Ok(false)
@@ -786,7 +905,7 @@ fn preflight_rename<D: BlockDevice>(
             .ok_or(Error::Corrupt)?;
         index += 1;
     }
-    if offset != snapshot.payload_len {
+    if offset != snapshot.records_len() {
         return Err(Error::Corrupt);
     }
 
@@ -875,7 +994,8 @@ fn validate_snapshot<D: BlockDevice>(
             previous += 1;
         }
 
-        let data_logical = (HEADER_SIZE as u32)
+        let data_logical = snapshot
+            .records_base()
             .checked_add(record.data_offset)
             .ok_or(Error::Corrupt)?;
         let data_crc = crc_segment_range(device, snapshot, data_logical, record.data_len)?;
@@ -895,7 +1015,8 @@ fn validate_snapshot<D: BlockDevice>(
         if !range_is_zero(
             device,
             snapshot,
-            (HEADER_SIZE as u32)
+            snapshot
+                .records_base()
                 .checked_add(data_end)
                 .ok_or(Error::Corrupt)?,
             padding,
@@ -908,7 +1029,7 @@ fn validate_snapshot<D: BlockDevice>(
         offset = record_end;
         index += 1;
     }
-    if offset != snapshot.payload_len {
+    if offset != snapshot.records_len() {
         return Err(Error::Corrupt);
     }
 
@@ -943,10 +1064,12 @@ struct StatsBuilder {
 }
 
 impl StatsBuilder {
-    fn new() -> Self {
+    /// `seed` is the CRC state of every payload byte written before the
+    /// records (the wear table); the finished value covers table + records.
+    fn new(seed: Crc32Mpeg2) -> Self {
         Self {
             payload_len: 0,
-            crc: Crc32Mpeg2::new(),
+            crc: seed,
             file_count: 0,
         }
     }
@@ -980,7 +1103,12 @@ impl StatsBuilder {
     }
 
     fn finish(self, geometry: Geometry) -> Result<PlanStats, Error<core::convert::Infallible>> {
-        if self.payload_len > snapshot_capacity(geometry).ok_or(Error::NoSpace)? {
+        let capacity = snapshot_capacity(geometry).ok_or(Error::NoSpace)?;
+        let total = self
+            .payload_len
+            .checked_add(wear_table_size(geometry.block_count))
+            .ok_or(Error::NoSpace)?;
+        if total > capacity {
             return Err(Error::NoSpace);
         }
         Ok(PlanStats {
@@ -1002,7 +1130,8 @@ fn stats_segment<D: BlockDevice>(
     let mut copied = 0;
     while copied < length {
         let amount = (length - copied).min(COPY_BUFFER_SIZE as u32) as usize;
-        let logical = (HEADER_SIZE as u32)
+        let logical = snapshot
+            .records_base()
             .checked_add(payload_offset)
             .and_then(|value| value.checked_add(copied))
             .ok_or(Error::Corrupt)?;
@@ -1080,8 +1209,9 @@ fn calculate_change<D: BlockDevice>(
     device: &mut D,
     snapshot: &SnapshotHeader,
     change: Change<'_>,
+    crc_seed: Crc32Mpeg2,
 ) -> Result<PlanStats, Error<D::Error>> {
-    let mut builder = StatsBuilder::new();
+    let mut builder = StatsBuilder::new(crc_seed);
     let mut renamed = NameBuffer::new();
     let mut offset = 0;
     let mut index = 0;
@@ -1109,7 +1239,7 @@ fn calculate_change<D: BlockDevice>(
             .ok_or(Error::Corrupt)?;
         index += 1;
     }
-    if offset != snapshot.payload_len {
+    if offset != snapshot.records_len() {
         return Err(Error::Corrupt);
     }
 
@@ -1191,7 +1321,8 @@ impl<'a, D: BlockDevice> SegmentWriter<'a, D> {
         let mut copied = 0;
         while copied < length {
             let amount = (length - copied).min(COPY_BUFFER_SIZE as u32) as usize;
-            let logical = (HEADER_SIZE as u32)
+            let logical = source
+                .records_base()
                 .checked_add(payload_offset)
                 .and_then(|value| value.checked_add(copied))
                 .ok_or(Error::Corrupt)?;
@@ -1280,7 +1411,7 @@ fn emit_change<D: BlockDevice>(
                 .ok_or(Error::Corrupt)?;
             index += 1;
         }
-        if offset != source.payload_len {
+        if offset != source.records_len() {
             return Err(Error::Corrupt);
         }
     } else if !matches!(change, Change::Clear) {
@@ -1312,11 +1443,122 @@ fn segments_overlap(left: &SnapshotHeader, right: &SnapshotHeader) -> bool {
     false
 }
 
+fn spans_overlap(
+    start: u32,
+    span: u32,
+    other_start: u32,
+    other_span: u32,
+    block_count: u32,
+) -> bool {
+    let mut index = 0;
+    while index < span {
+        let block = (start + index) % block_count;
+        let mut other = 0;
+        while other < other_span {
+            if (other_start + other) % block_count == block {
+                return true;
+            }
+            other += 1;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Choose the next segment start with dynamic wear leveling.
+///
+/// Among every run of `span` consecutive blocks that does not overlap the
+/// active snapshot, pick the one with the lowest maximum erase count (lowest
+/// total as tie-break). The remaining tie-break is the smallest forward cyclic
+/// distance from the old successor position, which reproduces the sequential
+/// sweep for uniformly worn devices. `span <= block_count/2` guarantees at
+/// least one valid candidate (the immediate successor), so the result is total.
+fn choose_start_block(
+    active: &SnapshotHeader,
+    span: u32,
+    wear: &[u16; MAX_WEAR_BLOCKS],
+    block_count: u32,
+) -> u32 {
+    let successor = (active.start_block + active.block_span) % block_count;
+    let mut best: Option<(u32, u32, u32, u32)> = None;
+    let mut start = 0;
+    while start < block_count {
+        if !spans_overlap(
+            start,
+            span,
+            active.start_block,
+            active.block_span,
+            block_count,
+        ) {
+            let (mut maximum, mut sum) = (0u32, 0u32);
+            let mut index = 0;
+            while index < span {
+                let count = wear[((start + index) % block_count) as usize] as u32;
+                maximum = maximum.max(count);
+                sum = sum.saturating_add(count);
+                index += 1;
+            }
+            let distance = (start + block_count - successor) % block_count;
+            let replace = best
+                .map(|(best_max, best_sum, best_distance, _)| {
+                    (maximum, sum, distance) < (best_max, best_sum, best_distance)
+                })
+                .unwrap_or(true);
+            if replace {
+                best = Some((maximum, sum, distance, start));
+            }
+        }
+        start += 1;
+    }
+    best.expect("span <= block_count/2 guarantees a non-overlapping start")
+        .3
+}
+
+/// Return `wear` with every block of the destination segment incremented,
+/// saturating at the `u16` counter width.
+fn incremented_wear(
+    wear: &[u16; MAX_WEAR_BLOCKS],
+    start_block: u32,
+    span: u32,
+    block_count: u32,
+) -> [u16; MAX_WEAR_BLOCKS] {
+    let mut next = *wear;
+    let mut index = 0;
+    while index < span {
+        let block = ((start_block + index) % block_count) as usize;
+        next[block] = next[block].saturating_add(1);
+        index += 1;
+    }
+    next
+}
+
+/// Read the active snapshot's per-block erase table.
+///
+/// The table is the first bytes of the payload, so its integrity is covered
+/// by the snapshot payload CRC validated during mount.
+fn read_wear_table<D: BlockDevice>(
+    device: &mut D,
+    snapshot: &SnapshotHeader,
+) -> Result<[u16; MAX_WEAR_BLOCKS], Error<D::Error>> {
+    let size = wear_table_size(snapshot.block_count);
+    let mut bytes = [0u8; MAX_WEAR_TABLE_SIZE];
+    segment_read(
+        device,
+        snapshot,
+        HEADER_SIZE as u32,
+        &mut bytes[..size as usize],
+    )?;
+    let mut wear = [0u16; MAX_WEAR_BLOCKS];
+    decode_wear_table(&bytes, snapshot.block_count, &mut wear).map_err(|_| Error::Corrupt)?;
+    Ok(wear)
+}
+
 fn write_candidate<D: BlockDevice>(
     device: &mut D,
     candidate: &SnapshotHeader,
     source: Option<&SnapshotHeader>,
     change: Change<'_>,
+    wear_bytes: &[u8],
 ) -> Result<(), Error<D::Error>> {
     if source
         .map(|active| segments_overlap(active, candidate))
@@ -1337,6 +1579,8 @@ fn write_candidate<D: BlockDevice>(
     segment_program(device, candidate, 0, &prefix)?;
 
     let mut writer = SegmentWriter::new(device, candidate);
+    // The wear table is the first bytes of the payload, before the records.
+    writer.bytes(wear_bytes)?;
     emit_change(&mut writer, source, change)?;
     writer.finish(candidate.payload_len)?;
 
