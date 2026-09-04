@@ -178,7 +178,7 @@ cargo test --workspace --target x86_64-unknown-linux-gnu
   HRCSTOP), 复位时硬件载入运行期只读的 ICG1 寄存器 (`icg` 模块);
   `clk::hrc_hz()` 按该位查询;
 - 振荡器命令: `hrc_cmd` / `xtal_cmd` (对齐 DDL `CLK_HrcCmd`/`CLK_XtalCmd`);
-- 配置摘要可由 shell `info`/`sysinfo` 命令输出 (时钟源/振荡器/总线分频/
+- 配置摘要可由 shell `sysinfo` 命令输出 (时钟源/振荡器/总线分频/
   UART/日志/线程等编译期常量);
 - 总线分频来自 `CFG_DIV_*`, 各总线频率查询: `system_clock_hz` /
   `hclk_hz` / `pclk0_hz` / `pclk1_hz` / `pclk2_hz` / `pclk3_hz` /
@@ -300,7 +300,7 @@ cargo test --workspace --target x86_64-unknown-linux-gnu
 pwd                          # 显示当前路径，上电/登录后默认为 /
 mkdir /etc                  # 原子创建目录；父目录必须已存在
 cd /etc                     # 切换当前路径；无参数时回到 /
-write config mode=normal    # 相对路径：原子创建或完整覆盖文件 (别名 put)
+write config mode=normal    # 相对路径：原子创建或完整覆盖文件
 nano ./config               # ANSI 全屏编辑文件；不存在时新建
 cat /etc/config             # 绝对路径：分块读取，非打印字节显示为 \xNN
 stat config                 # 显示文件或目录类型；文件另含大小与 CRC
@@ -309,7 +309,7 @@ cd /
 mv /etc /settings           # 在一个快照中原子移动完整目录树
 rm /settings/config         # 原子删除文件
 rmdir /settings             # 原子删除空目录
-df                          # 容量/条目数/generation (别名 fsinfo)
+df                          # 容量/条目数/generation
 fsck                        # 只读校验当前快照
 mount                       # 丢弃内存状态并重新挂载，当前路径回到 /
 mkfs --force                # 显式清空全部文件与目录
@@ -721,7 +721,7 @@ continue
 - 命令提示符包含当前路径，例如根目录为 `root@HC32F460JEUA:/$`，进入
   `/etc` 后为 `root@HC32F460JEUA:/etc$`;
 - **命令系统**: 命令注册在 `src/shell.rs` 的静态命令表 [`COMMANDS`]
-  (名称/别名/帮助/执行函数), 分发与实现解耦; **新增命令 = 表内追加一项
+  (名称/帮助/执行函数), 分发与实现解耦; **新增命令 = 表内追加一项
   + 加入 `CFG_SHELL_COMMANDS` 启用列表**, 无需修改分发/帮助逻辑;
 - **每个命令可单独启用/禁用**: `CFG_SHELL_COMMANDS` 为逗号分隔的命令名
   列表, 未列出的命令执行时提示 "未启用" 且不出现在 `help` 中;
@@ -729,11 +729,11 @@ continue
   除受 `CFG_SHELL_COMMANDS` 控制外, 还受各自的 `CFG_SHELL_NANO_ENABLE` /
   `CFG_SHELL_ZMODEM_ENABLE` / `CFG_APP_SELFTEST_ENABLE` / `CFG_SOAK_ENABLE`
   编译期开关约束 — 关闭时命令与代码整体不编译 (见"体积优化"一节);
-- 命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) / `echo` /
-  `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` / `write`(put) /
-  `nano` / `sz` / `rz` / `rm` / `mv` / `stat` / `df`(fsinfo) / `fsck` / `mount` /
+- 命令: `help` / `sysinfo` / `uptime` / `ps` / `free` / `echo` /
+  `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` / `write` /
+  `nano` / `sz` / `rz` / `rm` / `mv` / `stat` / `df` / `fsck` / `mount` /
   `mkfs --force` / `led` / `log` / `selftest` / `soak` / `clear` / `whoami` / `reboot` /
-  `logout`(exit);
+  `logout`;
 - 输入: 回车提交, 退格删除, Ctrl+C 清行, 方向键上/下浏览历史；
 - 输入采用中断驱动 (RX ISR 发出 OS 无关通知, `uart_rtos` 释放信号量,
   线程阻塞等待, 无轮询)。
