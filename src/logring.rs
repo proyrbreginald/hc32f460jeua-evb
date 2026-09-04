@@ -212,7 +212,11 @@ impl<const CAP: usize> LogRing<CAP> {
         );
         debug_assert!(mark.start + HEADER + mark.len <= self.head + self.len);
         let header = (mark.len as u16 & LEN_MASK)
-            | if mark.truncated { LEN_FLAG_TRUNCATED } else { 0 };
+            | if mark.truncated {
+                LEN_FLAG_TRUNCATED
+            } else {
+                0
+            };
         self.buf[mark.start..mark.start + HEADER].copy_from_slice(&header.to_le_bytes());
         self.writing.store(false, Ordering::Release);
     }

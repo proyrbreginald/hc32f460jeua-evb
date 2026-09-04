@@ -32,9 +32,7 @@ extern crate std;
 use core::alloc::Layout;
 use core::ptr;
 
-use crate::heap_layout::{
-    allocation_plan, checked_align_up, tlsf_insert_index, tlsf_search_index,
-};
+use crate::heap_layout::{allocation_plan, checked_align_up, tlsf_insert_index, tlsf_search_index};
 
 /// 块头: `size_flags` + 前块长度。总 8 字节。
 #[repr(C)]
@@ -220,9 +218,9 @@ impl Tlsf {
 
     /// 释放 [`alloc`] 返回的 payload。
     pub unsafe fn dealloc(&mut self, payload: *mut u8) {
-        let mut block = unsafe {
-            core::ptr::read((payload as usize - PREFIX_OFFSET) as *const usize)
-        } as *mut Block;
+        let mut block =
+            unsafe { core::ptr::read((payload as usize - PREFIX_OFFSET) as *const usize) }
+                as *mut Block;
         let mut size = unsafe { block_size(block) };
         let mut prev_used = unsafe { (*block).size_flags & PREV_USED_BIT != 0 };
 
@@ -322,7 +320,11 @@ impl Tlsf {
                 let mut block = self.lists[list_index(fl, sl)].next;
                 while !block.is_null() {
                     unsafe {
-                        blocks.push((block as usize, block_size(block), block_used(block) as usize));
+                        blocks.push((
+                            block as usize,
+                            block_size(block),
+                            block_used(block) as usize,
+                        ));
                         block = free_next(block);
                     }
                 }
@@ -430,7 +432,11 @@ fn minimum_need(layout: Layout) -> Option<usize> {
 unsafe fn block_size(block: *mut Block) -> usize {
     #[cfg(test)]
     if block as usize & 7 != 0 {
-        std::panic!("misaligned block ptr {:#x} (from {:p})", block as usize, block);
+        std::panic!(
+            "misaligned block ptr {:#x} (from {:p})",
+            block as usize,
+            block
+        );
     }
     unsafe { (*block).size_flags & !FLAGS_MASK }
 }
@@ -543,12 +549,7 @@ mod tests {
         for (ptr, _) in allocations.drain(..) {
             unsafe { tlsf.dealloc(ptr as *mut u8) };
         }
-        assert_eq!(
-            tlsf.used(),
-            0,
-            "空闲块残留: {:?}",
-            tlsf.debug_free_blocks()
-        );
+        assert_eq!(tlsf.used(), 0, "空闲块残留: {:?}", tlsf.debug_free_blocks());
         assert_eq!(
             tlsf.largest_free_block(),
             end - start,
@@ -719,7 +720,14 @@ mod tests {
         let (start, end) = arena_bounds(&arena);
         let l = Layout::from_size_align(256, 8).unwrap();
         // 覆盖全部释放顺序: 三个相邻块以任意次序释放都必须合并为单块
-        let orders: [[usize; 3]; 6] = [[0, 1, 2], [2, 1, 0], [1, 0, 2], [0, 2, 1], [2, 0, 1], [1, 2, 0]];
+        let orders: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [2, 1, 0],
+            [1, 0, 2],
+            [0, 2, 1],
+            [2, 0, 1],
+            [1, 2, 0],
+        ];
         for order in orders {
             let mut tlsf = Tlsf::new();
             unsafe { tlsf.init(start, end) };

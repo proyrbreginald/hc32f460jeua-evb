@@ -965,7 +965,8 @@ impl<T> Drop for Mailbox<T> {
         // 池已由 ensure_pool 成功构造并发布 (布局与发布值一一对应)
         let layout = Layout::array::<T>(mb.size as usize).expect("邮箱消息池布局失效");
         unsafe { dealloc(pool.cast(), layout) };
-        mb.pool.store(ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+        mb.pool
+            .store(ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1211,7 +1212,8 @@ impl Drop for MessageQueue {
         }
         let layout = q.pool_layout();
         unsafe { dealloc(pool, layout) };
-        q.pool.store(ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+        q.pool
+            .store(ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     }
 }
 

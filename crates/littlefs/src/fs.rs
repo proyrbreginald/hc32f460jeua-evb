@@ -510,8 +510,7 @@ impl<D: BlockDevice> FileSystem<D> {
             };
             let incremented = incremented_wear(&wear, start_block, span, block_count);
             let mut table = [0u8; MAX_WEAR_TABLE_SIZE];
-            encode_wear_table(&incremented, block_count, &mut table)
-                .map_err(|_| Error::Corrupt)?;
+            encode_wear_table(&incremented, block_count, &mut table).map_err(|_| Error::Corrupt)?;
 
             // The payload CRC covers the wear table followed by the records; the
             // record pass continues from the table's CRC state.
@@ -793,9 +792,7 @@ fn segment_program<D: BlockDevice>(
         return Err(CommitError::Fatal(Error::Corrupt));
     }
     let length = u32::try_from(data.len()).map_err(|_| Error::Corrupt)?;
-    let end = logical_offset
-        .checked_add(length)
-        .ok_or(Error::Corrupt)?;
+    let end = logical_offset.checked_add(length).ok_or(Error::Corrupt)?;
     let segment_len = snapshot
         .block_span
         .checked_mul(snapshot.block_size)

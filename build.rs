@@ -40,13 +40,12 @@ fn main() {
             _ => panic!("{env} 必须为 true/false"),
         };
         // dev 恒保留的调试/自测功能; 其余 (zmodem/panic_verbose) 始终按配置
-        let effective = if !is_release
-            && matches!(flag, "shell_nano" | "shell_selftest" | "shell_soak")
-        {
-            true
-        } else {
-            configured
-        };
+        let effective =
+            if !is_release && matches!(flag, "shell_nano" | "shell_selftest" | "shell_soak") {
+                true
+            } else {
+                configured
+            };
         if effective {
             println!("cargo:rustc-cfg={flag}");
         }

@@ -254,7 +254,9 @@ mod tests {
         let top = 1usize << (FL_MIN + FL_COUNT - 1); // 2^17
         assert!(super::tlsf_search_index(top, FL_MIN, FL_COUNT).is_some());
         // 末级上限 (2^18) 起不可容纳
-        assert!(super::tlsf_search_index(1usize << (FL_MIN + FL_COUNT), FL_MIN, FL_COUNT).is_none());
+        assert!(
+            super::tlsf_search_index(1usize << (FL_MIN + FL_COUNT), FL_MIN, FL_COUNT).is_none()
+        );
     }
 
     #[test]
@@ -267,4 +269,3 @@ mod tests {
         }
     }
 }
-

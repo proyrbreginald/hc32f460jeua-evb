@@ -79,7 +79,10 @@ fn power_loss_error_is_still_fatal_not_bad_block() {
     let device = base.fork();
     device.arm_power_loss(1, [0, 1, 2, 3]);
     let mut fs = FileSystem::mount(device).unwrap();
-    assert_eq!(fs.write("state", b"v2"), Err(Error::Device(RamError::PowerLoss)));
+    assert_eq!(
+        fs.write("state", b"v2"),
+        Err(Error::Device(RamError::PowerLoss))
+    );
     assert!(fs.recovery_required());
 }
 
@@ -98,7 +101,10 @@ fn wear_rescale_preserves_order_and_bad_flags() {
         fs.write("state", &data).unwrap();
     }
     let (min, max) = fs.wear_bounds();
-    assert!(max.saturating_sub(min) <= 2, "均衡失效: min={min} max={max}");
+    assert!(
+        max.saturating_sub(min) <= 2,
+        "均衡失效: min={min} max={max}"
+    );
     assert_eq!(fs.device().erase_counts()[3], 0);
 }
 

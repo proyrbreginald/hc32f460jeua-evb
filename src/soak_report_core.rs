@@ -590,12 +590,10 @@ fn render_criteria(html: &mut String, data: &Data<'_>) {
             "硬实时 (关中断/中断延迟)",
             alloc::format!(
                 "关中断 ≤ {} µs 且 节拍延迟 ≤ {} µs (DWT 实测)",
-                data.critical_limit_us, data.tick_latency_limit_us
+                data.critical_limit_us,
+                data.tick_latency_limit_us
             ),
-            alloc::format!(
-                "{} / {} µs",
-                data.critical_us, data.tick_latency_us
-            ),
+            alloc::format!("{} / {} µs", data.critical_us, data.tick_latency_us),
             data.latency_ok,
         ),
     ];
@@ -661,7 +659,11 @@ pub fn file_name<'a>(data: &Data<'_>, boot_seq: u64, buf: &'a mut [u8; NAME_BUF]
             alloc::format!("{NAME_PREFIX}20{y:02}-{m:02}-{d:02}_{hh:02}{mm:02}{ss:02}.html")
         }
         None => {
-            alloc::format!("{NAME_PREFIX}b{:04}_{:010}.html", boot_seq, data.start_uptime)
+            alloc::format!(
+                "{NAME_PREFIX}b{:04}_{:010}.html",
+                boot_seq,
+                data.start_uptime
+            )
         }
     };
     let bytes = name.as_bytes();
@@ -901,15 +903,30 @@ mod tests {
     fn seq_name_parsing_and_cross_boot_ordering() {
         // 新格式: (序号, uptime) 比较, 跨复位排序正确
         assert_eq!(parse_seq_name("soak_b0002_0000000010.html"), Some((2, 10)));
-        assert!(older_than("soak_b0002_0000000010.html", "soak_b0003_0000000001.html"));
+        assert!(older_than(
+            "soak_b0002_0000000010.html",
+            "soak_b0003_0000000001.html"
+        ));
         // 同序号: uptime 小的更旧 (同一次启动内的先后)
-        assert!(older_than("soak_b0003_0000000001.html", "soak_b0003_0000000002.html"));
+        assert!(older_than(
+            "soak_b0003_0000000001.html",
+            "soak_b0003_0000000002.html"
+        ));
         // 旧格式映射为序号 0: 恒比任何新报告旧
         assert_eq!(parse_seq_name("soak_boot00123456.html"), Some((0, 123_456)));
-        assert!(older_than("soak_boot00123456.html", "soak_b0001_0000000001.html"));
+        assert!(older_than(
+            "soak_boot00123456.html",
+            "soak_b0001_0000000001.html"
+        ));
         // RTC 名: 字典序即时间序; 混合场景保守保留 RTC 名
-        assert!(older_than("soak_2026-08-15_153012.html", "soak_2026-08-16_100000.html"));
-        assert!(!older_than("soak_b0009_0000000001.html", "soak_2026-08-15_153012.html"));
+        assert!(older_than(
+            "soak_2026-08-15_153012.html",
+            "soak_2026-08-16_100000.html"
+        ));
+        assert!(!older_than(
+            "soak_b0009_0000000001.html",
+            "soak_2026-08-15_153012.html"
+        ));
         // 无法识别 → None
         assert_eq!(parse_seq_name("other.html"), None);
         assert_eq!(parse_seq_name("soak_2026-08-15_153012.html"), None);
