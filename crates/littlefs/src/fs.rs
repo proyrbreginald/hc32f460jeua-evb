@@ -3,14 +3,41 @@ use core::str;
 use crate::format::{
     BlockDevice, Crc32Mpeg2, Geometry, HEADER_SIZE, MAX_FILES, MAX_NAME_LEN, MAX_WEAR_BLOCKS,
     MAX_WEAR_TABLE_SIZE, PROGRAM_SIZE, RECORD_FLAG_DIRECTORY, RECORD_HEADER_SIZE, RecordHeader,
-    SnapshotHeader, checked_snapshot_span, commit_marker_bytes, crc32_mpeg2, decode_wear_table,
-    encode_wear_table, generation_is_newer, wear_table_size,
+    SnapshotHeader, WEAR_BAD_BIT, WEAR_COUNT_MASK, checked_snapshot_span, commit_marker_bytes,
+    crc32_mpeg2, decode_wear_table, encode_wear_table, generation_is_newer, wear_table_size,
 };
 
 use crate::{EntryKind, Error, FileInfo, FsInfo};
 
 const COPY_BUFFER_SIZE: usize = 64;
 const ZERO_WORD: [u8; PROGRAM_SIZE] = [0; PROGRAM_SIZE];
+
+/// 磨损计数接近饱和时整体折半的触发阈值。
+///
+/// 折半保留计数相对顺序与坏块标记, 防止全部计数饱和后动态磨损均衡
+/// 退化为"所有候选同分"的无差异选择 (旧设计 u16 饱和后不再区分块)。
+/// 计数域为 15 位 (bit15 是坏块标记), 阈值取 30000 留足折半前余量。
+const WEAR_RESCALE_AT: u16 = 30_000;
+
+/// 单次提交 (mutate) 的坏块重试上限: 擦除/编程失败标记坏块后换位置
+/// 重试; 超过上限返回 NoSpace (块全坏的设备无可用布局)。
+const MAX_COMMIT_ATTEMPTS: u32 = 4;
+
+/// 段写入失败分类。
+enum CommitError<E> {
+    /// 指定块擦除/编程失败: 旧快照完整无损 (候选段与旧快照不重叠),
+    /// 可以安全地把该块标记为坏块并换位置重试。
+    Block { block: u32, error: E },
+    /// 其他失败 (含 commit 字阶段: 设备可能已完成提交, 状态不确定)。
+    /// 必须放弃当前内存状态并重新挂载。
+    Fatal(Error<E>),
+}
+
+impl<E> From<Error<E>> for CommitError<E> {
+    fn from(error: Error<E>) -> Self {
+        CommitError::Fatal(error)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Record {
@@ -93,6 +120,8 @@ impl<D: BlockDevice> FileSystem<D> {
             Some(header) => read_wear_table(&mut device, &header)?,
             None => [0u16; MAX_WEAR_BLOCKS],
         };
+        // 饱和预防: 计数接近饱和时整体折半 (保留相对顺序与坏块标记)
+        let previous_wear = rescaled_wear(&previous_wear, geometry.block_count);
         let generation = previous
             .map(|header| header.generation.wrapping_add(1))
             .unwrap_or(0);
@@ -100,7 +129,9 @@ impl<D: BlockDevice> FileSystem<D> {
         let span =
             checked_snapshot_span(table_size, geometry.block_size).ok_or(Error::InvalidGeometry)?;
         let start_block = match &previous {
-            Some(active) => choose_start_block(active, span, &previous_wear, geometry.block_count),
+            // 坏块被排除在候选之外; 无可用布局时报告空间不足
+            Some(active) => choose_start_block(active, span, &previous_wear, geometry.block_count)
+                .ok_or(Error::NoSpace)?,
             None => 0,
         };
         let wear = incremented_wear(&previous_wear, start_block, span, geometry.block_count);
@@ -123,7 +154,8 @@ impl<D: BlockDevice> FileSystem<D> {
             previous.as_ref(),
             Change::Clear,
             &table[..table_size as usize],
-        )?;
+        )
+        .map_err(map_commit_error)?;
         Ok(Self {
             device,
             geometry,
@@ -136,6 +168,12 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Return the owned device. Use this before remounting after an I/O error.
     pub fn into_device(self) -> D {
         self.device
+    }
+
+    /// 测试脚手架: 只读访问底层块设备 (集成测试注入坏块/检查擦除计数)。
+    #[doc(hidden)]
+    pub fn device(&self) -> &D {
+        &self.device
     }
 
     /// Whether a failed mutation requires dropping this state and mounting
@@ -180,15 +218,25 @@ impl<D: BlockDevice> FileSystem<D> {
         self.mutate(Change::Level)
     }
 
-    /// Smallest and largest erase count over all blocks.
+    /// Smallest and largest erase count over all non-bad blocks.
+    ///
+    /// Bad blocks are excluded from wear statistics: their counters no longer
+    /// participate in placement decisions.
     pub fn wear_bounds(&self) -> (u32, u32) {
-        let mut minimum = u16::MAX;
+        let mut minimum = u32::MAX;
         let mut maximum = 0;
-        for count in self.wear[..self.geometry.block_count as usize].iter() {
-            minimum = minimum.min(*count);
-            maximum = maximum.max(*count);
+        for entry in self.wear[..self.geometry.block_count as usize].iter() {
+            if entry & WEAR_BAD_BIT != 0 {
+                continue;
+            }
+            let count = (entry & WEAR_COUNT_MASK) as u32;
+            minimum = minimum.min(count);
+            maximum = maximum.max(count);
         }
-        (minimum as u32, maximum as u32)
+        if minimum == u32::MAX {
+            return (0, 0); // 全部块均为坏块
+        }
+        (minimum, maximum)
     }
 
     /// Re-read and validate the complete active snapshot.
@@ -446,52 +494,70 @@ impl<D: BlockDevice> FileSystem<D> {
             .ok_or(Error::NoSpace)?;
         let span =
             checked_snapshot_span(payload_len, self.geometry.block_size).ok_or(Error::Corrupt)?;
+        let block_count = self.geometry.block_count;
 
-        // Dynamic wear leveling: among all non-overlapping destinations pick
-        // the one whose blocks were erased the least. The old sequential
-        // sweep remains the tie-break, so uniform workloads keep rotating.
+        // 提交循环: 动态磨损均衡 (跳过坏块) + 坏块重试。
+        // 失败候选与旧快照不重叠, 未提交即不可见 —— 换位置重试安全;
+        // 每次重试前把失败块标记为坏 (随下一次成功提交持久化)。
         let generation = self.active.generation.wrapping_add(1);
-        let start_block =
-            choose_start_block(&self.active, span, &self.wear, self.geometry.block_count);
-        let wear = incremented_wear(&self.wear, start_block, span, self.geometry.block_count);
-        let mut table = [0u8; MAX_WEAR_TABLE_SIZE];
-        encode_wear_table(&wear, self.geometry.block_count, &mut table)
-            .map_err(|_| Error::Corrupt)?;
+        let mut wear = self.wear;
+        for _attempt in 0..MAX_COMMIT_ATTEMPTS {
+            // 饱和预防: 计数接近 u15 上限时整体折半 (见 rescaled_wear)
+            wear = rescaled_wear(&wear, block_count);
+            let Some(start_block) = choose_start_block(&self.active, span, &wear, block_count)
+            else {
+                break;
+            };
+            let incremented = incremented_wear(&wear, start_block, span, block_count);
+            let mut table = [0u8; MAX_WEAR_TABLE_SIZE];
+            encode_wear_table(&incremented, block_count, &mut table)
+                .map_err(|_| Error::Corrupt)?;
 
-        // The payload CRC covers the wear table followed by the records; the
-        // record pass continues from the table's CRC state.
-        let stats = calculate_change(
-            &mut self.device,
-            &self.active,
-            change,
-            Crc32Mpeg2::from_state(crc32_mpeg2(&table[..table_size as usize])),
-        )?;
-        let next = SnapshotHeader::new(
-            generation,
-            start_block,
-            payload_len,
-            stats.payload_crc,
-            stats.file_count,
-            self.geometry,
-        )
-        .map_err(|_| Error::NoSpace)?;
+            // The payload CRC covers the wear table followed by the records; the
+            // record pass continues from the table's CRC state.
+            let stats = calculate_change(
+                &mut self.device,
+                &self.active,
+                change,
+                Crc32Mpeg2::from_state(crc32_mpeg2(&table[..table_size as usize])),
+            )?;
+            let next = SnapshotHeader::new(
+                generation,
+                start_block,
+                payload_len,
+                stats.payload_crc,
+                stats.file_count,
+                self.geometry,
+            )
+            .map_err(|_| Error::NoSpace)?;
 
-        let result = write_candidate(
-            &mut self.device,
-            &next,
-            Some(&self.active),
-            change,
-            &table[..table_size as usize],
-        );
-        if let Err(error) = result {
-            // A device may report failure after physically completing the
-            // commit word. Do not issue another erase/program from stale RAM.
-            self.recovery_required = true;
-            return Err(error);
+            match write_candidate(
+                &mut self.device,
+                &next,
+                Some(&self.active),
+                change,
+                &table[..table_size as usize],
+            ) {
+                Ok(()) => {
+                    self.active = next;
+                    self.wear = incremented;
+                    return Ok(());
+                }
+                Err(CommitError::Block { block, .. }) => {
+                    // 该块擦除/编程失败: 标记坏块 (RAM), 保留本次已发生的
+                    // 擦除计数, 换位置重试
+                    wear = incremented;
+                    mark_bad(&mut wear, block);
+                }
+                Err(CommitError::Fatal(error)) => {
+                    // 设备可能已完成提交: 放弃当前内存状态, 要求重挂载
+                    self.recovery_required = true;
+                    return Err(error);
+                }
+            }
         }
-        self.active = next;
-        self.wear = wear;
-        Ok(())
+        // 无可用布局 (坏块过多) 或重试耗尽: 旧快照仍完整可挂载
+        Err(Error::NoSpace)
     }
 }
 
@@ -720,20 +786,22 @@ fn segment_program<D: BlockDevice>(
     snapshot: &SnapshotHeader,
     logical_offset: u32,
     data: &[u8],
-) -> Result<(), Error<D::Error>> {
+) -> Result<(), CommitError<D::Error>> {
     if !logical_offset.is_multiple_of(PROGRAM_SIZE as u32)
         || !data.len().is_multiple_of(PROGRAM_SIZE)
     {
-        return Err(Error::Corrupt);
+        return Err(CommitError::Fatal(Error::Corrupt));
     }
     let length = u32::try_from(data.len()).map_err(|_| Error::Corrupt)?;
-    let end = logical_offset.checked_add(length).ok_or(Error::Corrupt)?;
+    let end = logical_offset
+        .checked_add(length)
+        .ok_or(Error::Corrupt)?;
     let segment_len = snapshot
         .block_span
         .checked_mul(snapshot.block_size)
         .ok_or(Error::Corrupt)?;
     if end > segment_len {
-        return Err(Error::Corrupt);
+        return Err(CommitError::Fatal(Error::Corrupt));
     }
 
     let mut logical = logical_offset;
@@ -746,12 +814,17 @@ fn segment_program<D: BlockDevice>(
         let amount = input.len().min(available);
         let amount = amount - amount % PROGRAM_SIZE;
         if amount == 0 {
-            return Err(Error::Corrupt);
+            return Err(CommitError::Fatal(Error::Corrupt));
         }
         let (current, rest) = input.split_at(amount);
-        device
-            .program(block, block_offset, current)
-            .map_err(Error::Device)?;
+        if let Err(error) = device.program(block, block_offset, current) {
+            // 仅"电源完好且该块确已损坏"的错误可标记坏块并重试; 其余
+            // (掉电/超时/总线撕裂) 一律 Fatal, 由调用方重挂载
+            if device.permanent_block_failure(&error) {
+                return Err(CommitError::Block { block, error });
+            }
+            Err(Error::Device(error))?;
+        }
         logical = logical.checked_add(amount as u32).ok_or(Error::Corrupt)?;
         input = rest;
     }
@@ -1276,7 +1349,7 @@ impl<'a, D: BlockDevice> SegmentWriter<'a, D> {
         }
     }
 
-    fn bytes(&mut self, mut bytes: &[u8]) -> Result<(), Error<D::Error>> {
+    fn bytes(&mut self, mut bytes: &[u8]) -> Result<(), CommitError<D::Error>> {
         while !bytes.is_empty() {
             let available = PROGRAM_SIZE - self.pending_len;
             let amount = bytes.len().min(available);
@@ -1300,7 +1373,7 @@ impl<'a, D: BlockDevice> SegmentWriter<'a, D> {
         Ok(())
     }
 
-    fn zeros(&mut self, mut length: u32) -> Result<(), Error<D::Error>> {
+    fn zeros(&mut self, mut length: u32) -> Result<(), CommitError<D::Error>> {
         while length >= PROGRAM_SIZE as u32 {
             self.bytes(&ZERO_WORD)?;
             length -= PROGRAM_SIZE as u32;
@@ -1316,7 +1389,7 @@ impl<'a, D: BlockDevice> SegmentWriter<'a, D> {
         source: &SnapshotHeader,
         payload_offset: u32,
         length: u32,
-    ) -> Result<(), Error<D::Error>> {
+    ) -> Result<(), CommitError<D::Error>> {
         let mut buffer = [0u8; COPY_BUFFER_SIZE];
         let mut copied = 0;
         while copied < length {
@@ -1351,7 +1424,7 @@ fn emit_new_record<D: BlockDevice>(
     name: &str,
     data: &[u8],
     flags: u16,
-) -> Result<(), Error<D::Error>> {
+) -> Result<(), CommitError<D::Error>> {
     let data_len = u32::try_from(data.len()).map_err(|_| Error::FileTooLarge)?;
     let (header, encoded) =
         record_encoding(name, data_len, crc32_mpeg2(data), flags).map_err(|_| Error::NoSpace)?;
@@ -1370,7 +1443,7 @@ fn emit_renamed_record<D: BlockDevice>(
     source: &SnapshotHeader,
     record: &Record,
     new_name: &str,
-) -> Result<(), Error<D::Error>> {
+) -> Result<(), CommitError<D::Error>> {
     let (header, encoded) =
         record_encoding(new_name, record.data_len, record.data_crc, record.flags)
             .map_err(|_| Error::NoSpace)?;
@@ -1388,7 +1461,7 @@ fn emit_change<D: BlockDevice>(
     writer: &mut SegmentWriter<'_, D>,
     source: Option<&SnapshotHeader>,
     change: Change<'_>,
-) -> Result<(), Error<D::Error>> {
+) -> Result<(), CommitError<D::Error>> {
     if let Some(source) = source {
         let mut offset = 0;
         let mut index = 0;
@@ -1412,10 +1485,10 @@ fn emit_change<D: BlockDevice>(
             index += 1;
         }
         if offset != source.records_len() {
-            return Err(Error::Corrupt);
+            Err(Error::Corrupt)?;
         }
     } else if !matches!(change, Change::Clear) {
-        return Err(Error::Corrupt);
+        Err(Error::Corrupt)?;
     }
 
     match change {
@@ -1468,17 +1541,19 @@ fn spans_overlap(
 /// Choose the next segment start with dynamic wear leveling.
 ///
 /// Among every run of `span` consecutive blocks that does not overlap the
-/// active snapshot, pick the one with the lowest maximum erase count (lowest
-/// total as tie-break). The remaining tie-break is the smallest forward cyclic
-/// distance from the old successor position, which reproduces the sequential
-/// sweep for uniformly worn devices. `span <= block_count/2` guarantees at
-/// least one valid candidate (the immediate successor), so the result is total.
+/// active snapshot and contains **no bad blocks**, pick the one with the
+/// lowest maximum erase count (lowest total as tie-break). The remaining
+/// tie-break is the smallest forward cyclic distance from the old successor
+/// position, which reproduces the sequential sweep for uniformly worn devices.
+/// `span <= block_count/2` guarantees at least one non-overlapping candidate;
+/// bad blocks may remove all of them, in which case `None` is returned
+/// (the device has no viable layout for this snapshot).
 fn choose_start_block(
     active: &SnapshotHeader,
     span: u32,
     wear: &[u16; MAX_WEAR_BLOCKS],
     block_count: u32,
-) -> u32 {
+) -> Option<u32> {
     let successor = (active.start_block + active.block_span) % block_count;
     let mut best: Option<(u32, u32, u32, u32)> = None;
     let mut start = 0;
@@ -1491,12 +1566,22 @@ fn choose_start_block(
             block_count,
         ) {
             let (mut maximum, mut sum) = (0u32, 0u32);
+            let mut bad = false;
             let mut index = 0;
             while index < span {
-                let count = wear[((start + index) % block_count) as usize] as u32;
+                let entry = wear[((start + index) % block_count) as usize];
+                if entry & WEAR_BAD_BIT != 0 {
+                    bad = true;
+                    break;
+                }
+                let count = (entry & WEAR_COUNT_MASK) as u32;
                 maximum = maximum.max(count);
                 sum = sum.saturating_add(count);
                 index += 1;
+            }
+            if bad {
+                start += 1;
+                continue;
             }
             let distance = (start + block_count - successor) % block_count;
             let replace = best
@@ -1510,12 +1595,11 @@ fn choose_start_block(
         }
         start += 1;
     }
-    best.expect("span <= block_count/2 guarantees a non-overlapping start")
-        .3
+    best.map(|(_, _, _, start)| start)
 }
 
 /// Return `wear` with every block of the destination segment incremented,
-/// saturating at the `u16` counter width.
+/// saturating at the 15-bit counter width (bad flags preserved).
 fn incremented_wear(
     wear: &[u16; MAX_WEAR_BLOCKS],
     start_block: u32,
@@ -1526,10 +1610,46 @@ fn incremented_wear(
     let mut index = 0;
     while index < span {
         let block = ((start_block + index) % block_count) as usize;
-        next[block] = next[block].saturating_add(1);
+        let entry = next[block];
+        // 计数域 15 位: +1 后钳位到掩码上限 (32767+1 不再进位到坏位)
+        let count = ((entry & WEAR_COUNT_MASK) + 1).min(WEAR_COUNT_MASK);
+        next[block] = (entry & WEAR_BAD_BIT) | count;
         index += 1;
     }
     next
+}
+
+/// 磨损计数接近饱和时整体折半 (坏块标记保留)。
+///
+/// u15 计数饱和后所有块同分, 动态磨损均衡退化为无差异选择; 折半在
+/// 计数逼近饱和前触发, 保留相对顺序, 均衡永不失效。折半发生在选择
+/// 新位置**之前**, 折半后的计数随下一次成功提交持久化。
+fn rescaled_wear(wear: &[u16; MAX_WEAR_BLOCKS], block_count: u32) -> [u16; MAX_WEAR_BLOCKS] {
+    let mut next = *wear;
+    let saturated = next[..block_count as usize]
+        .iter()
+        .any(|&entry| entry & WEAR_COUNT_MASK >= WEAR_RESCALE_AT);
+    if saturated {
+        for entry in &mut next[..block_count as usize] {
+            *entry = (*entry & WEAR_BAD_BIT) | ((*entry & WEAR_COUNT_MASK) / 2);
+        }
+    }
+    next
+}
+
+/// 标记坏块 (仅内存; 随下一次成功提交的磨损表持久化)。
+///
+/// 被标记块不再作为快照放置候选; 无重映射 —— 跳过即"管理"。
+fn mark_bad(wear: &mut [u16; MAX_WEAR_BLOCKS], block: u32) {
+    wear[block as usize] |= WEAR_BAD_BIT;
+}
+
+/// CommitError → Error (format 等单次提交路径用)
+fn map_commit_error<E>(error: CommitError<E>) -> Error<E> {
+    match error {
+        CommitError::Block { error, .. } => Error::Device(error),
+        CommitError::Fatal(error) => error,
+    }
 }
 
 /// Read the active snapshot's per-block erase table.
@@ -1559,18 +1679,25 @@ fn write_candidate<D: BlockDevice>(
     source: Option<&SnapshotHeader>,
     change: Change<'_>,
     wear_bytes: &[u8],
-) -> Result<(), Error<D::Error>> {
+) -> Result<(), CommitError<D::Error>> {
     if source
         .map(|active| segments_overlap(active, candidate))
         .unwrap_or(false)
     {
-        return Err(Error::NoSpace);
+        Err(Error::NoSpace)?;
     }
 
     let mut relative = 0;
     while relative < candidate.block_span {
         let block = (candidate.start_block + relative) % candidate.block_count;
-        device.erase(block).map_err(Error::Device)?;
+        if let Err(error) = device.erase(block) {
+            // 仅"电源完好且该块确已损坏"的错误可标记坏块并重试;
+            // 掉电等模糊错误一律 Fatal (候选未写入任何内容, 旧快照无损)
+            if device.permanent_block_failure(&error) {
+                return Err(CommitError::Block { block, error });
+            }
+            Err(Error::Device(error))?;
+        }
         relative += 1;
     }
 
@@ -1591,26 +1718,154 @@ fn write_candidate<D: BlockDevice>(
     if observed[..crate::format::SNAPSHOT_PREFIX_SIZE] != prefix
         || observed[crate::format::COMMIT_OFFSET..] != [0xff; PROGRAM_SIZE]
     {
-        return Err(Error::Corrupt);
+        Err(Error::Corrupt)?;
     }
     validate_snapshot(device, candidate)?;
 
     // Publish only after complete readback. A torn word is rejected at mount
     // unless it happens to equal this exact value; even then both CRCs and the
     // full record structure above must also be valid.
+    //
+    // commit 字失败是不可重试的: 设备可能已物理完成提交 (块级错误按
+    // Fatal 处理, 调用方必须重挂载, 不得从旧内存状态继续写)。
     segment_program(
         device,
         candidate,
         crate::format::COMMIT_OFFSET as u32,
         &commit_marker_bytes(),
-    )?;
+    )
+    .map_err(|error| match error {
+        CommitError::Block { error, .. } => CommitError::Fatal(Error::Device(error)),
+        fatal => fatal,
+    })?;
     device.sync().map_err(Error::Device)?;
 
     segment_read(device, candidate, 0, &mut observed)?;
     let decoded = SnapshotHeader::decode_at(&observed, candidate.start_block, candidate.geometry())
         .map_err(|_| Error::Corrupt)?;
     if decoded != *candidate {
-        return Err(Error::Corrupt);
+        Err(Error::Corrupt)?;
     }
-    validate_snapshot(device, candidate)
+    validate_snapshot(device, candidate).map_err(CommitError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_geometry() -> Geometry {
+        Geometry::new(4096, 8)
+    }
+
+    fn sample_active() -> SnapshotHeader {
+        // span=1 的空快照 (起始块 0)
+        SnapshotHeader::new(1, 0, wear_table_size(8), 0, 0, sample_geometry()).unwrap()
+    }
+
+    #[test]
+    fn rescale_halves_counts_and_preserves_bad_flags() {
+        let mut wear = [0u16; MAX_WEAR_BLOCKS];
+        wear[0] = 10;
+        wear[1] = WEAR_RESCALE_AT; // 触发折半
+        wear[2] = WEAR_BAD_BIT | 20_000; // 坏块, 计数 20000
+        wear[3] = WEAR_BAD_BIT | 29_999; // 坏块, 计数接近饱和
+
+        let rescaled = rescaled_wear(&wear, 8);
+        assert_eq!(rescaled[0], 5);
+        assert_eq!(rescaled[1], WEAR_RESCALE_AT / 2);
+        // 坏块标记保留, 计数折半
+        assert_eq!(rescaled[2], WEAR_BAD_BIT | 10_000);
+        assert_eq!(rescaled[3], WEAR_BAD_BIT | 14_999);
+        // 范围外条目原样保留
+        assert_eq!(rescaled[8], 0);
+    }
+
+    #[test]
+    fn rescale_is_idempotent_below_threshold() {
+        let mut wear = [0u16; MAX_WEAR_BLOCKS];
+        wear[0] = WEAR_RESCALE_AT - 1;
+        let rescaled = rescaled_wear(&wear, 8);
+        assert_eq!(rescaled, wear);
+    }
+
+    #[test]
+    fn choose_skips_runs_containing_bad_blocks() {
+        let active = sample_active(); // 当前 [0,1)
+        let mut wear = [0u16; MAX_WEAR_BLOCKS];
+        // 均匀磨损: 顺序轮转本应选块 1 (后继); 坏掉 1 后应选 2
+        let start = choose_start_block(&active, 1, &wear, 8).unwrap();
+        assert_eq!(start, 1);
+        wear[1] = WEAR_BAD_BIT;
+        let start = choose_start_block(&active, 1, &wear, 8).unwrap();
+        assert_eq!(start, 2);
+    }
+
+    #[test]
+    fn choose_returns_none_when_all_candidates_contain_bad_blocks() {
+        let active = sample_active(); // 当前 [0,1), 候选 = 1..7
+        let mut wear = [0u16; MAX_WEAR_BLOCKS];
+        for block in 1..8 {
+            wear[block] = WEAR_BAD_BIT;
+        }
+        assert_eq!(choose_start_block(&active, 1, &wear, 8), None);
+    }
+
+    #[test]
+    fn incremented_wear_saturates_at_mask_and_keeps_bad() {
+        let mut wear = [0u16; MAX_WEAR_BLOCKS];
+        wear[0] = WEAR_COUNT_MASK;
+        wear[1] = WEAR_BAD_BIT | 5;
+        let next = incremented_wear(&wear, 0, 2, 8);
+        assert_eq!(next[0], WEAR_COUNT_MASK); // 饱和
+        assert_eq!(next[1], WEAR_BAD_BIT | 6); // 坏标记保留, 计数递增
+    }
+
+    #[test]
+    fn mark_bad_sets_flag_without_touching_count() {
+        let mut wear = [0u16; MAX_WEAR_BLOCKS];
+        wear[4] = 123;
+        mark_bad(&mut wear, 4);
+        assert_eq!(wear[4], WEAR_BAD_BIT | 123);
+    }
+
+    #[test]
+    fn wear_bounds_skip_bad_blocks() {
+        let mut wear = [7u16; MAX_WEAR_BLOCKS];
+        wear[0] = 3;
+        wear[1] = 9;
+        wear[2] = WEAR_BAD_BIT | 20_000; // 坏块, 不参与统计
+        let fs = FileSystem::<DummyDevice> {
+            device: DummyDevice,
+            geometry: sample_geometry(),
+            active: sample_active(),
+            recovery_required: false,
+            wear,
+        };
+        assert_eq!(fs.wear_bounds(), (3, 9));
+    }
+
+    /// 仅用于构造 FileSystem 的哑设备 (不执行任何 I/O)
+    struct DummyDevice;
+
+    impl BlockDevice for DummyDevice {
+        type Error = ();
+        fn block_size(&self) -> u32 {
+            4096
+        }
+        fn block_count(&self) -> u32 {
+            8
+        }
+        fn read(&mut self, _b: u32, _o: u32, _buf: &mut [u8]) -> Result<(), ()> {
+            Ok(())
+        }
+        fn program(&mut self, _b: u32, _o: u32, _d: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+        fn erase(&mut self, _b: u32) -> Result<(), ()> {
+            Ok(())
+        }
+        fn sync(&mut self) -> Result<(), ()> {
+            Ok(())
+        }
+    }
 }

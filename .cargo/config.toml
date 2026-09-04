@@ -212,6 +212,10 @@ CFG_SOAK_MINUTES = "10"              # soak 无参数时的默认时长 (分钟,
 CFG_SOAK_REPORT_INTERVAL_MS = "30000" # 进度报告间隔 (毫秒)
 CFG_SOAK_HANG_GRACE_MS = "5000"      # 压力线程心跳停滞判定 (毫秒)
 CFG_SOAK_FLASH_INTERVAL_MS = "10000" # Flash 压力节流: 两次擦写循环的最小间隔 (毫秒)
+# 硬实时判定阈值 (实测峰值超过即 FAIL):
+# 最长关中断 (PRIMASK) 时间 / 最长 SysTick ISR 到达延迟 (不含 Flash bus hold)
+CFG_SOAK_MAX_CRITICAL_US = "50"
+CFG_SOAK_MAX_IRQ_LATENCY_US = "500"
 
 [target.thumbv7em-none-eabihf]
 rustflags = [

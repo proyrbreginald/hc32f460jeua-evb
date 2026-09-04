@@ -13,46 +13,53 @@
 //! 主机可测: 纯 `core` 原子操作, 不依赖硬件, 已加入 `lib.rs` 供 `cargo test`。
 #![allow(dead_code)] // 部分 API (clear/is_installed) 供未来驱动选用
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// 无参回调 (中断上下文执行, 必须有界、无阻塞且不得打印)
 pub type Callback = fn();
 
-/// 原子回调槽 (null = 未安装; 原子类型不可 Copy, 静态数组用
+// ABI 契约: 本槽位把函数指针按 `usize` 存储。Cortex-M (ARMv7-M) 使用
+// 统一地址空间, 函数指针与数据指针同宽, `fn → usize` 为保留位模式
+// 的显式转换; 反向经 `transmute` 仅在本断言保证同宽时才成立。若未来
+// 移植到指针分宽的目标 (如哈佛结构的函数/数据指针不同宽), 此断言将
+// 在编译期失败, 提示改用工整的标签表方案。
+const _: () = assert!(core::mem::size_of::<Callback>() == core::mem::size_of::<usize>());
+
+/// 原子回调槽 (0 = 未安装; 原子类型不可 Copy, 静态数组用
 /// [`NotifySlot::new`] 逐项构造)
-pub struct NotifySlot(AtomicPtr<()>);
+pub struct NotifySlot(AtomicUsize);
 
 impl NotifySlot {
     /// 空槽 (未安装回调)
     pub const fn new() -> Self {
-        Self(AtomicPtr::new(core::ptr::null_mut()))
+        Self(AtomicUsize::new(0))
     }
 
-    /// 安装回调 (原子替换; 传 [`None`] 语义的 null 由 [`Self::clear`] 提供)
+    /// 安装回调 (原子替换; 传 [`None`] 语义的 0 由 [`Self::clear`] 提供)
     pub fn store(&self, cb: Callback) {
-        self.0.store(cb as *const () as *mut (), Ordering::Release);
+        self.0.store(cb as usize, Ordering::Release);
     }
 
     /// 卸载回调 (槽位恢复空)
     pub fn clear(&self) {
-        self.0.store(core::ptr::null_mut(), Ordering::Release);
+        self.0.store(0, Ordering::Release);
     }
 
     /// 调用已安装的回调 (未安装则为无操作)。
     ///
-    /// 供 ISR 侧调用; 槽位只接受 [`Callback`] (与 `*mut ()` 同宽),
-    /// 存入的函数指针始终有效且与目标同宽。
+    /// 供 ISR 侧调用; 槽位只接受 [`Callback`], 存储值 0 恒为未安装。
+    /// 宽度契约见模块级 const 断言。
     pub fn call(&self) {
-        let ptr = self.0.load(Ordering::Acquire);
-        if !ptr.is_null() {
-            let cb = unsafe { core::mem::transmute::<*mut (), Callback>(ptr) };
+        let value = self.0.load(Ordering::Acquire);
+        if value != 0 {
+            let cb = unsafe { core::mem::transmute::<usize, Callback>(value) };
             cb();
         }
     }
 
     /// 是否已安装回调
     pub fn is_installed(&self) -> bool {
-        !self.0.load(Ordering::Acquire).is_null()
+        self.0.load(Ordering::Acquire) != 0
     }
 }
 

@@ -35,31 +35,40 @@ pub unsafe extern "C" fn default_handler() {
 /// 运行时注册的外设中断回调 (供 [`register_irq`] / [`crate::intc`] 使用)
 type IrqHandler = unsafe extern "C" fn();
 
-/// 回调槽位: 原子函数指针存储 (null = 未注册)
+/// 回调槽位: 原子函数指针存储 (0 = 未注册)
 ///
 /// 纯原子实现, 无 `unsafe impl Sync`: 注册 (Release 写) 与中断分发
 /// (Acquire 读) 无需临界区 —— 运行时重复注册/注销也是竞态安全的,
 /// 不依赖"仅初始化期注册"的文档约定。
-struct IrqSlot(core::sync::atomic::AtomicPtr<()>);
+///
+/// ABI 契约: 函数指针按 `usize` 存储。Cortex-M 统一地址空间下两者同宽,
+/// `fn → usize` 为保留位模式的显式转换, 反向 `transmute` 由下方 const
+/// 断言保证同宽; 移植到指针分宽目标时该断言编译失败 (见 notify 模块)。
+struct IrqSlot(core::sync::atomic::AtomicUsize);
+
+const _: () = assert!(
+    core::mem::size_of::<IrqHandler>() == core::mem::size_of::<usize>(),
+    "中断回调函数指针须与 usize 同宽 (统一地址空间)"
+);
 
 impl IrqSlot {
     const fn new() -> Self {
-        Self(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()))
+        Self(core::sync::atomic::AtomicUsize::new(0))
     }
 
     fn store(&self, handler: IrqHandler) {
         use core::sync::atomic::Ordering;
-        self.0.store(handler as *mut (), Ordering::Release);
+        self.0.store(handler as usize, Ordering::Release);
     }
 
     fn load(&self) -> Option<IrqHandler> {
         use core::sync::atomic::Ordering;
         let v = self.0.load(Ordering::Acquire);
-        if v.is_null() {
+        if v == 0 {
             None
         } else {
-            // 存储的必然是合法函数指针 (store 的输入), 指针 ↔ fn 同宽
-            Some(unsafe { core::mem::transmute::<*mut (), IrqHandler>(v) })
+            // 存储的必然是合法函数指针 (store 的输入), 宽度经 const 断言
+            Some(unsafe { core::mem::transmute::<usize, IrqHandler>(v) })
         }
     }
 }
@@ -77,12 +86,12 @@ pub fn register_irq(n: usize, handler: IrqHandler) {
     IRQ_HANDLERS[n].store(handler);
 }
 
-/// 移除外设中断回调 (置空; 未注册的槽位触发时静默返回)
+/// 移除外设中断回调 (置 0; 未注册的槽位触发时静默返回)
 pub fn unregister_irq(n: usize) {
     assert!(n < 144, "unregister_irq: 仅支持 INT000~INT143");
     IRQ_HANDLERS[n]
         .0
-        .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
+        .store(0, core::sync::atomic::Ordering::Release);
 }
 
 /// 生成分发入口: 查表调用对应槽位的回调 (未注册时静默返回)

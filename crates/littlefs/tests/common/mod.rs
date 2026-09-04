@@ -11,6 +11,8 @@ pub enum RamError {
     Unaligned,
     NotErased,
     PowerLoss,
+    /// A block that has been armed as permanently dead rejected an operation.
+    DeadBlock,
 }
 
 #[derive(Clone)]
@@ -23,6 +25,7 @@ struct State {
     events: u64,
     byte_order: [usize; 4],
     erase_counts: Vec<u32>,
+    dead_blocks: Vec<bool>,
 }
 
 impl State {
@@ -75,8 +78,20 @@ impl RamNor {
                 events: 0,
                 byte_order: [0, 1, 2, 3],
                 erase_counts: vec![0; block_count as usize],
+                dead_blocks: vec![false; block_count as usize],
             })),
         }
+    }
+
+    /// Arm a permanently dead block: every erase/program on it returns
+    /// [`RamError::DeadBlock`] (classified as `permanent_block_failure`).
+    pub fn arm_dead_block(&self, block: u32) {
+        self.state.borrow_mut().dead_blocks[block as usize] = true;
+    }
+
+    /// Heal a previously armed dead block (test scaffolding).
+    pub fn heal_dead_block(&self, block: u32) {
+        self.state.borrow_mut().dead_blocks[block as usize] = false;
     }
 
     /// Create an independent persistent image with fault counters reset.
@@ -155,6 +170,9 @@ impl BlockDevice for RamNor {
         }
 
         let mut state = self.state.borrow_mut();
+        if state.dead_blocks[block as usize] {
+            return Err(RamError::DeadBlock);
+        }
         let absolute = state.range(block, offset, bytes.len())?;
         for word in 0..bytes.len() / 4 {
             let word_index = absolute / 4 + word;
@@ -183,6 +201,9 @@ impl BlockDevice for RamNor {
 
     fn erase(&mut self, block: u32) -> Result<(), Self::Error> {
         let mut state = self.state.borrow_mut();
+        if state.dead_blocks[block as usize] {
+            return Err(RamError::DeadBlock);
+        }
         let block_size = state.block_size as usize;
         let absolute = state.range(block, 0, block_size)?;
         state.erase_counts[block as usize] += 1;
@@ -203,6 +224,10 @@ impl BlockDevice for RamNor {
 
     fn sync(&mut self) -> Result<(), Self::Error> {
         self.state.borrow_mut().event()
+    }
+
+    fn permanent_block_failure(&self, error: &Self::Error) -> bool {
+        matches!(error, RamError::DeadBlock)
     }
 }
 

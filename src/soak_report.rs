@@ -4,7 +4,14 @@
 //! 汇总为单个自包含 HTML (内联 CSS, 无外部依赖), 写入文件系统
 //! `/test/soak_<时间戳>.html`。HTML 构建与文件名等纯逻辑在
 //! [`crate::soak_report_core`] (主机可单测), 本模块负责文件系统
-//! 写入与目录预算。
+//! 写入、启动序号分配与目录预算。
+//!
+//! # 跨复位排序
+//!
+//! RTC 未设置时报告名退化为 `soak_b<启动序号>_<uptime>.html`: 启动序号
+//! 由本模块扫描 `/test` 目录取最大序号 +1 (跨复位单调), uptime 零填充;
+//! 预算删除按 [`crate::soak_report_core::older_than`] 比较, 复位后
+//! uptime 归零也不破坏时间序 (旧版仅按 uptime 命名, 跨复位会删错文件)。
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -27,17 +34,32 @@ pub(crate) fn save(
     if filesystem.stat(REPORT_DIR).is_err() {
         filesystem.mkdir(REPORT_DIR)?;
     }
+    // 退化文件名的启动序号: 扫描现有报告取最大 +1 (跨复位单调)
+    let boot_seq = next_boot_seq(filesystem)?;
     enforce_budget(filesystem)?;
 
     let mut name = [0u8; crate::soak_report_core::NAME_BUF];
-    let name = crate::soak_report_core::file_name(data, &mut name);
+    let name = crate::soak_report_core::file_name(data, boot_seq, &mut name);
     let path = alloc::format!("{REPORT_DIR}/{name}");
     filesystem.write(&path, bytes)?;
     Ok(path)
 }
 
-/// 维护报告预算: 枚举 `/test` 目录, 超出上限时删除字典序最前的
-/// (即最旧) 报告文件
+/// 现有退化报告名的最大启动序号 +1 (无历史时为 1)。
+fn next_boot_seq(filesystem: &mut crate::filesystem::FileSystem) -> Result<u64, FsError> {
+    let mut max: u64 = 0;
+    filesystem.read_dir(REPORT_DIR, |name, _info| {
+        if let Some((seq, _)) = crate::soak_report_core::parse_seq_name(name) {
+            max = max.max(seq);
+        }
+    })?;
+    Ok(max.saturating_add(1).max(1))
+}
+
+/// 维护报告预算: 枚举 `/test` 目录, 超出上限时删除时间序最前的
+/// (即最旧) 报告文件。排序经 [`crate::soak_report_core::older_than`]:
+/// RTC 名按字典序 (即时间序), 退化名按 (启动序号, uptime) —— 跨复位
+/// 仍正确 (见模块文档)。
 fn enforce_budget(filesystem: &mut crate::filesystem::FileSystem) -> Result<(), FsError> {
     let mut names: Vec<String> = Vec::new();
     filesystem.read_dir(REPORT_DIR, |name, _info| {
@@ -48,11 +70,10 @@ fn enforce_budget(filesystem: &mut crate::filesystem::FileSystem) -> Result<(), 
             names.push(name.into());
         }
     })?;
-    // 插入排序 (≤ COLLECT_CAP=32 项): 字典序即时间序 (报告名含时间戳),
-    // 避免链接 core 的泛型快速排序机器 (~2.4KiB)
+    // 插入排序 (≤ COLLECT_CAP=32 项): 避免链接 core 的泛型快速排序机器 (~2.4KiB)
     for i in 1..names.len() {
         let mut j = i;
-        while j > 0 && names[j] < names[j - 1] {
+        while j > 0 && crate::soak_report_core::older_than(&names[j], &names[j - 1]) {
             names.swap(j, j - 1);
             j -= 1;
         }

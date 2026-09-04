@@ -348,7 +348,7 @@ pub(crate) fn run_can() {
             crate::println!("[selftest] CAN 已中断 (ESC)");
         }
         Err(error) => {
-            crate::log_info!("[FAIL] CAN: {}", error);
+            crate::log_error!("[FAIL] CAN: {}", error);
             crate::println!("[selftest] CAN 完成: 0 通过, 1 失败 ({})", error);
         }
     }
@@ -371,7 +371,8 @@ pub(crate) fn run() {
             crate::log_info!("[PASS] {}", name);
         } else {
             fail += 1;
-            crate::log_info!("[FAIL] {}", name);
+            // 失败项以 error 级 (红色 [ERR]) 输出, 与通过项的绿色区分
+            crate::log_error!("[FAIL] {}", name);
         }
         // 每项后检查 ESC (中断剩余项)
         if abort_requested() {
@@ -694,5 +695,8 @@ pub(crate) fn run() {
         );
     } else {
         crate::println!("[selftest] 完成: {} 通过, {} 失败", pass, fail);
+        if fail > 0 {
+            crate::println!("[selftest] 存在失败项, 详见上方红色 [ERR] 输出");
+        }
     }
 }

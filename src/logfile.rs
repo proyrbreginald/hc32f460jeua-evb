@@ -1,4 +1,4 @@
-//! 日志落盘: 把 RAM 日志缓冲 (见 [`crate::log::drain_into`]) 自动保存到
+//! 日志落盘: 把 RAM 日志缓冲 (见 [`crate::log::drain_limited`]) 自动保存到
 //! 文件系统的 `/log/` 目录。
 //!
 //! # 工作方式
@@ -7,9 +7,12 @@
 //! [`flush_once`]; shell 的 `reboot` 命令也会在复位前同步调用
 //! [`flush_now`], 保证掉电前日志已落盘。
 //!
-//! 一次刷新 (零中间堆分配): 排空日志缓冲**直接追加**到 RAM 中的当前
-//! 文件镜像 → 整文件原子写 `/log/boot_<序号>.log`。镜像超过
-//! [`crate::config::LOG_FILE_MAX`] 时轮转: 段号 +1, 新段另起一个文件。
+//! 一次刷新 (零中间堆分配): 日志缓冲按**条目粒度**追加到 RAM 中的
+//! 当前文件镜像, 放不下即轮转 (段号 +1) 后继续 → 整文件原子写
+//! `/log/boot_<序号>.log`。镜像按 [`crate::config::LOG_FILE_MAX`]
+//! 分块: 单个日志文件恒不超上限 (超长单条目独占一段的例外见
+//! [`flush_once`]); 缓冲丢弃最旧/截断条目由 logring 输出显式标记,
+//! 落盘文件不再静默缺日志。
 //!
 //! # 文件名与顺序性 (见 [`crate::logfile_core`])
 //!
@@ -145,6 +148,15 @@ impl core::fmt::Write for FmtSlice<'_> {
 ///
 /// 由日志线程周期性调用, 也可由其他线程 (shell `reboot`) 同步调用;
 /// 两者经文件系统互斥量 + [`STATE`] 串行化, 不会互相覆盖。
+///
+/// # 分块轮转 (文件上限保证)
+///
+/// 缓冲按**条目粒度**切块落盘: 每条追加前检查段镜像剩余空间, 放得下
+/// 才追加; 放不下即先落盘当前段、段号 +1 另起新段。单个日志文件
+/// **恒 ≤ [`config::LOG_FILE_MAX`]**, 唯一的例外是"单条日志 + 段头
+/// 标记本身就超过上限"的病态场景 (此时该条目独占一段, 超限部分 =
+/// 单条长度, 且会被后续轮转吸收 —— 不再出现旧版"一次刷入整个缓冲
+/// 导致段文件超限一个环大小"的问题)。
 pub fn flush_once() {
     if !crate::log::file_enabled() {
         return;
@@ -169,37 +181,74 @@ pub fn flush_once() {
         state.scanned = true;
     }
 
-    // 当前段已满 → 轮转 (段号 +1, 新段文件)
-    if !state.image.is_empty() && state.image.len() >= config::LOG_FILE_MAX {
-        state.segment += 1;
-        state.image.clear();
-    }
-    // 新段起始 (启动首写或轮转后首写): 内容标记 (含芯片唯一编号,
-    // 日志自含设备身份) + 维护文件预算
-    if state.image.is_empty() {
-        let mut marker_buf = [0u8; logfile_core::MARKER_CAP];
-        let mut uid_buf = [0u8; crate::efm::UID_HEX_CAP];
-        let uid = crate::efm::uid_hex(&mut uid_buf);
-        let marker = logfile_core::format_boot_marker(state.boot_no, uid, &mut marker_buf);
-        state.image.extend_from_slice(marker);
-        enforce_budget(&mut filesystem, state.boot_no, state.segment);
-    }
-
-    // 排空缓冲直接追加到镜像 (零中间分配)
-    crate::log::drain_into(&mut state.image);
-
-    if write_segment(&mut filesystem, state.boot_no, state.segment, &state.image).is_err() {
-        // 空间不足等: 删最旧日志文件后重试一次, 仍失败则丢弃本轮
-        if free_oldest(&mut filesystem).is_err() {
-            println!("logfile: 无法释放日志文件");
-            return;
+    // 分块排空: 段镜像按条目粒度填满即轮转, 单文件恒 ≤ LOG_FILE_MAX
+    loop {
+        // 新段起始 (启动首写或轮转后首写): 内容标记 (含芯片唯一编号,
+        // 日志自含设备身份) + 维护文件预算
+        if state.image.is_empty() {
+            let mut marker_buf = [0u8; logfile_core::MARKER_CAP];
+            let mut uid_buf = [0u8; crate::efm::UID_HEX_CAP];
+            let uid = crate::efm::uid_hex(&mut uid_buf);
+            let marker = logfile_core::format_boot_marker(state.boot_no, uid, &mut marker_buf);
+            state.image.extend_from_slice(marker);
+            enforce_budget(&mut filesystem, state.boot_no, state.segment);
         }
-        if let Err(error) =
-            write_segment(&mut filesystem, state.boot_no, state.segment, &state.image)
-        {
-            println!("logfile: 日志落盘失败: {}", fs_error_summary(&error));
+        if crate::log::pending_bytes() == 0 {
+            break;
+        }
+        let free = config::LOG_FILE_MAX.saturating_sub(state.image.len());
+        if crate::log::drain_limited(&mut state.image, free) == 0 {
+            // 首条放不进剩余空间: 强制排出 (超长条目独占一段, 见模块文档)
+            if crate::log::drain_oldest(&mut state.image) == 0 {
+                // 排空失败 (极端: 条目构建中): 放弃本轮, 下轮再试
+                return;
+            }
+            if write_segment_retry(&mut filesystem, state.boot_no, state.segment, &state.image)
+                .is_err()
+            {
+                return;
+            }
+            state.segment += 1;
+            state.image.clear();
+            continue;
+        }
+        if crate::log::pending_bytes() > 0 {
+            // 本段已填满 (或已达上限): 落盘并轮转
+            if write_segment_retry(&mut filesystem, state.boot_no, state.segment, &state.image)
+                .is_err()
+            {
+                return;
+            }
+            state.segment += 1;
+            state.image.clear();
         }
     }
+    // 收尾: 最后一段 (未满) 也落盘
+    if !state.image.is_empty() {
+        let _ = write_segment_retry(&mut filesystem, state.boot_no, state.segment, &state.image);
+    }
+}
+
+/// 落盘一个段文件; 失败时删最旧日志文件重试一次 (仍失败则报错)
+fn write_segment_retry(
+    filesystem: &mut filesystem::FileSystem,
+    boot_no: u64,
+    segment: u32,
+    image: &[u8],
+) -> Result<(), ()> {
+    if write_segment(filesystem, boot_no, segment, image).is_ok() {
+        return Ok(());
+    }
+    // 空间不足等: 删最旧日志文件后重试一次, 仍失败则丢弃本轮
+    if free_oldest(filesystem).is_err() {
+        println!("logfile: 无法释放日志文件");
+        return Err(());
+    }
+    if let Err(error) = write_segment(filesystem, boot_no, segment, image) {
+        println!("logfile: 日志落盘失败: {}", fs_error_summary(&error));
+        return Err(());
+    }
+    Ok(())
 }
 
 /// 立即把缓冲中的日志落盘 (供 `reboot` 在复位前调用; 落盘开关关闭时为无操作)

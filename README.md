@@ -9,10 +9,18 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 - 零依赖裸机 Rust (edition 2024, `thumbv7em-none-eabihf`),无 PAC/HAL crate;
 - 寄存器级外设驱动:时钟 (XTAL+MPLL→200MHz,失败自动回退)、GPIO、SysTick、
   USART、经典 CAN 2.0B、DMA (DMA1/DMA2 各 4 通道, 控制台 UART 发送卸载);
-- 全局堆分配器 (边界标记 + 首次适配,中断安全),完整支持 `Layout` 的任意
-  2 的幂对齐，并以 checked 算术拒绝越界布局，支持 `Vec`/`Box`/`String`;
+- 全局堆分配器 (**TLSF 两级隔离空闲链表**: O(1) 分配/释放, 关中断时间
+  有界 —— 硬实时),完整支持 `Layout` 的任意 2 的幂对齐，并以 checked
+  算术拒绝越界布局，支持 `Vec`/`Box`/`String`;
 - **RTOS 内核**:32 级位图调度 + 时间片轮转、优先级继承互斥量、硬定时器、
   信号量/事件/邮箱/消息队列、线程生命周期与僵尸回收;
+- **内核对象零临界区分配**: 邮箱/消息队列的消息池在临界区**外**经 CAS
+  一次性发布 —— 关中断区间绝不发生 malloc;
+- **硬实时指标测量**: DWT 周期计数器实测最长关中断 (PRIMASK) 时间与
+  SysTick ISR 到达延迟 (基线法全值; Flash 擦写 bus hold 期间排队的
+  样本经 原子标志 + 到达时点 双重判定, 单独归类不污染指标), `soak`
+  按编译期阈值 (`CFG_SOAK_MAX_CRITICAL_US`/`CFG_SOAK_MAX_IRQ_LATENCY_US`)
+  纳入 PASS/FAIL 判定并写入 HTML 报告;
 - **原子打印**:打印锁 (优先级继承) 保证输出整行不交错,高优先级线程
   不会无界等待低优先级线程;
 - 完整的 panic/fault 诊断 (CFSR/HFSR 解码 + 基本/浮点异常帧 + 安全栈回溯)。
@@ -80,7 +88,8 @@ src/
 ├── critical_section.rs# PRIMASK 临界区 (嵌套安全, 中断安全的基础)
 ├── mmio.rs            # 内存映射寄存器访问原语 (全部外设驱动共用, 含 u8/u16/u32 与 RMW)
 ├── notify.rs          # 原子回调槽: ISR → 应用无锁通知 (uart/dma 共用, 可在主机测试)
-├── heap.rs            # 全局堆分配器 (边界标记 + 首次适配 + 前后合并)
+├── heap.rs            # 全局堆分配器适配层 (临界区 + 链接脚本边界)
+├── latency.rs         # 硬实时指标: DWT 实测最长关中断 + 节拍 ISR 到达延迟
 ├── icg.rs             # ICG 初始化配置段 (flash 0x400, 由 CFG_HRC_FREQ 生成)
 ├── efm.rs             # 片内 Flash (EFM): 扇区擦除/字编程/读等待周期/UID
 ├── filesystem.rs      # 精简断电安全文件系统的片内 Flash 分区适配
@@ -128,17 +137,25 @@ crates/littlefs/  # 块设备/磁盘格式 + 文件/目录/原子快照操作
 
 ## 堆布局与主机测试
 
-`heap.rs` 在每个返回 payload 前保存所属分配块的地址，因此即使高对齐请求
-在块头后产生 padding，释放时仍能准确找回边界标记。地址、大小、padding
-和块尾计算均使用 checked 算术；布局无法完整落入空闲块时返回 null。
+TLSF 两级隔离状态机位于 `src/heap_tlsf.rs` (纯逻辑, **主机压力测试**:
+随机 churn + 模式校验、线程栈/TCB 精确内核模式、全部释放顺序合并、
+高对齐往返、分配失败优雅拒绝), `heap.rs` 仅提供临界区串行化与链接
+脚本堆边界。位图在常数步内定位"装得下需求的最小尺寸级"并取链首,
+释放经前/后块合并 (块头内嵌 `prev_phys`) 后按尺寸级插回 —— 分配/
+释放与空闲块总数无关, **关中断时间有界** (硬实时要求)。在每个返回
+payload 前保存所属分配块的地址，因此即使高对齐请求在块头后产生
+padding，释放时仍能准确找回边界标记。地址、大小、padding 均使用
+checked 算术；布局无法完整落入空闲块时返回 null。
 
 硬件无关的布局规划位于 `src/heap_layout.rs`，主机测试覆盖 1B 到 4096B
 的代表性二次幂对齐、高对齐 padding、空间不足/整数溢出以及零大小布局。
 `src/can_timing.rs` 的主机测试覆盖常用位速率、DDL 边界、SBT 编码、误差
 上限及溢出输入。`src/zmodem.rs` 的主机测试覆盖 CRC 标准向量 (与 lrzsz
 实测一致)、转义/帧收发往返、收发双端内存回环 (多文件/空文件/跳过)，
-以及宿主机装有 lrzsz 时与真实 `sz`/`rz` 的互通测试。它们验证纯算法，
-不替代目标板上的寄存器路径、总线电气连接、完整链表分配器和临界区测试：
+以及宿主机装有 lrzsz 时与真实 `sz`/`rz` 的互通测试。`crates/littlefs`
+的测试覆盖文件系统语义、断电穷举、磨损均衡与**坏块标记/重试/跳过**。
+它们验证纯算法，不替代目标板上的寄存器路径、总线电气连接、完整链表
+分配器和临界区测试：
 
 ```bash
 cargo test --workspace --target x86_64-unknown-linux-gnu

@@ -85,6 +85,17 @@ pub struct Data<'a> {
     /// 实测最大喂狗间隔 / WDT 硬件超时 (毫秒; 未启用时为 0)
     pub wdt_feed_gap_ms: u32,
     pub wdt_timeout_ms: u32,
+    /// 硬实时指标 (DWT 实测): 最长关中断 (µs) / 阈值 / 是否通过
+    pub critical_us: u32,
+    pub critical_limit_us: u32,
+    /// Flash 擦写窗口内的最大关中断 (µs, 信息性)
+    pub critical_flash_us: u32,
+    /// SysTick 到达延迟 (µs, 不含 Flash bus hold) / 阈值 / 是否通过
+    pub tick_latency_us: u32,
+    pub tick_latency_limit_us: u32,
+    /// Flash 擦写窗口内的到达延迟 (µs, 信息性)
+    pub tick_latency_flash_us: u32,
+    pub latency_ok: bool,
     pub rows: &'a [Row<'a>],
 }
 
@@ -100,6 +111,7 @@ pub fn build(data: &Data<'_>) -> Vec<u8> {
     render_heap(&mut html, data);
     render_workers(&mut html, data);
     render_latency(&mut html, data);
+    render_realtime(&mut html, data);
     render_watchdog(&mut html, data);
     render_criteria(&mut html, data);
     render_conclusion(&mut html, data);
@@ -432,8 +444,63 @@ fn render_latency(html: &mut String, data: &Data<'_>) {
     html.push_str(PANEL_END);
 }
 
+/// 硬实时指标面板: DWT 实测的最长关中断与节拍到达延迟 (判定阈值
+/// 来自编译期配置), 是"该系统能否满足实时约束"的直接证据
+fn render_realtime(html: &mut String, data: &Data<'_>) {
+    panel(html, "硬实时指标 (DWT 实测)");
+    let verdict = if data.latency_ok {
+        "<b style=\"color:var(--ok)\">通过</b>"
+    } else {
+        "<b style=\"color:var(--bad)\">超限</b>"
+    };
+    let _ = writeln!(
+        html,
+        "<div class=\"samples\">判定: {verdict} · 基准: HCLK 周期计数 (DWT CYCCNT), 峰值取运行期最大值</div>"
+    );
+    html.push_str("<table>");
+    html.push_str(
+        "<tr><th>指标</th><th class=\"num\">实测峰值</th><th class=\"num\">阈值</th><th>判定</th></tr>",
+    );
+    let critical_ok = data.critical_us <= data.critical_limit_us;
+    let tick_ok = data.tick_latency_us <= data.tick_latency_limit_us;
+    for (name, value, limit, ok, note) in [
+        (
+            "最长关中断 (PRIMASK)",
+            data.critical_us,
+            data.critical_limit_us,
+            critical_ok,
+            "所有线程/ISR 抢占不可用窗口的上界",
+        ),
+        (
+            "SysTick 到达延迟",
+            data.tick_latency_us,
+            data.tick_latency_limit_us,
+            tick_ok,
+            "节拍中断实际入口 vs 硬件期望时刻 (不含 Flash 擦写窗口)",
+        ),
+    ] {
+        let mark = if ok {
+            "<b style=\"color:var(--ok)\">✓</b>"
+        } else {
+            "<b style=\"color:var(--bad)\">✗</b>"
+        };
+        let _ = writeln!(
+            html,
+            "<tr><td><b>{name}</b> <span class=\"sub\">{note}</span></td>\
+             <td class=\"num\">{value} µs</td><td class=\"num\">{limit} µs</td><td>{mark}</td></tr>"
+        );
+    }
+    html.push_str("</table>");
+    let _ = writeln!(
+        html,
+        "<div class=\"samples warn\">Flash 擦/写窗口 (bus hold, 硬件固有): 关中断峰值 {} µs, 节拍延迟峰值 {} µs \
+         — 不计入判定, 仅作信息系统化记录。需要该时段也保持中断响应时, 应将关键 ISR 常驻 RAM。</div>",
+        data.critical_flash_us, data.tick_latency_flash_us
+    );
+    html.push_str(PANEL_END);
+}
+
 fn render_watchdog(html: &mut String, data: &Data<'_>) {
-    panel(html, "看门狗");
     if data.wdt_enabled {
         let gap = data.wdt_feed_gap_ms;
         let timeout = data.wdt_timeout_ms;
@@ -462,7 +529,7 @@ fn render_criteria(html: &mut String, data: &Data<'_>) {
     html.push_str(
         "<tr><th>判定项</th><th>通过准则</th><th class=\"num\">本次结果</th><th>判定</th></tr>",
     );
-    let rows: [(&str, String, String, bool); 8] = [
+    let rows: [(&str, String, String, bool); 9] = [
         (
             "压力线程错误",
             "0 (任何错误即 FAIL)".into(),
@@ -519,6 +586,18 @@ fn render_criteria(html: &mut String, data: &Data<'_>) {
             alloc::format!("{} 次", data.heap_alloc_failures),
             true, // 计数本身即证据; 崩溃则系统已复位
         ),
+        (
+            "硬实时 (关中断/中断延迟)",
+            alloc::format!(
+                "关中断 ≤ {} µs 且 节拍延迟 ≤ {} µs (DWT 实测)",
+                data.critical_limit_us, data.tick_latency_limit_us
+            ),
+            alloc::format!(
+                "{} / {} µs",
+                data.critical_us, data.tick_latency_us
+            ),
+            data.latency_ok,
+        ),
     ];
     for (name, criterion, value, ok) in rows {
         let mark = if ok {
@@ -571,14 +650,18 @@ fn fmt_duration(ms: u32) -> String {
 // ============================== 报告文件名 ==============================
 
 /// 报告文件名: RTC 运行时 `soak_YYYY-MM-DD_HHMMSS.html`, 否则
-/// `soak_boot<启动秒>.html` (按启动序号退化, 字典序仍为时间序)
-pub fn file_name<'a>(data: &Data<'_>, buf: &'a mut [u8; NAME_BUF]) -> &'a str {
+/// `soak_b<启动序号>_<uptime_ms>.html`。
+///
+/// 退化名中的**启动序号**由设备侧扫描 `/test` 目录取最大序号 +1
+/// (跨复位单调), uptime 零填充 —— 两者组合保证"字典序即时间序"
+/// 在跨复位场景仍成立 (旧版仅用 uptime, 复位归零会破坏排序)。
+pub fn file_name<'a>(data: &Data<'_>, boot_seq: u64, buf: &'a mut [u8; NAME_BUF]) -> &'a str {
     let name = match data.rtc_stamp {
         Some((y, m, d, hh, mm, ss)) => {
             alloc::format!("{NAME_PREFIX}20{y:02}-{m:02}-{d:02}_{hh:02}{mm:02}{ss:02}.html")
         }
         None => {
-            alloc::format!("{NAME_PREFIX}boot{:08}.html", data.start_uptime)
+            alloc::format!("{NAME_PREFIX}b{:04}_{:010}.html", boot_seq, data.start_uptime)
         }
     };
     let bytes = name.as_bytes();
@@ -587,6 +670,36 @@ pub fn file_name<'a>(data: &Data<'_>, buf: &'a mut [u8; NAME_BUF]) -> &'a str {
     buf[n] = 0;
     // 缓冲区内容为 ASCII, 直接按字节切
     core::str::from_utf8(&buf[..n]).unwrap_or("soak_report.html")
+}
+
+/// 解析退化报告名 `soak_b<seq>_<uptime>.html` → `(启动序号, uptime)`。
+///
+/// 兼容旧格式 `soak_boot<uptime>.html` (映射为序号 0 —— 任何新报告的
+/// 序号 ≥ 1, 旧格式恒最旧)。RTC 名或无法识别的名字返回 `None`。
+pub fn parse_seq_name(name: &str) -> Option<(u64, u32)> {
+    let rest = name.strip_prefix(NAME_PREFIX)?;
+    if let Some(rest) = rest.strip_prefix("boot") {
+        let uptime = rest.strip_suffix(".html")?.parse::<u32>().ok()?;
+        return Some((0, uptime));
+    }
+    let rest = rest.strip_prefix('b')?;
+    let (seq, uptime) = rest.split_once('_')?;
+    let uptime = uptime.strip_suffix(".html")?.parse::<u32>().ok()?;
+    Some((seq.parse::<u64>().ok()?, uptime))
+}
+
+/// 两个报告文件名的时间先后比较 (供 `/test` 预算删除最旧)。
+///
+/// - 两个退化名: `(启动序号, uptime)` 比较 (跨复位仍正确);
+/// - 退化名 vs RTC 名: RTC 名视为更新 (仅混合场景, 保守保留);
+/// - 两个 RTC 名: 字典序 (`YYYY-MM-DD_HHMMSS` 即时间序)。
+pub fn older_than(a: &str, b: &str) -> bool {
+    match (parse_seq_name(a), parse_seq_name(b)) {
+        (Some((sa, ua)), Some((sb, ub))) => (sa, ua) < (sb, ub),
+        (Some(_), None) => false,
+        (None, Some(_)) => true,
+        (None, None) => a < b,
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +758,13 @@ mod tests {
             wdt_enabled: true,
             wdt_feed_gap_ms: 5,
             wdt_timeout_ms: 500,
+            critical_us: 12,
+            critical_limit_us: 50,
+            critical_flash_us: 18_200,
+            tick_latency_us: 80,
+            tick_latency_limit_us: 500,
+            tick_latency_flash_us: 24_000,
+            latency_ok: true,
             rows: core::slice::from_ref(&ROW),
         }
     }
@@ -764,7 +884,7 @@ mod tests {
     #[test]
     fn file_name_uses_rtc_stamp() {
         let mut buf = [0u8; NAME_BUF];
-        let name = file_name(&sample_data(), &mut buf);
+        let name = file_name(&sample_data(), 3, &mut buf);
         assert_eq!(name, "soak_2026-08-15_153012.html");
     }
 
@@ -773,7 +893,25 @@ mod tests {
         let mut d = sample_data();
         d.rtc_stamp = None;
         let mut buf = [0u8; NAME_BUF];
-        let name = file_name(&d, &mut buf);
-        assert_eq!(name, "soak_boot00123456.html");
+        let name = file_name(&d, 7, &mut buf);
+        assert_eq!(name, "soak_b0007_0000123456.html");
+    }
+
+    #[test]
+    fn seq_name_parsing_and_cross_boot_ordering() {
+        // 新格式: (序号, uptime) 比较, 跨复位排序正确
+        assert_eq!(parse_seq_name("soak_b0002_0000000010.html"), Some((2, 10)));
+        assert!(older_than("soak_b0002_0000000010.html", "soak_b0003_0000000001.html"));
+        // 同序号: uptime 小的更旧 (同一次启动内的先后)
+        assert!(older_than("soak_b0003_0000000001.html", "soak_b0003_0000000002.html"));
+        // 旧格式映射为序号 0: 恒比任何新报告旧
+        assert_eq!(parse_seq_name("soak_boot00123456.html"), Some((0, 123_456)));
+        assert!(older_than("soak_boot00123456.html", "soak_b0001_0000000001.html"));
+        // RTC 名: 字典序即时间序; 混合场景保守保留 RTC 名
+        assert!(older_than("soak_2026-08-15_153012.html", "soak_2026-08-16_100000.html"));
+        assert!(!older_than("soak_b0009_0000000001.html", "soak_2026-08-15_153012.html"));
+        // 无法识别 → None
+        assert_eq!(parse_seq_name("other.html"), None);
+        assert_eq!(parse_seq_name("soak_2026-08-15_153012.html"), None);
     }
 }

@@ -19,8 +19,10 @@ mod board;
 // ---- 内核基础设施 ----
 mod arch; // CPU 架构原语 facade (PRIMASK / WFI / DSB / 系统复位)
 mod critical_section; // PRIMASK 临界区 + 中断上下文检测 (ISR 误用防护)
-mod heap; // 全局堆分配器 (边界标记 + 首次适配)
-mod heap_layout; // 堆分配布局规划 (纯逻辑, 可在主机测试)
+mod heap; // 全局堆分配器适配层 (临界区 + 链接脚本边界, 状态机见 lib)
+mod heap_layout; // 堆分配布局规划 + TLSF 尺寸级映射 (纯逻辑, 主机测试)
+mod heap_tlsf; // TLSF 两级隔离状态机 (与 lib 同源, 主机压力测试)
+mod latency; // 硬实时指标: 最长关中断 + SysTick 到达延迟 (DWT)
 mod mmio; // 内存映射寄存器访问原语 (各外设驱动共用)
 mod notify; // 原子回调槽: ISR → 应用无锁通知 (可在主机测试)
 mod panic; // panic/fault 诊断: 寄存器解码 + 栈回溯 + 停机/复位策略
@@ -85,6 +87,9 @@ static TIMER_COUNT: AtomicU32 = AtomicU32::new(0);
 /// 节拍驱动: 节拍递增 → 时间片轮转 → 定时器检查 → 调度。
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_tick_handler() {
+    // 硬实时指标: 记录节拍中断实际到达时刻 (相对硬件期望的偏差,
+    // Flash 擦写窗口单独归类, 见 latency 模块) —— 必须是入口第一条。
+    crate::latency::tick_entry();
     rtos::tick_increase();
     // Arm Errata 838869: ISR 末尾加 DSB, 确保中断唤醒低功耗模式的行为可靠
     arch::data_sync_barrier();

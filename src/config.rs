@@ -1031,6 +1031,15 @@ const _: () = assert!(
     SOAK_FLASH_INTERVAL_MS >= 1000,
     "CFG_SOAK_FLASH_INTERVAL_MS 应不小于 1000"
 );
+/// 硬实时判定阈值: 允许的最长关中断 (PRIMASK) 时间 (微秒, 实测峰值)
+pub const SOAK_MAX_CRITICAL_US: u32 = parse_u32(env!("CFG_SOAK_MAX_CRITICAL_US"));
+/// 硬实时判定阈值: 允许的最长 SysTick ISR 到达延迟 (微秒, 不含 Flash
+/// 擦写 bus hold 窗口, 实测峰值)
+pub const SOAK_MAX_IRQ_LATENCY_US: u32 = parse_u32(env!("CFG_SOAK_MAX_IRQ_LATENCY_US"));
+const _: () = assert!(
+    SOAK_MAX_CRITICAL_US > 0 && SOAK_MAX_IRQ_LATENCY_US > 0,
+    "CFG_SOAK_MAX_CRITICAL_US / CFG_SOAK_MAX_IRQ_LATENCY_US 必须大于 0"
+);
 
 /// 测试报告预算: `/test/` 目录保留的报告文件数 (超出删除最旧;
 /// 文件名按字典序即时间序)

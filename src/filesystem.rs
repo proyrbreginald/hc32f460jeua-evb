@@ -179,6 +179,19 @@ impl BlockDevice for InternalFlash {
         BLOCK_COUNT
     }
 
+    /// 分类"块永久损坏"错误: 电源/总线完好的前提下, 擦写控制器的
+    /// PEWERR (擦/写失败)、PGMISMTCH (回读不匹配) 与擦除后校验失败
+    /// 表明该扇区单元已损坏 —— 文件系统可标记坏块并换位置重试。
+    /// 掉电/超时/读冲突等模糊错误保持默认 false (Fatal, 需重挂载)。
+    fn permanent_block_failure(&self, error: &Self::Error) -> bool {
+        matches!(
+            error,
+            FlashError::VerifyFailed
+                | FlashError::Controller(crate::efm::EfmError::ProgramEraseError)
+                | FlashError::Controller(crate::efm::EfmError::Mismatch)
+        )
+    }
+
     fn read(&mut self, block: u32, offset: u32, buffer: &mut [u8]) -> Result<(), Self::Error> {
         Self::check_thread_context()?;
         let address = Self::address(block, offset, buffer.len())?;

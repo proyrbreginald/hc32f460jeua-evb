@@ -51,6 +51,10 @@ impl Board {
         // UART 就绪后报告，后续外设一律按实际时钟计算分频。
         let clock_error = crate::clk::init().err();
 
+        // 硬实时指标测量 (DWT): 时钟就绪后立即初始化, 之后的临界区与
+        // 节拍中断即进入测量范围
+        crate::latency::init(crate::clk::hclk_hz());
+
         if crate::config::MPU_ENABLE {
             crate::mpu::init();
             crate::rtos::set_context_switch_hook(Some(apply_thread_memory_protection));

@@ -804,7 +804,9 @@ pub struct Mailbox<T> {
 struct MailboxInner<T> {
     base: IpcBase,
     sender_list: ListHead,
-    pool: *mut T,
+    /// 消息池 (惰性初始化; 原子指针: 分配在临界区**外**完成, 经 CAS
+    /// 一次性发布 —— 临界区内绝不发生 malloc, 关中断时间有界)
+    pool: core::sync::atomic::AtomicPtr<T>,
     size: u32,
     count: u32,
     in_idx: u32,
@@ -817,8 +819,9 @@ unsafe impl<T: Send> Sync for Mailbox<T> {}
 impl<T: Copy> Mailbox<T> {
     /// 创建容量为 `capacity` 的邮箱
     ///
-    /// 消息池在**首次使用**时分配 (惰性初始化, 使 [`Mailbox`] 可作
-    /// `static` 使用); 常量求值时仅检查容量合法性。
+    /// 消息池在**首次使用前**按需分配 (惰性初始化, 使 [`Mailbox`] 可作
+    /// `static` 使用); 分配发生在临界区**外** (见 [`MailboxInner::ensure_pool`]),
+    /// 常量求值时仅检查容量合法性。
     pub const fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "Mailbox::new: 容量必须大于 0");
         assert!(capacity <= u32::MAX as usize, "Mailbox::new: 容量超出 u32");
@@ -830,7 +833,7 @@ impl<T: Copy> Mailbox<T> {
             inner: UnsafeCell::new(MailboxInner {
                 base: IpcBase::const_new(),
                 sender_list: ListHead::const_new(),
-                pool: ptr::null_mut(),
+                pool: core::sync::atomic::AtomicPtr::new(ptr::null_mut()),
                 size: capacity as u32,
                 count: 0,
                 in_idx: 0,
@@ -851,13 +854,14 @@ impl<T: Copy> Mailbox<T> {
 
     fn send_impl(&self, msg: T, timeout: Timeout, urgent: bool) -> Result<(), Error> {
         ensure_ipc_context(timeout)?;
+        // 池惰性分配在临界区外完成 (无锁 CAS 发布), 保证关中断区间无 malloc
+        let pool = self.ensure_pool();
         loop {
             let mut outcome = Err(Error::Full);
             let mut need = false;
             let mut blocked = false;
             critical_section::with(|cs| unsafe {
                 let mb = &mut *self.ptr();
-                mb.ensure_pool();
                 if mb.count < mb.size {
                     if urgent {
                         mb.out_idx = if mb.out_idx == 0 {
@@ -865,9 +869,9 @@ impl<T: Copy> Mailbox<T> {
                         } else {
                             mb.out_idx - 1
                         };
-                        ptr::write(mb.pool.add(mb.out_idx as usize), msg);
+                        ptr::write(pool.add(mb.out_idx as usize), msg);
                     } else {
-                        ptr::write(mb.pool.add(mb.in_idx as usize), msg);
+                        ptr::write(pool.add(mb.in_idx as usize), msg);
                         mb.in_idx = (mb.in_idx + 1) % mb.size;
                     }
                     mb.count += 1;
@@ -902,15 +906,16 @@ impl<T: Copy> Mailbox<T> {
     /// (对齐 RT-Thread 语义), 消息不会滞留。
     pub fn recv(&self, timeout: Timeout) -> Result<T, Error> {
         ensure_ipc_context(timeout)?;
+        // 池惰性分配在临界区外完成 (无锁 CAS 发布)
+        let pool = self.ensure_pool();
         loop {
             let mut outcome = Err(Error::TimedOut);
             let mut need = false;
             let mut blocked = false;
             critical_section::with(|cs| unsafe {
                 let mb = &mut *self.ptr();
-                mb.ensure_pool();
                 if mb.count > 0 {
-                    let msg = ptr::read(mb.pool.add(mb.out_idx as usize));
+                    let msg = ptr::read(pool.add(mb.out_idx as usize));
                     mb.out_idx = (mb.out_idx + 1) % mb.size;
                     mb.count -= 1;
                     outcome = Ok(msg);
@@ -942,36 +947,55 @@ impl<T: Copy> Mailbox<T> {
     fn ptr(&self) -> *mut MailboxInner<T> {
         self.inner.get()
     }
+
+    /// 临界区外确保消息池已分配 (见 [`MailboxInner::ensure_pool`])
+    #[inline]
+    fn ensure_pool(&self) -> *mut T {
+        unsafe { (*self.ptr()).ensure_pool() }
+    }
 }
 
 impl<T> Drop for Mailbox<T> {
     fn drop(&mut self) {
         let mb = self.inner.get_mut();
-        if mb.pool.is_null() {
+        let pool = mb.pool.load(core::sync::atomic::Ordering::Relaxed);
+        if pool.is_null() {
             return;
         }
-        // `pool != null` 证明该布局已在 ensure_pool 中成功构造。
+        // 池已由 ensure_pool 成功构造并发布 (布局与发布值一一对应)
         let layout = Layout::array::<T>(mb.size as usize).expect("邮箱消息池布局失效");
-        unsafe { dealloc(mb.pool.cast(), layout) };
-        mb.pool = ptr::null_mut();
+        unsafe { dealloc(pool.cast(), layout) };
+        mb.pool.store(ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// 邮箱内部状态: 消息池惰性分配
+/// 邮箱内部状态: 消息池惰性分配 (临界区外)
 impl<T: Copy> MailboxInner<T> {
-    /// 临界区内: 惰性分配消息池
+    /// 确保消息池已分配并返回池指针。
     ///
-    /// 注意: 必须以 `&mut self` 直接写字段 (通过共享引用派生裸指针
-    /// 写入会被编译器按死代码消除)。池内槽位由 `count` 保护, 仅在
-    /// 发送后才会被读取, 无需初始化。
-    unsafe fn ensure_pool(&mut self) {
-        if !self.pool.is_null() {
-            return;
+    /// **绝不进入临界区**: 分配完成后经 CAS 一次性发布, 并发首用者
+    /// 各分配一块、CAS 失败者释放自己的备份 —— 临界区内只读原子指针,
+    /// 关中断时间不包含 malloc (硬实时要求)。
+    fn ensure_pool(&self) -> *mut T {
+        let pool = self.pool.load(core::sync::atomic::Ordering::Acquire);
+        if !pool.is_null() {
+            return pool;
         }
         let layout = Layout::array::<T>(self.size as usize).expect("邮箱消息池布局无效");
-        let pool = alloc(layout);
-        assert!(!pool.is_null(), "邮箱消息池分配失败");
-        self.pool = pool as *mut T;
+        let allocated = unsafe { alloc(layout) };
+        assert!(!allocated.is_null(), "邮箱消息池分配失败");
+        match self.pool.compare_exchange(
+            ptr::null_mut(),
+            allocated as *mut T,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => allocated as *mut T,
+            Err(published) => {
+                unsafe { dealloc(allocated, layout) };
+                published
+            }
+        }
     }
 }
 
@@ -993,7 +1017,9 @@ pub struct MessageQueue {
 struct MessageQueueInner {
     base: IpcBase,
     sender_list: ListHead,
-    pool: *mut u8,
+    /// 消息池 (惰性初始化; 原子指针: 分配与空闲链初始化在临界区**外**
+    /// 完成, 经 CAS 一次性发布 —— 临界区内绝不发生 malloc)
+    pool: core::sync::atomic::AtomicPtr<u8>,
     block_size: u32,
     msg_size: u32,
     max_msgs: u32,
@@ -1038,7 +1064,7 @@ impl MessageQueue {
             inner: UnsafeCell::new(MessageQueueInner {
                 base: IpcBase::const_new(),
                 sender_list: ListHead::const_new(),
-                pool: ptr::null_mut(),
+                pool: core::sync::atomic::AtomicPtr::new(ptr::null_mut()),
                 // 块大小 = 8 (next+len 头) + 消息大小, 4 字节对齐 (≥ 12)
                 block_size: block_size as u32,
                 msg_size: msg_size as u32,
@@ -1063,13 +1089,14 @@ impl MessageQueue {
 
     fn send_impl(&self, buf: &[u8], timeout: Timeout, urgent: bool) -> Result<(), Error> {
         ensure_ipc_context(timeout)?;
+        // 池惰性分配在临界区外完成 (无锁 CAS 发布), 保证关中断区间无 malloc
+        self.ensure_pool();
         loop {
             let mut outcome = Err(Error::Full);
             let mut need = false;
             let mut blocked = false;
             critical_section::with(|cs| unsafe {
                 let q = &mut *self.ptr();
-                q.ensure_pool();
                 if q.free != BLOCK_END {
                     let b = q.free;
                     q.free = q.block_next(b);
@@ -1121,13 +1148,14 @@ impl MessageQueue {
     /// 接收消息: 拷贝到 `buf`, 返回实际字节数 (空时按超时阻塞)
     pub fn recv(&self, buf: &mut [u8], timeout: Timeout) -> Result<usize, Error> {
         ensure_ipc_context(timeout)?;
+        // 池惰性分配在临界区外完成 (无锁 CAS 发布)
+        self.ensure_pool();
         loop {
             let mut outcome = Err(Error::TimedOut);
             let mut need = false;
             let mut blocked = false;
             critical_section::with(|cs| unsafe {
                 let q = &mut *self.ptr();
-                q.ensure_pool();
                 if q.count > 0 {
                     let b = q.head;
                     q.head = q.block_next(b);
@@ -1166,43 +1194,67 @@ impl MessageQueue {
     fn ptr(&self) -> *mut MessageQueueInner {
         self.inner.get()
     }
+
+    /// 临界区外确保消息池已分配 (见 [`MessageQueueInner::ensure_pool`])
+    #[inline]
+    fn ensure_pool(&self) -> *mut u8 {
+        unsafe { (*self.ptr()).ensure_pool() }
+    }
 }
 
 impl Drop for MessageQueue {
     fn drop(&mut self) {
         let q = self.inner.get_mut();
-        if q.pool.is_null() {
+        let pool = q.pool.load(core::sync::atomic::Ordering::Relaxed);
+        if pool.is_null() {
             return;
         }
         let layout = q.pool_layout();
-        unsafe { dealloc(q.pool, layout) };
-        q.pool = ptr::null_mut();
+        unsafe { dealloc(pool, layout) };
+        q.pool.store(ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     }
 }
 
 /// 消息队列内部状态: 块访问辅助
 impl MessageQueueInner {
-    /// 临界区内: 惰性分配消息池并初始化空闲链表
+    /// 确保消息池已分配并返回池指针。
     ///
-    /// 注意: 必须以 `&mut self` 直接写字段 (通过共享引用派生裸指针
-    /// 写入会被编译器按死代码消除)。
-    unsafe fn ensure_pool(&mut self) {
-        if !self.pool.is_null() {
-            return;
+    /// **绝不进入临界区**: 分配 + 空闲链初始化完成后经 CAS 一次性发布,
+    /// 并发首用者各构造一份、CAS 失败者释放自己的备份 —— 临界区内
+    /// 只读原子指针, 关中断时间不包含 malloc (硬实时要求)。
+    fn ensure_pool(&self) -> *mut u8 {
+        let pool = self.pool.load(core::sync::atomic::Ordering::Acquire);
+        if !pool.is_null() {
+            return pool;
         }
         let max_msgs = self.max_msgs as usize;
         let layout = self.pool_layout();
-        let pool = alloc(layout);
-        assert!(!pool.is_null(), "消息队列池分配失败");
-        core::ptr::write_bytes(pool, 0, layout.size());
-        self.pool = pool;
-        for i in 0..max_msgs {
-            let next = if i + 1 < max_msgs {
-                (i + 1) as u32
-            } else {
-                BLOCK_END
-            };
-            self.set_block_next(i as u32, next);
+        let allocated = unsafe { alloc(layout) };
+        assert!(!allocated.is_null(), "消息队列池分配失败");
+        // 初始化空闲链表 (必须在 CAS 发布前完成, 保证发布值完全可用)
+        unsafe {
+            core::ptr::write_bytes(allocated, 0, layout.size());
+            let init_pool = allocated;
+            for i in 0..max_msgs {
+                let next = if i + 1 < max_msgs {
+                    (i + 1) as u32
+                } else {
+                    BLOCK_END
+                };
+                *((init_pool.add(i * self.block_size as usize)) as *mut u32) = next;
+            }
+        }
+        match self.pool.compare_exchange(
+            ptr::null_mut(),
+            allocated,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => allocated,
+            Err(published) => {
+                unsafe { dealloc(allocated, layout) };
+                published
+            }
         }
     }
 
@@ -1215,7 +1267,15 @@ impl MessageQueueInner {
 
     #[inline]
     fn block_ptr(&self, idx: u32) -> *mut u8 {
-        unsafe { self.pool.add(idx as usize * self.block_size as usize) }
+        unsafe { self.pool_ptr().add(idx as usize * self.block_size as usize) }
+    }
+
+    /// 池指针 (调用方保证已发布)
+    #[inline]
+    fn pool_ptr(&self) -> *mut u8 {
+        let pool = self.pool.load(core::sync::atomic::Ordering::Relaxed);
+        debug_assert!(!pool.is_null(), "消息池未分配");
+        pool
     }
 
     #[inline]

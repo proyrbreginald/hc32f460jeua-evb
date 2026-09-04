@@ -43,9 +43,12 @@ SoC drivers                  RTOS core
    定时器回绕窗口均有明确约束。
 6. 定时器在 PRIMASK 临界区内完成摘链/状态迁移，在临界区外执行 ISR
    回调，缩短全局关中断时间并允许回调自停或重启。
-7. 堆分配器按任意 2 的幂 `Layout` 对齐 payload，在 payload 前记录原块
-   地址并以 checked 算术关闭溢出路径；纯布局规划拆到 `heap_layout`，可在
-   主机测试高对齐 padding、空间不足、整数溢出和零大小布局。
+7. 堆分配器为 **TLSF 两级隔离结构** (O(1) 分配/释放, 关中断时间有界);
+   按任意 2 的幂 `Layout` 对齐 payload, 在 payload 前记录原块地址并以
+   checked 算术关闭溢出路径；纯布局规划与 TLSF 尺寸级映射拆到
+   `heap_layout`, 可在主机测试高对齐 padding、空间不足、整数溢出、
+   零大小布局与尺寸级边界不变量。邮箱/消息队列池在临界区外经 CAS
+   一次性发布, 关中断区间无 malloc。
 8. `Thread` 收敛为 `Arc<Thread>` 不可变外壳和唯一
    `UnsafeCell<ThreadInner>`。内核状态仅在单核关中断临界区访问，
    `kernel_self` 保证 TCB 的原始指针、侵入式节点和内建 Timer 活动期间

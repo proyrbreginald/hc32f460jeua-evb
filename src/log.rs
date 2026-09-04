@@ -79,11 +79,18 @@ pub fn set_file_enabled(on: bool) {
     FILE_ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// 把缓冲中的所有日志条目拷入 `out` (每条末尾补 `\n`) 并清空缓冲。
+/// 把"完整放得下"的前缀条目拷入 `out` (损耗/截断标记按序在前),
+/// 放不下的条目保留待下轮 (落盘按文件上限分块轮转用, 见 logfile)。
 ///
-/// 由日志落盘线程周期性调用; 返回拷贝的字节数 (0 = 无待落盘日志)。
-pub fn drain_into(out: &mut alloc::vec::Vec<u8>) -> usize {
-    RING.with(|ring| ring.drain_into(out))
+/// 返回拷贝的字节数 (0 = 无待落盘, 或首条放不下 —— 后者由调用方
+/// 决定强制排出或留待下一段)。
+pub fn drain_limited(out: &mut alloc::vec::Vec<u8>, limit: usize) -> usize {
+    RING.with(|ring| ring.drain_into_limited(out, limit))
+}
+
+/// 无条件排空首条 (超长条目比整个段还长时强制取出, 保证进度)。
+pub fn drain_oldest(out: &mut alloc::vec::Vec<u8>) -> usize {
+    RING.with(|ring| ring.drain_oldest_entry(out))
 }
 
 /// 待落盘的日志字节数 (含条目头, 不含换行符)

@@ -1404,12 +1404,23 @@ pub(crate) fn run(args: &str) {
     // PI 握手复位 (防御: 上次异常退出残留)
     PI_HOG_GO.store(false, Ordering::Relaxed);
     PI_HOG_ACK.store(false, Ordering::Relaxed);
+    // 累计统计复位: 本次运行的报告不得混入先前运行的数据
+    PI_MAX_WAIT.store(0, Ordering::Relaxed);
+    PI_ROUNDS.store(0, Ordering::Relaxed);
+    HEAP_ALLOC_FAILURES.store(0, Ordering::Relaxed);
+    TIMER_TICKS.store(0, Ordering::Relaxed);
+    IRQ_TICKS.store(0, Ordering::Relaxed);
+    for slot in STACK_PEAK.iter() {
+        slot.store(0, Ordering::Relaxed);
+    }
     // 直方图复位
     for b in DELAY_HIST.iter() {
         b.store(0, Ordering::Relaxed);
     }
     DELAY_SAMPLES.store(0, Ordering::Relaxed);
     DELAY_MAX.store(0, Ordering::Relaxed);
+    // 硬实时指标复位: 关中断/节拍延迟峰值从本次运行起重新累计
+    crate::latency::reset_peaks();
 
     // ---- 基线快照 ----
     let heap_base = crate::heap::used();
@@ -1658,7 +1669,29 @@ pub(crate) fn run(args: &str) {
         .iter()
         .map(|&id| WORKERS[id.index()].errors.load(Ordering::Relaxed))
         .sum();
-    let pass = total_errors == 0 && sram_errors == 0 && leak_ok && mtx_ok;
+
+    // ---- 硬实时指标判定 (DWT 实测峰值, 见 latency 模块) ----
+    let critical_cycles = crate::latency::max_critical_cycles();
+    let critical_flash_cycles = crate::latency::max_critical_flash_cycles();
+    let tick_latency_cycles = crate::latency::max_tick_latency_cycles();
+    let tick_latency_flash_cycles = crate::latency::max_tick_latency_flash_cycles();
+    let critical_us = crate::latency::cycles_to_us(critical_cycles);
+    let critical_flash_us = crate::latency::cycles_to_us(critical_flash_cycles);
+    let tick_latency_us = crate::latency::cycles_to_us(tick_latency_cycles);
+    let tick_latency_flash_us = crate::latency::cycles_to_us(tick_latency_flash_cycles);
+    let latency_ok = critical_us <= crate::config::SOAK_MAX_CRITICAL_US
+        && tick_latency_us <= crate::config::SOAK_MAX_IRQ_LATENCY_US;
+    if !latency_ok {
+        crate::log_error!(
+            "[soak] 硬实时指标超限: 最长关中断 {}µs (限 {}µs), 节拍到达延迟 {}µs (限 {}µs)",
+            critical_us,
+            crate::config::SOAK_MAX_CRITICAL_US,
+            tick_latency_us,
+            crate::config::SOAK_MAX_IRQ_LATENCY_US
+        );
+    }
+
+    let pass = total_errors == 0 && sram_errors == 0 && leak_ok && mtx_ok && latency_ok;
 
     // ---- 汇总报告: 单文件 HTML → /test/ (控制台仅保留结果一行) ----
     clear_bar();
@@ -1798,6 +1831,13 @@ pub(crate) fn run(args: &str) {
         wdt_enabled: crate::config::WDT_ENABLE,
         wdt_feed_gap_ms,
         wdt_timeout_ms,
+        critical_us,
+        critical_limit_us: crate::config::SOAK_MAX_CRITICAL_US,
+        critical_flash_us,
+        tick_latency_us,
+        tick_latency_limit_us: crate::config::SOAK_MAX_IRQ_LATENCY_US,
+        tick_latency_flash_us,
+        latency_ok,
         rows: &rows,
     };
     let html = crate::soak_report_core::build(&data);
@@ -1806,14 +1846,22 @@ pub(crate) fn run(args: &str) {
     // 报告写入失败/文件系统不可用时的紧凑控制台回退 (结果不丢失)
     let fallback_summary = |total_errors: u32, sram_errors: u32| {
         crate::println!(
-            "[soak]   摘要: {} 压力线程, 总错误 {}, SRAM {}, 堆净增 {}B, 线程 {}→{}, 互斥量 {}",
+            "[soak]   摘要: {} 压力线程, 总错误 {}, SRAM {}, 堆净增 {}B, 线程 {}→{}, 互斥量 {}, 实时性 {}",
             spawned.len(),
             total_errors,
             sram_errors,
             net_growth,
             thread_base,
             thread_end,
-            if mtx_ok { "通过" } else { "失败" }
+            if mtx_ok { "通过" } else { "失败" },
+            if latency_ok { "通过" } else { "失败" }
+        );
+        crate::println!(
+            "[soak]   实时性: 最长关中断 {}µs (限 {}µs), 节拍延迟 {}µs (限 {}µs)",
+            critical_us,
+            crate::config::SOAK_MAX_CRITICAL_US,
+            tick_latency_us,
+            crate::config::SOAK_MAX_IRQ_LATENCY_US
         );
     };
     if let Some(mut fs) = crate::filesystem::mounted() {
