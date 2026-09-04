@@ -204,9 +204,10 @@ pub fn tick_entry() {
     }
 }
 
-// ============================== 查询 ==============================
+// ============================== 查询 (仅 soak 消费) ==============================
 
 /// 清零全部峰值 (soak 每次运行开始时建立新基线)
+#[cfg(shell_soak)]
 pub fn reset_peaks() {
     CRITICAL_MAX.store(0, Ordering::Relaxed);
     CRITICAL_FLASH_MAX.store(0, Ordering::Relaxed);
@@ -216,26 +217,31 @@ pub fn reset_peaks() {
 }
 
 /// 最长关中断时间 (cycles, 不含 Flash 擦写窗口; 未初始化/无采样为 0)
+#[cfg(shell_soak)]
 pub fn max_critical_cycles() -> u32 {
     CRITICAL_MAX.load(Ordering::Relaxed)
 }
 
 /// Flash 擦写窗口内的最大关中断时间 (cycles, 信息性)
+#[cfg(shell_soak)]
 pub fn max_critical_flash_cycles() -> u32 {
     CRITICAL_FLASH_MAX.load(Ordering::Relaxed)
 }
 
 /// 最长 SysTick 到达延迟 (cycles, 不含 Flash 擦写窗口)
+#[cfg(shell_soak)]
 pub fn max_tick_latency_cycles() -> u32 {
     TICK_LATENCY_MAX.load(Ordering::Relaxed)
 }
 
 /// Flash 擦写窗口内的最大到达延迟 (cycles, 信息性)
+#[cfg(shell_soak)]
 pub fn max_tick_latency_flash_cycles() -> u32 {
     TICK_LATENCY_FLASH_MAX.load(Ordering::Relaxed)
 }
 
 /// cycles → 微秒 (按初始化时的 HCLK)
+#[cfg(shell_soak)]
 pub fn cycles_to_us(cycles: u32) -> u32 {
     let hclk = HCLK_HZ.load(Ordering::Relaxed);
     if hclk == 0 {

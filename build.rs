@@ -17,6 +17,16 @@ fn main() {
     // 功能开关: 布尔 env → `cargo:rustc-cfg=<flag>`, 非法值直接编译报错。
     // 每次开关变化都会触发 build.rs 重跑 (rerun-if-env-changed 追踪), 并
     // 因 cfg 变化导致相关代码重新编译。
+    //
+    // dev / release 策略: **debug 构建恒保留调试/自测配套功能**
+    // (nano 编辑器 / selftest 自检 / soak 长稳), 不受 CFG_* 的 "false"
+    // 影响 —— 便于在完整功能下调试; 只有 release 产物才按配置裁剪以省
+    // FLASH。因此注入额外 cfg `dev_profile` 供 config::cmd_enabled 放宽
+    // 命令启用列表, 与命令注册保持一致。
+    let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
+    if !is_release {
+        println!("cargo:rustc-cfg=dev_profile");
+    }
     for (env, flag) in [
         ("CFG_SHELL_NANO_ENABLE", "shell_nano"),
         ("CFG_SHELL_ZMODEM_ENABLE", "shell_zmodem"),
@@ -24,10 +34,21 @@ fn main() {
         ("CFG_SOAK_ENABLE", "shell_soak"),
         ("CFG_PANIC_VERBOSE", "panic_verbose"),
     ] {
-        match std::env::var(env).as_deref() {
-            Ok("true") => println!("cargo:rustc-cfg={flag}"),
-            Ok("false") => {}
+        let configured = match std::env::var(env).as_deref() {
+            Ok("true") => true,
+            Ok("false") => false,
             _ => panic!("{env} 必须为 true/false"),
+        };
+        // dev 恒保留的调试/自测功能; 其余 (zmodem/panic_verbose) 始终按配置
+        let effective = if !is_release
+            && matches!(flag, "shell_nano" | "shell_selftest" | "shell_soak")
+        {
+            true
+        } else {
+            configured
+        };
+        if effective {
+            println!("cargo:rustc-cfg={flag}");
         }
         println!("cargo:rerun-if-env-changed={env}");
     }
@@ -42,6 +63,7 @@ fn main() {
         "shell_selftest",
         "shell_soak",
         "panic_verbose",
+        "dev_profile",
     ] {
         println!("cargo:rustc-check-cfg=cfg({flag})");
     }
