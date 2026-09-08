@@ -227,17 +227,13 @@ pub fn accumulate(data: &[u8], width: DataWidth) {
             }
         }
         DataWidth::HalfWord => {
-            for chunk in data.chunks_exact(2) {
-                let v = u16::from_le_bytes([chunk[0], chunk[1]]);
-                dat0.write_u16(v);
+            for chunk in data.as_chunks::<2>().0 {
+                dat0.write_u16(u16::from_le_bytes(*chunk));
             }
         }
         DataWidth::Word => {
-            for chunk in data.chunks_exact(4) {
-                let mut b = [0u8; 4];
-                b.copy_from_slice(chunk);
-                let v = u32::from_le_bytes(b);
-                dat0.write(v);
+            for chunk in data.as_chunks::<4>().0 {
+                dat0.write(u32::from_le_bytes(*chunk));
             }
         }
     }

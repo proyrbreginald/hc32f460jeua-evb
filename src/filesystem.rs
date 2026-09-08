@@ -242,11 +242,16 @@ impl BlockDevice for InternalFlash {
                     return Err(FlashError::VerifyFailed);
                 }
             } else {
-                for (index, expected) in data[offset..offset + chunk].chunks_exact(4).enumerate() {
+                for (index, expected) in data[offset..offset + chunk]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
                     let actual =
                         crate::efm::read_word(address + offset as u32 + (index * 4) as u32)
                             .map_err(FlashError::Controller)?;
-                    if actual.to_le_bytes() != expected {
+                    if actual.to_le_bytes() != *expected {
                         return Err(FlashError::VerifyFailed);
                     }
                 }
