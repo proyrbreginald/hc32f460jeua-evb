@@ -1,3 +1,21 @@
+//! 快照文件系统状态机。
+//!
+//! 每次修改都先只读预检，再把“磨损表 + 全部目录项”写入与当前快照不重叠的
+//! 候选段。候选完整同步、回读和校验后，最后单独写 commit word 发布。任何时刻
+//! 至少保留一个完整快照，因此复位后只能挂载到旧状态或新状态，不会看到混合态。
+//!
+//! # 状态与错误边界
+//!
+//! - `FileSystem` 独占块设备；本模块自身不提供锁，多线程串行化由平台适配层负责；
+//! - 参数、容量和命名空间错误发生在首次擦除前，不会污染挂载状态；
+//! - 擦除开始后的普通设备错误使 `recovery_required` 置位，调用方必须取回设备并
+//!   重新挂载，因为 commit word 可能已经物理写入；
+//! - 只有设备适配器明确认定为永久块故障的错误才会标记坏块并换位置重试；
+//! - 所有遍历和临时缓冲有固定上限，不使用堆，也不含 `unsafe`。
+//!
+//! 磁盘字段和 checked 编解码位于 [`crate::format`]，完整持久化论证见
+//! `crates/littlefs/DESIGN.md`。
+
 use core::str;
 
 use crate::format::{
@@ -204,6 +222,10 @@ impl<D: BlockDevice> FileSystem<D> {
         self.recovery_required
     }
 
+    /// 返回当前快照、容量和磨损范围的只读摘要。
+    ///
+    /// `capacity_bytes` 是单个快照可用于记录的上限，已扣除磨损表；它不是当前
+    /// 剩余空间。写入指定路径前应调用 [`Self::max_write_size`]。
     pub fn info(&self) -> FsInfo {
         let (minimum, maximum) = self.wear_bounds();
         FsInfo {

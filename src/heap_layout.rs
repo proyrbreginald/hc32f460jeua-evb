@@ -1,4 +1,8 @@
-//! Pure allocation-layout planning shared by the firmware allocator and host tests.
+//! 堆分配布局规划与 TLSF 尺寸级映射（固件和主机测试共用）。
+//!
+//! 本模块只做 checked 整数运算，不读写分配器元数据。`heap_tlsf` 负责空闲链表
+//! 状态机，`heap` 再用临界区把它接到 [`GlobalAlloc`](core::alloc::GlobalAlloc)。
+//! 三层拆分保证对齐、溢出和尺寸级边界可以脱离目标板完整测试。
 
 use core::alloc::Layout;
 

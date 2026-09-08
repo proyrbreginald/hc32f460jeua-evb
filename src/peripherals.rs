@@ -1,4 +1,9 @@
 //! 唯一的片内外设所有权入口。
+//!
+//! 驱动句柄多为零大小 capability token，但“零大小”不等于可以任意构造：
+//! [`Peripherals::take`] 的一次性 CAS 与 DMA 通道自己的占用位图共同防止两个上层
+//! 同时配置同一硬件实例。集合由 [`crate::board::Board`] 消费，应用只接收初始化
+//! 后的 [`crate::board::BoardResources`]。
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

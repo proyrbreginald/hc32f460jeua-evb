@@ -1,10 +1,10 @@
-//! Hardware-independent classical CAN bit-timing calculation.
+//! 经典 CAN 位时序搜索（硬件无关，固件和主机测试共用）。
 //!
-//! HC32F460's `S_SEG_1` includes the synchronization segment, so one bit is
-//! `time_seg1 + time_seg2` time quanta. The hardware also gives a programmed
-//! prescaler of one a special, two-TQ-earlier sample point. This calculator
-//! deliberately starts at an actual prescaler of two so the ordinary timing
-//! formulas remain valid.
+//! HC32F460 的 `S_SEG_1` 已包含同步段，因此一位等于
+//! `time_seg1 + time_seg2` 个时间量子。硬件还对寄存器预分频值 0（实际分频 1）
+//! 使用提前两个 TQ 的特殊采样点；为保持普通公式成立，本算法从实际分频 2 开始
+//! 搜索。候选按位速率误差、采样点误差和总 TQ 数排序，最终再由 `can` 驱动编码
+//! 为 SBT 寄存器值。
 
 /// ISO 11898-1 classical CAN limit documented for HC32F460.
 pub const MAX_CLASSIC_BITRATE: u32 = 1_000_000;

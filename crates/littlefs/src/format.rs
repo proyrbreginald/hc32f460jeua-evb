@@ -299,10 +299,6 @@ impl SnapshotHeader {
         Geometry::new(self.block_size, self.block_count)
     }
 
-    /// Logical offset of the record area within the snapshot segment.
-    ///
-    /// The payload begins with the fixed wear table (see [`wear_table_size`])
-    /// immediately after the snapshot header; entry records follow it.
     /// Logical offset of the entry-record area within the snapshot segment.
     ///
     /// The payload begins at [`HEADER_SIZE`] with the fixed wear table (see

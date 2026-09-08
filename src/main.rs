@@ -6,6 +6,15 @@
 // (rtos/heap 等以"模块级契约 + 整模块 allow"设计的模块单独豁免)
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//! HC32F460JEUA-EVB 固件 crate 根。
+//!
+//! 本文件只声明系统组成并编排启动后的顶层资源：硬件复位和 RAM 初始化在
+//! [`startup`]，板级外设顺序在 [`board`]，线程/IPC 在 [`rtos`]。可由宿主机
+//! 测试的纯逻辑以同源模块从 `src/lib.rs` 导出，避免目标板实现与测试替身分叉。
+//!
+//! `main` 创建静态应用拓扑后启动调度器；业务线程不得绕过 [`peripherals`] 或
+//! [`board`] 自行复制外设所有权，也不得在 ISR/定时器回调中调用阻塞 API。
+
 // 使用 Rust 堆数据结构 (Vec/Box/String 等), 分配器见 heap 模块
 extern crate alloc;
 

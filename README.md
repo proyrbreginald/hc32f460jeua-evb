@@ -4,6 +4,33 @@ HC32F460JEUA (Cortex-M4F, 200MHz) 开发板的**纯 Rust 裸机**工程:零第�
 全部外设驱动为手写寄存器访问,并内置一个**从 RT-Thread v5.2.2 移植的 RTOS 内核**
 (接口按 Rust 风格重新设计)。
 
+## 文档导航
+
+- [系统架构](docs/ARCHITECTURE.md): 分层、启动时序、线程/中断模型、内存与
+  Flash 布局，以及关键安全不变量；新维护者建议先读此文档。
+- [开发与验证](docs/DEVELOPMENT.md): 工具链、构建、主机测试、静态检查、烧录、
+  串口验证和常见故障定位。
+- [移植指南](PORTING.md): 同系列换芯片与跨 CPU 架构移植的边界和顺序。
+- [文件系统设计](crates/littlefs/DESIGN.md): 磁盘格式、提交顺序、掉电恢复、磨损
+  均衡和坏块处理。
+- 本 README: 功能清单、各驱动的使用约束和 shell 操作手册。
+
+## 快速开始
+
+工程默认目标由 `.cargo/config.toml` 指定为 `thumbv7em-none-eabihf`。首次使用先
+安装 stable Rust、`rustfmt`、`clippy` 和 ARM 目标，然后执行：
+
+```bash
+# 完整静态检查、主机测试和固件构建
+bash scripts/verify.sh
+
+# 构建并通过 pyOCD 烧录；需已连接调试器并安装 pyocd
+cargo run --release
+```
+
+默认控制台为 USART1（PA9/PA10，115200 8N1），登录用户名和密码均为 `root`。
+所有板级参数均从 `.cargo/config.toml` 的 `[env]` 在编译期读取。
+
 ## 特性
 
 - 零依赖裸机 Rust (edition 2024, `thumbv7em-none-eabihf`),无 PAC/HAL crate;
