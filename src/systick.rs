@@ -34,7 +34,7 @@ const SYST_BASE: usize = 0xE000_E010;
 const RELOAD_MASK: u32 = 0x00FF_FFFF;
 
 /// 控制与状态寄存器 (CSR; 寄存器句柄见 [`crate::mmio::Reg`])
-const CSR: crate::mmio::Reg = crate::mmio::Reg::new(SYST_BASE + 0x00);
+const CSR: crate::mmio::Reg = crate::mmio::Reg::new(SYST_BASE);
 /// 重装载值寄存器 (RVR)
 const RVR: crate::mmio::Reg = crate::mmio::Reg::new(SYST_BASE + 0x04);
 /// 当前值寄存器 (CVR)

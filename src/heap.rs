@@ -24,8 +24,9 @@ struct TlsfCell(UnsafeCell<Tlsf>);
 // 与内核 KCell 同理: 访问全部经临界区串行化
 unsafe impl Sync for TlsfCell {}
 
-const TLSF_CELL: TlsfCell = TlsfCell(UnsafeCell::new(Tlsf::new()));
-static TLSF: TlsfCell = TLSF_CELL;
+// `Tlsf::new()` 为 const fn, 静态初始化即可 (无需中间 const, 避免
+// 内部可变对象的 const 副本语义)。
+static TLSF: TlsfCell = TlsfCell(UnsafeCell::new(Tlsf::new()));
 
 /// 全局堆分配器。
 pub struct HeapAllocator;

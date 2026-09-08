@@ -434,9 +434,7 @@ mod tests {
         assert!(push(&mut ring, "small"));
         // 单条内容 32B > 缓冲: 先丢最旧条目 (small) 尝试腾空间,
         // 仍放不下 → 截断为空条目; 排空时跳过空条目, 但保留丢弃标记
-        let Some(mut mark) = ring.begin_entry() else {
-            panic!("begin 失败");
-        };
+        let mut mark = ring.begin_entry().expect("begin 失败");
         assert!(!ring.append_to_entry(&mut mark, b"this entry is far too long"));
         ring.commit_entry(&mark);
         let mut out = Vec::new();
@@ -447,9 +445,7 @@ mod tests {
     #[test]
     fn incremental_entry_is_truncated_at_capacity() {
         let mut ring = LogRing::<16>::new();
-        let Some(mut mark) = ring.begin_entry() else {
-            panic!("begin 失败");
-        };
+        let mut mark = ring.begin_entry().expect("begin 失败");
         assert!(ring.append_to_entry(&mut mark, b"0123456789")); // 10/12
         assert!(!ring.append_to_entry(&mut mark, b"ABCDEFGHIJ")); // 超出 → 截断
         ring.commit_entry(&mark);
@@ -461,9 +457,7 @@ mod tests {
     #[test]
     fn truncated_flag_roundtrips_through_commit() {
         let mut ring = LogRing::<24>::new();
-        let Some(mut mark) = ring.begin_entry() else {
-            panic!("begin 失败");
-        };
+        let mut mark = ring.begin_entry().expect("begin 失败");
         assert!(ring.append_to_entry(&mut mark, b"abcdefghij"));
         assert!(!ring.append_to_entry(&mut mark, b"klmnopqrstuvwxyz"));
         ring.commit_entry(&mark);
@@ -492,9 +486,7 @@ mod tests {
     fn drain_waits_for_inflight_entry() {
         // 增量条目进行中: 排空应等待提交后再读, 不读到半成品
         let mut ring = LogRing::<64>::new();
-        let Some(mut mark) = ring.begin_entry() else {
-            panic!("begin 失败");
-        };
+        let mut mark = ring.begin_entry().expect("begin 失败");
         ring.append_to_entry(&mut mark, b"in-flight");
         // 模拟另一线程调用排空 (writing 已置位)
         let mut out = Vec::new();

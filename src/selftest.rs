@@ -217,24 +217,28 @@ fn can_loopback_test() -> Result<crate::can_timing::BitTiming, CanSelftestError>
         return Err(CanSelftestError::ApplicationCanEnabled);
     }
     let can = crate::board::BoardResources::get().can();
+    let clocks = crate::board::BoardResources::get().clocks();
     if can.irq_registered() {
         return Err(CanSelftestError::IrqConsumerRegistered);
     }
     let xtal_was_enabled = crate::clk::xtal_enabled();
     let test = (|| {
-        let timing = can.init(crate::can::Config {
-            mode: crate::can::WorkMode::InternalLoopback,
-            filters: &CAN_SELFTEST_FILTERS,
-            self_ack: false,
-            ptb_single_shot: false,
-            stb_single_shot: false,
-            stb_priority: crate::can::StbPriority::Fifo,
-            rx_warn_limit: 10,
-            rx_all_frames: false,
-            rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
-            interrupts: crate::can::Interrupts::ALL,
-            ..crate::config::CAN_CONFIG
-        })?;
+        let timing = can.init(
+            clocks,
+            crate::can::Config {
+                mode: crate::can::WorkMode::InternalLoopback,
+                filters: &CAN_SELFTEST_FILTERS,
+                self_ack: false,
+                ptb_single_shot: false,
+                stb_single_shot: false,
+                stb_priority: crate::can::StbPriority::Fifo,
+                rx_warn_limit: 10,
+                rx_all_frames: false,
+                rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
+                interrupts: crate::can::Interrupts::ALL,
+                ..crate::config::CAN_CONFIG
+            },
+        )?;
 
         while can.try_receive().is_some() {}
         can.clear_status(can.status());

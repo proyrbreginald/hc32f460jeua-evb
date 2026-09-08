@@ -20,14 +20,14 @@ pub struct Board {
 }
 
 /// 初始化后可交给应用使用的板级资源。
+///
+/// 只持有应用实际消费的能力 (LED/控制台/CAN/时钟快照); DMA/CRC 句柄
+/// 是零大小能力 token, 一次性获取 (`Peripherals::take` 的位图/CAS) 后
+/// 运行路径按编译期配置重建等价句柄, 无需在此常驻。
 pub struct BoardResources {
     led: BoardLed,
     console: crate::config::ConsoleUart,
     can: crate::can::Can,
-    _dma_tx: crate::dma::Dma<{ crate::config::DMA_TX_UNIT }, { crate::config::DMA_TX_CHANNEL }>,
-    _dma_copy:
-        crate::dma::Dma<{ crate::config::DMA_COPY_UNIT }, { crate::config::DMA_COPY_CHANNEL }>,
-    _crc: crate::crc::Crc,
     clocks: crate::clk::Clocks,
 }
 
@@ -39,20 +39,13 @@ struct ResourceSlot(UnsafeCell<MaybeUninit<BoardResources>>);
 unsafe impl Sync for ResourceSlot {}
 
 static RESOURCES: ResourceSlot = ResourceSlot(UnsafeCell::new(MaybeUninit::uninit()));
-static BOARD_TAKEN: AtomicBool = AtomicBool::new(false);
 static BOARD_READY: AtomicBool = AtomicBool::new(false);
 
 impl Board {
-    /// 获取板级入口。全系统仅第一次调用成功。
+    /// 获取板级入口。全系统仅第一次调用成功 (由
+    /// [`crate::peripherals::Peripherals::take`] 的一次性 CAS 保证)。
     pub fn take() -> Option<Self> {
-        crate::peripherals::Peripherals::take()
-            .map(|peripherals| Self { peripherals })
-            .and_then(|board| {
-                BOARD_TAKEN
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .ok()
-                    .map(|_| board)
-            })
+        crate::peripherals::Peripherals::take().map(|peripherals| Self { peripherals })
     }
 
     /// 初始化开发板并返回静态板级资源。
@@ -69,13 +62,19 @@ impl Board {
             clocks,
         } = self.peripherals;
         let clocks = clocks.freeze();
+
+        // DMA/CRC 句柄为 ZST 能力 token: 独占获取已在 `Peripherals::take`
+        // 固化 (DMA 通道位图 / 构造入口收紧), 运行路径 (dma.rs::uart_tx_try
+        // / copy_try) 按编译期配置重建等价句柄。此处只确认核心通道未被
+        // 重复获取, 句柄随即丢弃。
+        let _ = dma_tx.expect("DMA TX 通道已被重复获取");
+        let _ = dma_copy.expect("DMA COPY 通道已被重复获取");
+        let _ = crc;
+
         let resources = BoardResources {
             led: gpio.pin::<PortC, { crate::config::LED_PIN }>(),
             console,
             can,
-            _dma_tx: dma_tx.expect("DMA TX 通道已被重复获取"),
-            _dma_copy: dma_copy.expect("DMA COPY 通道已被重复获取"),
-            _crc: crc,
             clocks,
         };
 
@@ -273,6 +272,13 @@ impl BoardResources {
         self.clocks.system_hz()
     }
 
+    /// 冻结后的实际时钟快照 (驱动/测试恢复路径按实测频率计算;
+    /// selftest/soak 的 CAN 回环等路径消费)。
+    #[cfg(any(shell_selftest, shell_soak))]
+    pub(crate) fn clocks(&self) -> &crate::clk::Clocks {
+        &self.clocks
+    }
+
     /// 已初始化的控制台 UART。
     pub(crate) fn console(&self) -> &crate::config::ConsoleUart {
         &self.console
@@ -282,7 +288,7 @@ impl BoardResources {
     ///
     /// 长时间运行的测试 (自检/soak) 期间终端输入一律丢弃 (ESC 除外);
     /// 返回 true 表示请求中断。放在本模块以便 selftest 与 soak 共享。
-    #[cfg(shell_selftest)]
+    #[cfg(any(shell_selftest, shell_soak))]
     pub(crate) fn abort_requested(&self) -> bool {
         let mut esc = false;
         while let Some(b) = self.console.read_rx() {
@@ -294,7 +300,7 @@ impl BoardResources {
     }
 
     /// 板级唯一 CAN 控制器句柄。
-    #[cfg(shell_selftest)]
+    #[cfg(any(shell_selftest, shell_soak))]
     pub(crate) fn can(&self) -> &crate::can::Can {
         &self.can
     }
@@ -356,7 +362,7 @@ fn apply_thread_memory_protection(next: crate::rtos::ContextSwitchInfo) {
 ///
 /// 长时间运行的测试 (自检/soak) 期间终端输入一律丢弃 (ESC 除外);
 /// 返回 true 表示请求中断。selftest 与 soak 均通过本函数共享。
-#[cfg(shell_selftest)]
+#[cfg(any(shell_selftest, shell_soak))]
 pub(crate) fn abort_requested() -> bool {
     BoardResources::get().abort_requested()
 }

@@ -464,11 +464,15 @@ impl<const U: u8> Uart<U> {
     /// DDL 示例 usart_uart_dma 每次发送"先使能 DMA 通道, 再重新使能
     /// USART_TX"的序列。
     ///
+    /// `now` 由调用方注入的**单调毫秒时钟** (调用方传
+    /// [`crate::rtos::uptime_ms`]), 本裸驱动不依赖 RTOS 节拍, 且超时
+    /// 语义与节拍频率 (`CFG_TICKS_PER_SEC`) 解耦。
+    ///
     /// 返回 false = 等待 TC 超时 (TE 未动, 调用方应回退轮询, 不会死锁)。
-    pub(crate) fn dma_tx_arm(&self, timeout_ms: u32) -> bool {
-        let start = crate::rtos::tick();
+    pub(crate) fn dma_tx_arm(&self, timeout_ms: u32, now: impl Fn() -> u32) -> bool {
+        let start = now();
         while self.sr().read() & SR_TC == 0 {
-            if crate::rtos::tick().wrapping_sub(start) >= timeout_ms {
+            if now().wrapping_sub(start) >= timeout_ms {
                 return false;
             }
         }

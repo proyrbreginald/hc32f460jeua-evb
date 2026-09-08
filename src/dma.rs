@@ -399,8 +399,8 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
         let align = |addr: usize| -> bool {
             match cfg.width {
                 Width::B8 => true,
-                Width::B16 => addr % 2 == 0,
-                Width::B32 => addr % 4 == 0,
+                Width::B16 => addr.is_multiple_of(2),
+                Width::B32 => addr.is_multiple_of(4),
             }
         };
         if !align(cfg.src_addr) || !align(cfg.dest_addr) {
@@ -504,7 +504,7 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
         desc_addr: usize,
         auto_run: bool,
     ) -> Result<(), DmaError> {
-        if desc_addr % 4 != 0 {
+        if !desc_addr.is_multiple_of(4) {
             return Err(DmaError::BadAlign);
         }
         self.ch_reg(LLP).write((desc_addr as u32) & LLP_MASK);
@@ -599,10 +599,10 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
     fn wait_other_channels_idle(&self) -> Result<(), DmaError> {
         let own_bit = 1 << (16 + CH);
         let mask = CHSTAT_CHACT;
-        let start = crate::rtos::tick();
+        let start = crate::rtos::uptime_ms();
         while self.unit_reg(CHSTAT).read() & mask & !own_bit != 0 {
-            // 墙钟截止 (SysTick 1kHz, 与 uart_rtos 同模式, 回绕安全)
-            if crate::rtos::tick().wrapping_sub(start) >= 2 {
+            // 墙钟截止 (毫秒, 与节拍频率解耦, 回绕安全)
+            if crate::rtos::uptime_ms().wrapping_sub(start) >= 2 {
                 return Err(DmaError::ChannelBusy);
             }
         }
@@ -649,18 +649,18 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
 
     /// 阻塞等待传输完成 (轮询 TC 标志, 墙钟超时)。
     ///
-    /// 截止时间取自 SysTick 节拍 (`rtos::tick`, 1kHz, 回绕安全), 与
-    /// 循环速度无关。返回 true = 传输完成 (TC 置位); false = 超时。
-    /// 超时后应检查 [`Dma::error_pending`] 区分错误与硬件停滞, 并
-    /// [`Dma::disable`] 中止残留传输。
+    /// 截止时间取自单调毫秒时钟 ([`crate::rtos::uptime_ms`], 与循环
+    /// 速度及节拍频率无关, 回绕安全)。返回 true = 传输完成 (TC 置位);
+    /// false = 超时。超时后应检查 [`Dma::error_pending`] 区分错误与硬件
+    /// 停滞, 并 [`Dma::disable`] 中止残留传输。
     pub fn wait_done(&self, timeout_us: u32) -> bool {
-        let timeout_ticks = (timeout_us / 1000).max(1);
-        let start = crate::rtos::tick();
+        let timeout_ms = (u64::from(timeout_us)).div_ceil(1000) as u32;
+        let start = crate::rtos::uptime_ms();
         loop {
             if self.tc_pending() {
                 return true;
             }
-            if crate::rtos::tick().wrapping_sub(start) >= timeout_ticks {
+            if crate::rtos::uptime_ms().wrapping_sub(start) >= timeout_ms {
                 return false;
             }
         }
@@ -734,7 +734,10 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
         if len == 0 {
             return Ok(());
         }
-        let (width, items) = if (src as usize) % 4 == 0 && (dst as usize) % 4 == 0 && len % 4 == 0 {
+        let (width, items) = if (src as usize).is_multiple_of(4)
+            && (dst as usize).is_multiple_of(4)
+            && len.is_multiple_of(4)
+        {
             (Width::B32, len / 4)
         } else {
             (Width::B8, len)
@@ -981,7 +984,7 @@ pub fn uart_tx_try<const U: u8>(bytes: &[u8]) -> bool {
     {
         dma.clear_tc();
         // 启动边沿: 空闲 → TE 停 → 使能通道 → TE 起 (见函数文档)
-        if uart.dma_tx_arm(UART_TX_ARM_TIMEOUT_MS) {
+        if uart.dma_tx_arm(UART_TX_ARM_TIMEOUT_MS, crate::rtos::uptime_ms) {
             if dma.enable().is_ok() {
                 uart.dma_tx_fire();
                 // 超时 = 波特率耗时 ×2 + 1ms 余量 (u64 防长包溢出; 墙钟

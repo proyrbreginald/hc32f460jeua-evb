@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf,x86_64-unknown-linux-gnu
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      # 主机测试: 纯算法 + littlefs 断电穷举 + (装有 lrzsz 时) 真实互通
+      - name: Host unit tests
+        run: cargo test --workspace --target x86_64-unknown-linux-gnu
+
+      # 目标 debug (dev_profile 强制全功能) + release (默认裁剪):
+      # 两条路径都编译 selftest/soak/nano, 防止 cfg 门控代码漏检
+      - name: Target clippy (debug, 默认配置)
+        run: cargo clippy --workspace --target thumbv7em-none-eabihf -- -D warnings
+
+      - name: Target build (debug)
+        run: cargo build --target thumbv7em-none-eabihf
+
+      - name: Target build (release, 默认裁剪配置)
+        run: cargo build --release --target thumbv7em-none-eabihf
+
+      # 全开配置: release + debug 都强制编译所有大功能
+      - name: Target build (release, 全开配置)
+        run: >
+          CFG_SHELL_NANO_ENABLE=true
+          CFG_SHELL_ZMODEM_ENABLE=true
+          CFG_APP_SELFTEST_ENABLE=true
+          CFG_SOAK_ENABLE=true
+          cargo build --release --target thumbv7em-none-eabihf
+
+      - name: Target clippy (release, 全开配置)
+        run: >
+          CFG_SHELL_NANO_ENABLE=true
+          CFG_SHELL_ZMODEM_ENABLE=true
+          CFG_APP_SELFTEST_ENABLE=true
+          CFG_SOAK_ENABLE=true
+          cargo clippy --workspace --release --target thumbv7em-none-eabihf -- -D warnings

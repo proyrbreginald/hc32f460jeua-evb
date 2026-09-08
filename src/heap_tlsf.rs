@@ -108,6 +108,12 @@ pub struct Tlsf {
     initialized: bool,
 }
 
+impl Default for Tlsf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tlsf {
     pub const fn new() -> Self {
         Self {
@@ -130,6 +136,12 @@ impl Tlsf {
     ///
     /// `start`/`end` 须按 [`heap_layout`] 对齐到 8 字节; 区域不足
     /// MIN_BLOCK 时初始化为空堆 (所有分配失败)。
+    ///
+    /// # Safety
+    ///
+    /// `[start, end)` 必须是调用方独占的、满足 [`BLOCK_ALIGN`] 对齐的
+    /// 内存区间 (本状态机自此拥有该区间); 区间内不得与其他分配器重叠。
+    /// 未初始化时重复调用为无操作。
     pub unsafe fn init(&mut self, start: usize, end: usize) {
         if self.initialized {
             return;
@@ -150,6 +162,12 @@ impl Tlsf {
     }
 
     /// 分配 `layout`, 失败返回 null。
+    ///
+    /// # Safety
+    ///
+    /// 返回的 payload 在 [`Self::dealloc`] 归还前由调用方独占; 调用方
+    /// 不得对返回指针越界访问 (容量由 [`layout`] 决定)。`&mut self`
+    /// 已保证本调用期间无其他并发访问。
     pub unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
         if !self.initialized {
             return core::ptr::null_mut();
@@ -217,6 +235,12 @@ impl Tlsf {
     }
 
     /// 释放 [`alloc`] 返回的 payload。
+    ///
+    /// # Safety
+    ///
+    /// `payload` 必须恰好是 [`Self::alloc`] 返回的指针 (或
+    /// [`Self::dealloc`] 后未再使用的旧指针除外), 且未被重复释放;
+    /// allocator 不区分 `Layout`, 释放时不要求传入原布局。
     pub unsafe fn dealloc(&mut self, payload: *mut u8) {
         let mut block =
             unsafe { core::ptr::read((payload as usize - PREFIX_OFFSET) as *const usize) }
@@ -253,10 +277,10 @@ impl Tlsf {
                 unsafe { self.list_remove(next) };
                 size += next_size;
                 // 后继后继块的 prev_phys 更新
-                if let Some(after_addr) = next_addr.checked_add(next_size) {
-                    if after_addr < self.arena_end {
-                        unsafe { (*(after_addr as *mut Block)).prev_phys = size };
-                    }
+                if let Some(after_addr) = next_addr.checked_add(next_size)
+                    && after_addr < self.arena_end
+                {
+                    unsafe { (*(after_addr as *mut Block)).prev_phys = size };
                 }
             } else {
                 // 本块已空闲: 后继块的"前块已使用"标志清除, 且 prev_phys

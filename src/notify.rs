@@ -29,6 +29,12 @@ const _: () = assert!(core::mem::size_of::<Callback>() == core::mem::size_of::<u
 /// [`NotifySlot::new`] 逐项构造)
 pub struct NotifySlot(AtomicUsize);
 
+impl Default for NotifySlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NotifySlot {
     /// 空槽 (未安装回调)
     pub const fn new() -> Self {

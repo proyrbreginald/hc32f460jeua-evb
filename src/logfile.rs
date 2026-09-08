@@ -173,11 +173,21 @@ pub fn flush_once() {
         .lock(Timeout::Forever)
         .expect("flush_once 必须在线程上下文");
 
-    // 首次刷新: 扫描目录确定本次启动序号
+    // 首次刷新: 扫描目录确定本次启动序号; 同时按段上限一次性为镜像
+    // 预留容量 (段间复用, 后续追加不再触发分配)。预留失败表示内存
+    // 紧张, 保留 scanned=false 供后续轮次重试 —— 落盘路径绝不因
+    // 分配失败转 panic (panic 策略会复位系统), 本轮直接跳过。
     if !state.scanned {
         let files = collect_log_files(&mut filesystem);
         state.boot_no = logfile_core::next_boot(logfile_core::newest_boot(&files));
         state.segment = 0;
+        if state
+            .image
+            .try_reserve(config::LOG_FILE_MAX + logfile_core::MARKER_CAP)
+            .is_err()
+        {
+            return;
+        }
         state.scanned = true;
     }
 

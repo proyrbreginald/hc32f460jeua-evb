@@ -1090,23 +1090,27 @@ fn wait_can_tx(can: &crate::can::Can, buffer: crate::can::TxBuffer) -> bool {
 extern "C" fn can_worker(param: usize) {
     let w = &WORKERS[param];
     let can = crate::board::BoardResources::get().can();
+    let clocks = crate::board::BoardResources::get().clocks();
     let xtal_was_enabled = crate::clk::xtal_enabled();
     let mut ok = true;
 
     if can
-        .init(crate::can::Config {
-            mode: crate::can::WorkMode::InternalLoopback,
-            filters: &SOAK_CAN_FILTERS,
-            self_ack: false,
-            ptb_single_shot: false,
-            stb_single_shot: false,
-            stb_priority: crate::can::StbPriority::Fifo,
-            rx_warn_limit: 10,
-            rx_all_frames: false,
-            rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
-            interrupts: crate::can::Interrupts::ALL,
-            ..crate::config::CAN_CONFIG
-        })
+        .init(
+            clocks,
+            crate::can::Config {
+                mode: crate::can::WorkMode::InternalLoopback,
+                filters: &SOAK_CAN_FILTERS,
+                self_ack: false,
+                ptb_single_shot: false,
+                stb_single_shot: false,
+                stb_priority: crate::can::StbPriority::Fifo,
+                rx_warn_limit: 10,
+                rx_all_frames: false,
+                rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
+                interrupts: crate::can::Interrupts::ALL,
+                ..crate::config::CAN_CONFIG
+            },
+        )
         .is_err()
     {
         ok = false;

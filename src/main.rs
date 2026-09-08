@@ -105,7 +105,9 @@ pub(crate) fn main() -> ! {
     rtos::init();
 
     // 创建应用线程 (栈/优先级/时间片来自 .cargo/config.toml)。默认配置下
-    // shell 优先级最高，首次运行时先启动并独占文件系统，再进入登录流程。
+    // shell 优先级 (1) 仅低于 WDT supervisor (0) —— 喂狗线程必须先于一切
+    // 应用线程被调度, 因此用 0 级优先级保底; shell 首次运行时先启动并
+    // 独占文件系统, 再进入登录流程。
     // selftest 不在此运行, 由 shell 命令 `selftest` 同步执行。
     rtos::thread_create(
         "led",

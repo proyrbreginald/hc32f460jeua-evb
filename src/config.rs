@@ -447,7 +447,10 @@ const _: () = assert!(
 );
 /// 控制台 TX DMA 通道 (CFG_DMA_TX_CHANNEL = 0~3)
 pub const DMA_TX_CHANNEL: u8 = parse_u8(env!("CFG_DMA_TX_CHANNEL"));
-const _: () = assert!(DMA_TX_CHANNEL <= 3, "CFG_DMA_TX_CHANNEL 非法 (可用 0~3)");
+const _: () = match DMA_TX_CHANNEL {
+    0..=3 => {}
+    _ => panic!("CFG_DMA_TX_CHANNEL 非法 (可用 0~3)"),
+};
 /// 触发 DMA 发送的最小输出长度 (字节) (CFG_DMA_TX_MIN)
 ///
 /// 低于该阈值的输出 (逐字节轮询开销更小) 保持原轮询路径; 阈值同时
@@ -465,10 +468,10 @@ const _: () = assert!(
     "CFG_DMA_COPY_UNIT 非法 (可用 1/2)"
 );
 pub const DMA_COPY_CHANNEL: u8 = parse_u8(env!("CFG_DMA_COPY_CHANNEL"));
-const _: () = assert!(
-    DMA_COPY_CHANNEL <= 3,
-    "CFG_DMA_COPY_CHANNEL 非法 (可用 0~3)"
-);
+const _: () = match DMA_COPY_CHANNEL {
+    0..=3 => {}
+    _ => panic!("CFG_DMA_COPY_CHANNEL 非法 (可用 0~3)"),
+};
 /// TX 与 COPY 不得共用同一通道 (同一通道被两个功能同时配置会互相覆盖)
 const _: () = assert!(
     !(DMA_ENABLE && DMA_TX_UNIT == DMA_COPY_UNIT && DMA_TX_CHANNEL == DMA_COPY_CHANNEL),
@@ -817,6 +820,7 @@ const _: () = assert!(
 ///
 /// - `halt`: 屏蔽中断后 wfi 死循环 (调试期推荐, 便于 gdb 现场检查);
 /// - `reset`: 软复位重启 (产品部署推荐, 尽快恢复服务)。
+///
 /// 见 [`crate::panic::PanicStrategy`]。
 pub const PANIC_STRATEGY: crate::panic::PanicStrategy =
     if eq_str(env!("CFG_PANIC_STRATEGY"), "halt") {
