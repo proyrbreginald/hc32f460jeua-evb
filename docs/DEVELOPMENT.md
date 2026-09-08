@@ -1,5 +1,9 @@
 # 开发与验证
 
+相关设计和功能说明见 [系统架构](ARCHITECTURE.md)、[配置参考](CONFIGURATION.md)、
+[Shell](SHELL.md)、[RTOS](RTOS.md)、[驱动参考](DRIVERS.md)、[实时性](REALTIME.md)
+和[验证矩阵](VALIDATION.md)。
+
 ## 1. 前置环境
 
 需要 stable Rust，并安装格式化、静态检查和两个编译目标：
