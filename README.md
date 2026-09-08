@@ -592,8 +592,10 @@ fn use_ipc() -> Result<(), Error> {
 目标: `thumbv7em-none-eabihf`,自定义链接脚本 `link.ld`
 (固件 FLASH 368K + 文件系统 128K + 自检/交换保留 16K；RAM 188K、8K 主栈、
 `.heap` 段)。链接断言保证固件不会增长覆盖文件系统分区。
-工具链由仓库根 [`rust-toolchain.toml`](rust-toolchain.toml) 固定
-(rustc 1.98.1 + rustfmt/clippy + 双目标; CI 与容器同源)。
+工具链使用**最新 stable** (本地 `rustup` 默认工具链; CI 与容器均装
+stable + rustfmt/clippy + 双目标, 不固定具体版本)。
+`SOURCE_DATE_EPOCH` 只固定横幅里构建日期, 完整 bit-for-bit 可复现仍
+要求相同工具链版本 (随 stable 漂移, 见下文)。
 
 ```bash
 cargo build                          # debug 构建

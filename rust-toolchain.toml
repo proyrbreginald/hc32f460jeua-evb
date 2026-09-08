@@ -1,8 +1,0 @@
-# 固定工具链: 项目依赖 cargo ≥ 1.84 (`.cargo/config.toml [env]` 变更的
-# 重编译追踪, cargo#13280) 且 edition 2024 要求 rustc ≥ 1.85;
-# 固定到已验证版本保证可复现构建 (CI 用 dtolnay/rust-toolchain@rust-toolchain
-# 即读取本文件; 本地 `rustup` 自动切换)。
-[toolchain]
-channel = "1.98.1"
-components = ["rustfmt", "clippy"]
-targets = ["thumbv7em-none-eabihf", "x86_64-unknown-linux-gnu"]

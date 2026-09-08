@@ -11,10 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 工具链取自仓库根 rust-toolchain.toml (固定版本, 可复现; 该文件
-      # 声明 targets/components, 无需重复)
+      # 最新 stable (不固定具体版本; targets/components 在此声明)
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@rust-toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf,x86_64-unknown-linux-gnu
+          components: rustfmt, clippy
 
       # lrzsz: zmodem 互通测试的前提 (缺失时相关测试静默跳过)
       - name: Install lrzsz
@@ -26,7 +28,7 @@ jobs:
           path: |
             ~/.cargo/registry
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
 
       # 与 scripts/verify.sh 保持同一矩阵: fmt + 主机测试 + clippy +
       # debug/release 构建 + 全开配置 (release) 构建与 clippy
