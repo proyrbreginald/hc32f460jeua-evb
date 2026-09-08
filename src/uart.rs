@@ -278,7 +278,7 @@ pub type Uart4 = Uart<4>;
 impl<const U: u8> Uart<U> {
     /// 获取 UART 句柄。`U` 越界 (非 1~4) 时:
     /// 以 `const` 方式使用会在编译期报错。
-    pub const fn take() -> Self {
+    pub(crate) const fn take() -> Self {
         assert!(U >= 1 && U <= 4, "USART 单元必须为 1..=4");
         Self { _private: () }
     }
@@ -333,7 +333,7 @@ impl<const U: u8> Uart<U> {
     ///
     /// 注意: 本方法只配置 USART 外设, 引脚复用 (PFSR.FSEL) 需按封装
     /// 引脚表另行配置 (见数据手册表 2-1)。
-    pub fn init(&self, config: UartConfig) -> Result<(), UartError> {
+    pub fn init(&self, clocks: &crate::clk::Clocks, config: UartConfig) -> Result<(), UartError> {
         if config.baudrate == 0 {
             return Err(UartError::InvalidBaudrate);
         }
@@ -342,7 +342,7 @@ impl<const U: u8> Uart<U> {
         crate::clk::fcg1_enable(fcg1_usart_bit(U));
 
         // 2. 计算波特率 (USART 时钟 = PCLK1 / 预分频, PCLK1 运行时查询)
-        let usart_clk = crate::clk::pclk1_hz() / config.clock_div.divisor();
+        let usart_clk = clocks.pclk1_hz() / config.clock_div.divisor();
         let (div_int, div_frac, fbme) = calc_brr(usart_clk, config.baudrate, config.oversample)?;
 
         // 3. CR1: 过采样 / 数据位 / 校验 / 噪声滤波 / 首字节 / 起始位极性
@@ -748,6 +748,13 @@ impl<const U: u8> Uart<U> {
 /// (配合 `core::fmt::write` / `write_fmt` 使用, 见 `console` 模块的
 /// `print!`/`println!` 宏)。
 impl<const U: u8> core::fmt::Write for Uart<U> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+impl<const U: u8> core::fmt::Write for &Uart<U> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.write(s.as_bytes());
         Ok(())

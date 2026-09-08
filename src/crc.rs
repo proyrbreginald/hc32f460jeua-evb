@@ -74,6 +74,17 @@ pub enum DataWidth {
     Word = 4,
 }
 
+/// CRC 硬件句柄。句柄本身为零大小类型，所有权由 `Peripherals` 管理。
+pub struct Crc {
+    _private: (),
+}
+
+impl Crc {
+    pub(crate) const fn take() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// CRC 配置 (对齐 DDL `stc_crc_init_t`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Config {

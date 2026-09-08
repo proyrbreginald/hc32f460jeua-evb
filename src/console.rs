@@ -42,9 +42,6 @@
 use crate::rtos::{Mutex, Timeout};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// 控制台输出串口 (编译期绑定: `.cargo/config.toml` 的 `CFG_UART_UNIT`)
-pub type ConsoleUart = crate::config::ConsoleUart;
-
 /// 打印互斥量 (优先级继承): 串行化线程上下文的打印输出
 ///
 /// 保护数据为 `()`: 本模块仅需锁语义 (输出串行化), 经
@@ -96,8 +93,9 @@ pub fn write_fmt_raw(args: core::fmt::Arguments<'_>) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
-    let mut uart = ConsoleUart::take();
-    let _ = core::fmt::write(&mut uart, args);
+    let uart = crate::board::BoardResources::get().console();
+    let mut writer = uart;
+    let _ = core::fmt::write(&mut writer, args);
 }
 
 /// 无锁输出原始字节 (调用方负责持锁/不交错约束)
@@ -105,8 +103,7 @@ fn write_bytes_raw(bytes: &[u8]) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
-    let uart = ConsoleUart::take();
-    uart.write(bytes);
+    crate::board::BoardResources::get().console().write(bytes);
 }
 
 /// 打印锁内执行 `f`, `f` 收到原始字节写出器 (输出不会与其他线程交错)。

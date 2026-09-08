@@ -137,11 +137,11 @@ impl InternalFlash {
         let mut offset = 0;
         while offset < len {
             let chunk = (len - offset).min(scratch.len());
-            if crate::dma::copy_try(
-                (address + offset as u32) as *const u8,
-                scratch.as_mut_ptr(),
-                chunk,
-            ) {
+            // `address` was range-checked against the memory-mapped Flash partition.
+            let flash = unsafe {
+                core::slice::from_raw_parts((address + offset as u32) as *const u8, chunk)
+            };
+            if crate::dma::copy_try(flash, &mut scratch[..chunk]) {
                 if scratch[..chunk].iter().any(|&b| b != 0xFF) {
                     return Ok(false);
                 }
@@ -197,7 +197,9 @@ impl BlockDevice for InternalFlash {
         let address = Self::address(block, offset, buffer.len())?;
         // 大块读取走 DMA 整块拷贝 (Flash→RAM, 比逐字节循环快约一个数量级);
         // 未接管 (过短/通道忙) 时回退逐字节轮询。
-        if crate::dma::copy_try(address as *const u8, buffer.as_mut_ptr(), buffer.len()) {
+        // `address` was range-checked by `Self::address`; Flash is memory mapped.
+        let flash = unsafe { core::slice::from_raw_parts(address as *const u8, buffer.len()) };
+        if crate::dma::copy_try(flash, buffer) {
             return Ok(());
         }
         for (index, byte) in buffer.iter_mut().enumerate() {
@@ -231,11 +233,11 @@ impl BlockDevice for InternalFlash {
         let mut offset = 0;
         while offset < data.len() {
             let chunk = (data.len() - offset).min(scratch.len());
-            if crate::dma::copy_try(
-                (address + offset as u32) as *const u8,
-                scratch.as_mut_ptr(),
-                chunk,
-            ) {
+            // The programmed range was validated above and remains memory mapped.
+            let flash = unsafe {
+                core::slice::from_raw_parts((address + offset as u32) as *const u8, chunk)
+            };
+            if crate::dma::copy_try(flash, &mut scratch[..chunk]) {
                 if scratch[..chunk] != data[offset..offset + chunk] {
                     return Err(FlashError::VerifyFailed);
                 }

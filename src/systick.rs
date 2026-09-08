@@ -61,13 +61,13 @@ pub enum SystickError {
 ///
 /// 写入顺序: 先设重装载值, 再清零当前值 (同时清除 COUNTFLAG),
 /// 最后使能 (时钟源 + 中断 + 计数器), 避免计数器运行时修改装载值。
-pub fn init(freq_hz: u32) -> Result<(), SystickError> {
+pub fn init(clocks: &crate::clk::Clocks, freq_hz: u32) -> Result<(), SystickError> {
     if freq_hz == 0 {
         return Err(SystickError::InvalidFrequency);
     }
 
     // 每次中断间隔的 HCLK 周期数 (运行时查询, 支持切时钟源/总线分频)
-    let hclk = crate::clk::hclk_hz();
+    let hclk = clocks.hclk_hz();
     let ticks = hclk / freq_hz;
     if ticks == 0 || ticks > RELOAD_MASK + 1 {
         return Err(SystickError::FrequencyOutOfRange);

@@ -15,6 +15,7 @@ mod config;
 
 // ---- 板级支持 (HC32F460JEUA-EVB 资源与初始化编排) ----
 mod board;
+mod peripherals;
 
 // ---- 内核基础设施 ----
 mod arch; // CPU 架构原语 facade (PRIMASK / WFI / DSB / 系统复位)

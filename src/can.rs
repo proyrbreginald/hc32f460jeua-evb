@@ -444,10 +444,10 @@ impl Can {
     /// Initialization enters local reset, which clears the hardware RX and STB
     /// FIFOs. The caller must own the controller lifecycle and quiesce any
     /// application/IRQ consumer before calling this method.
-    pub fn init(&self, cfg: Config) -> Result<BitTiming, CanError> {
+    pub fn init(&self, clocks: &crate::clk::Clocks, cfg: Config) -> Result<BitTiming, CanError> {
         validate_config(&cfg)?;
         let timing = crate::can_timing::calculate(
-            crate::clk::XTAL_HZ,
+            clocks.xtal_hz(),
             cfg.bitrate,
             cfg.sample_point_permille as u32,
             cfg.sjw as u32,
@@ -455,7 +455,7 @@ impl Can {
         )
         .ok_or(CanError::BitTimingUnsupported)?;
 
-        if u64::from(crate::clk::exclk_hz()) * 2 < u64::from(crate::clk::XTAL_HZ) * 3 {
+        if u64::from(clocks.exclk_hz()) * 2 < u64::from(clocks.xtal_hz()) * 3 {
             return Err(CanError::ClockConstraint);
         }
         if !crate::clk::xtal_stable() {

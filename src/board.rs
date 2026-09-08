@@ -4,9 +4,11 @@
 //! 应用通过 [`Board`] / [`BoardResources`] 使用板载 LED 和控制台，避免
 //! 在应用入口中直接绑定端口、引脚及外设实例。
 
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::gpio::{Config, Drive, Gpio, Mode, Pin, PortA, PortB, PortC};
+use crate::gpio::{Config, Drive, Mode, Pin, PortA, PortB, PortC};
 use crate::uart::UartConfig;
 
 /// 板载 LED: PC13，引脚号保留现有编译期配置校验。
@@ -14,7 +16,7 @@ type BoardLed = Pin<PortC, { crate::config::LED_PIN }>;
 
 /// HC32F460JEUA-EVB 板级入口。
 pub struct Board {
-    _private: (),
+    peripherals: crate::peripherals::Peripherals,
 }
 
 /// 初始化后可交给应用使用的板级资源。
@@ -22,38 +24,68 @@ pub struct BoardResources {
     led: BoardLed,
     console: crate::config::ConsoleUart,
     can: crate::can::Can,
+    _dma_tx: crate::dma::Dma<{ crate::config::DMA_TX_UNIT }, { crate::config::DMA_TX_CHANNEL }>,
+    _dma_copy:
+        crate::dma::Dma<{ crate::config::DMA_COPY_UNIT }, { crate::config::DMA_COPY_CHANNEL }>,
+    _crc: crate::crc::Crc,
+    clocks: crate::clk::Clocks,
 }
 
 static WDT_FEED_MAX_GAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-static RESOURCES: BoardResources = BoardResources {
-    led: BoardLed::new(),
-    console: crate::config::ConsoleUart::take(),
-    can: crate::can::Can::new(),
-};
+struct ResourceSlot(UnsafeCell<MaybeUninit<BoardResources>>);
+
+// The slot is written exactly once before BOARD_READY is published.
+unsafe impl Sync for ResourceSlot {}
+
+static RESOURCES: ResourceSlot = ResourceSlot(UnsafeCell::new(MaybeUninit::uninit()));
 static BOARD_TAKEN: AtomicBool = AtomicBool::new(false);
 static BOARD_READY: AtomicBool = AtomicBool::new(false);
 
 impl Board {
     /// 获取板级入口。全系统仅第一次调用成功。
     pub fn take() -> Option<Self> {
-        BOARD_TAKEN
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self { _private: () })
+        crate::peripherals::Peripherals::take()
+            .map(|peripherals| Self { peripherals })
+            .and_then(|board| {
+                BOARD_TAKEN
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .ok()
+                    .map(|_| board)
+            })
     }
 
     /// 初始化开发板并返回静态板级资源。
     ///
     /// 顺序保持为：时钟 -> MPU -> GPIO -> SysTick -> UART -> CAN -> RTC。
     pub fn init(self) -> &'static BoardResources {
-        // 振荡器/PLL 失败时硬件仍保持或回退到可用源。先保存结果，等
-        // UART 就绪后报告，后续外设一律按实际时钟计算分频。
-        let clock_error = crate::clk::init().err();
+        let crate::peripherals::Peripherals {
+            gpio,
+            console,
+            can,
+            dma_tx,
+            dma_copy,
+            crc,
+            clocks,
+        } = self.peripherals;
+        let clocks = clocks.freeze();
+        let resources = BoardResources {
+            led: gpio.pin::<PortC, { crate::config::LED_PIN }>(),
+            console,
+            can,
+            _dma_tx: dma_tx.expect("DMA TX 通道已被重复获取"),
+            _dma_copy: dma_copy.expect("DMA COPY 通道已被重复获取"),
+            _crc: crc,
+            clocks,
+        };
+
+        // 振荡器/PLL 失败时硬件仍保持或回退到可用源。错误随冻结后的
+        // Clocks 保存，后续外设一律按该实际快照计算分频。
+        let clock_error = resources.clocks.error();
 
         // 硬实时指标测量 (DWT): 时钟就绪后立即初始化, 之后的临界区与
         // 节拍中断即进入测量范围
-        crate::latency::init(crate::clk::hclk_hz());
+        crate::latency::init(resources.clocks.hclk_hz());
 
         if crate::config::MPU_ENABLE {
             crate::mpu::init();
@@ -61,8 +93,7 @@ impl Board {
             crate::log_debug!("MPU: 已使能 (FLASH 只读, SRAM/外设 XN, 线程栈守卫)");
         }
 
-        let gpio = Gpio::take();
-        RESOURCES.led.configure(Config {
+        resources.led.configure(Config {
             mode: Mode::Output,
             pull_up: false,
             drive: Drive::Low,
@@ -80,26 +111,29 @@ impl Board {
                 .set_func(crate::config::CAN_RX_FSEL);
         }
 
-        crate::systick::init(crate::config::SYSTICK_FREQ_HZ).expect("SysTick 配置失败!");
+        crate::systick::init(&resources.clocks, crate::config::SYSTICK_FREQ_HZ)
+            .expect("SysTick 配置失败!");
         crate::log_debug!("SysTick: {} Hz", crate::config::SYSTICK_FREQ_HZ);
 
-        RESOURCES
+        resources
             .console
-            .init(UartConfig {
-                baudrate: crate::config::UART_BAUDRATE,
-                oversample: crate::config::UART_OVERSAMPLE,
-                clock_div: crate::config::UART_CLOCK_DIV,
-                data_bits: crate::config::UART_DATA_BITS,
-                parity: crate::config::UART_PARITY,
-                stop_bits: crate::config::UART_STOP_BITS,
-                first_bit: crate::config::UART_FIRST_BIT,
-                start_bit_polarity: crate::config::UART_START_POLARITY,
-                flow_control: crate::config::UART_FLOW_CTRL,
-                noise_filter: crate::config::UART_NOISE_FILTER,
-            })
+            .init(
+                &resources.clocks,
+                UartConfig {
+                    baudrate: crate::config::UART_BAUDRATE,
+                    oversample: crate::config::UART_OVERSAMPLE,
+                    clock_div: crate::config::UART_CLOCK_DIV,
+                    data_bits: crate::config::UART_DATA_BITS,
+                    parity: crate::config::UART_PARITY,
+                    stop_bits: crate::config::UART_STOP_BITS,
+                    first_bit: crate::config::UART_FIRST_BIT,
+                    start_bit_polarity: crate::config::UART_START_POLARITY,
+                    flow_control: crate::config::UART_FLOW_CTRL,
+                    noise_filter: crate::config::UART_NOISE_FILTER,
+                },
+            )
             .expect("UART 初始化失败!");
-        crate::console::mark_ready();
-        let active_clock = crate::clk::active_clock_source();
+        let active_clock = resources.clocks.source();
         let active_name = active_clock
             .map(crate::clk::ClockSource::name)
             .unwrap_or("unknown");
@@ -108,19 +142,19 @@ impl Board {
                 "系统时钟初始化失败 ({:?})，继续使用实际源 {} @ {} Hz",
                 error,
                 active_name,
-                crate::clk::system_clock_hz()
+                resources.clocks.system_hz()
             );
         } else if active_clock != Some(crate::config::CLOCK_SOURCE) {
             crate::log_warn!(
                 "系统时钟已从配置源 {} 回退到 {} @ {} Hz",
                 crate::config::CLOCK_SOURCE.name(),
                 active_name,
-                crate::clk::system_clock_hz()
+                resources.clocks.system_hz()
             );
         } else {
             crate::log_debug!(
                 "时钟: {} Hz (实际源 {})",
-                crate::clk::system_clock_hz(),
+                resources.clocks.system_hz(),
                 active_name
             );
         }
@@ -148,9 +182,9 @@ impl Board {
         }
 
         if crate::config::CAN_ENABLE {
-            let timing = RESOURCES
+            let timing = resources
                 .can
-                .init(crate::config::CAN_CONFIG)
+                .init(&resources.clocks, crate::config::CAN_CONFIG)
                 .expect("CAN 初始化失败");
             assert_eq!(
                 timing,
@@ -160,8 +194,8 @@ impl Board {
             crate::log_debug!(
                 "CAN: {} bps (实际 {} bps, 误差 {}ppm, 采样点 {}‰, {}TQ, PRESC={}, SEG1={}, SEG2={}, SJW={})",
                 crate::config::CAN_BITRATE,
-                timing.actual_bitrate(crate::clk::XTAL_HZ),
-                timing.error_ppm(crate::clk::XTAL_HZ, crate::config::CAN_BITRATE),
+                timing.actual_bitrate(resources.clocks.xtal_hz()),
+                timing.error_ppm(resources.clocks.xtal_hz(), crate::config::CAN_BITRATE),
                 timing.sample_point_permille(),
                 timing.total_time_quanta(),
                 timing.prescaler,
@@ -196,8 +230,10 @@ impl Board {
             crate::log_info!("RTC 已启动 (LRC 源, 24H), 日志时间戳生效 [天:时:分:秒]");
         }
 
+        unsafe { (*RESOURCES.0.get()).write(resources) };
         BOARD_READY.store(true, Ordering::Release);
-        &RESOURCES
+        crate::console::mark_ready();
+        BoardResources::resources()
     }
 }
 
@@ -210,7 +246,12 @@ impl BoardResources {
             BOARD_READY.load(Ordering::Acquire),
             "BoardResources 尚未初始化"
         );
-        &RESOURCES
+        Self::resources()
+    }
+
+    fn resources() -> &'static Self {
+        // BOARD_READY is the acquire fence for this one-time publication.
+        unsafe { (*RESOURCES.0.get()).assume_init_ref() }
     }
 
     /// 翻转板载 LED。
@@ -229,7 +270,7 @@ impl BoardResources {
 
     /// 当前系统时钟频率。
     pub fn system_clock_hz(&self) -> u32 {
-        crate::clk::system_clock_hz()
+        self.clocks.system_hz()
     }
 
     /// 已初始化的控制台 UART。
@@ -274,7 +315,7 @@ impl BoardResources {
                 "WDT supervisor 必须在调度器启动前创建"
             );
 
-            let pclk3_hz = crate::clk::pclk3_hz();
+            let pclk3_hz = self.clocks.pclk3_hz();
             let timeout_us = crate::wdt::DEFAULT
                 .timeout_us(pclk3_hz)
                 .expect("WDT 配置非法或 PCLK3 未运行");
