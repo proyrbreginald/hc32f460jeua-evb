@@ -519,11 +519,17 @@ impl<const U: u8> Uart<U> {
     /// - `line`: NVIC 中断线 (INT000~INT127, 见 [`crate::intc::Line`]),
     ///   事件源自动取本单元 USARTn_RI;
     /// - `priority`: NVIC 抢占优先级 (0~15, 值越小优先级越高)。
+    ///
+    /// CR1 的读-改-写在临界区内完成: ISR 错误清除路径
+    /// ([`rx_irq_handler`]) 对同一寄存器做读-改-写, 无保护时两者交错
+    /// 会丢失 RIE 位更新 (与 [`dma_tx_arm`] 同类的竞争防护)。
     pub fn enable_rx_interrupt(&self, line: crate::intc::Line, priority: u8) {
         crate::intc::register(ri_source(U), line, priority, rx_irq_handler::<U>)
             .expect("USART 接收中断注册失败 (中断线被占用)");
         // CR1.RIE: 接收满 + 接收错误中断使能 (对齐 USART_FuncCmd(USART_INT_RX))
-        self.cr1().modify(|v| v | CR1_RIE);
+        crate::critical_section::with(|_| {
+            self.cr1().modify(|v| v | CR1_RIE);
+        });
     }
 }
 

@@ -68,6 +68,30 @@ pub(crate) fn data_sync_barrier() {
     }
 }
 
+/// DWT 周期计数器 (与 SysTick/RTOS 解耦的单调时钟)。
+///
+/// 未使能时惰性初始化 (与 [`crate::latency::init`] 的序列一致, 幂等):
+/// DEMCR.TRCENA 开放调试组件 → 清零 CYCCNT → 使能计数。32 位回绕,
+/// 差值必须用 `wrapping_sub`。调度器启动前 (单执行流) 即可使用,
+/// 供校准短延时与裸驱动的单调超时 (避免依赖 RTOS 节拍)。
+pub(crate) fn cycles_now() -> u32 {
+    const DWT_CTRL: usize = 0xE000_1000;
+    const DWT_CYCCNT: usize = 0xE000_1004;
+    const DEMCR: usize = 0xE000_EDFC;
+    const DEMCR_TRCENA: u32 = 1 << 24;
+    const CYCCNTENA: u32 = 1 << 0;
+
+    let ctrl = crate::mmio::Reg::new(DWT_CTRL);
+    if ctrl.read() & CYCCNTENA == 0 {
+        let demcr = crate::mmio::Reg::new(DEMCR);
+        demcr.write(demcr.read() | DEMCR_TRCENA);
+        ctrl.write(0);
+        crate::mmio::Reg::new(DWT_CYCCNT).write(0);
+        ctrl.write(CYCCNTENA);
+    }
+    crate::mmio::Reg::new(DWT_CYCCNT).read()
+}
+
 /// Request a full system reset through SCB.AIRCR.
 pub(crate) fn system_reset() -> ! {
     const AIRCR_ADDR: usize = 0xE000_ED0C;

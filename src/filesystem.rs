@@ -130,35 +130,58 @@ impl InternalFlash {
 
     /// 校验 [address, address+len) 是否全部为擦除态 (0xFF)。
     ///
-    /// 优先 DMA 整块读回 (Flash→RAM, 见 [`crate::dma::copy_try`]),
-    /// 回退逐字轮询; 逐 1KiB 分块, 栈缓冲零分配。
+    /// 逐 1KiB 分块, 栈缓冲零分配; 块校验首次不一致会**重读一次**
+    /// (见 [`Self::chunk_verify`]), 总线/缓存毛刺不会误判为数据损坏。
     fn region_erased(address: u32, len: usize) -> Result<bool, FlashError> {
-        let mut scratch = [0xFFu8; 1024];
+        let mut scratch = [0u8; 1024];
         let mut offset = 0;
         while offset < len {
             let chunk = (len - offset).min(scratch.len());
-            // `address` was range-checked against the memory-mapped Flash partition.
-            let flash = unsafe {
-                core::slice::from_raw_parts((address + offset as u32) as *const u8, chunk)
-            };
-            if crate::dma::copy_try(flash, &mut scratch[..chunk]) {
-                if scratch[..chunk].iter().any(|&b| b != 0xFF) {
-                    return Ok(false);
-                }
-            } else {
-                let mut i = 0;
-                while i < chunk {
-                    let actual = crate::efm::read_word(address + offset as u32 + i as u32)
-                        .map_err(FlashError::Controller)?;
-                    if actual != u32::MAX {
-                        return Ok(false);
-                    }
-                    i += 4;
-                }
+            if !Self::chunk_verify(address + offset as u32, None, &mut scratch[..chunk])? {
+                return Ok(false);
             }
             offset += chunk;
         }
         Ok(true)
+    }
+
+    /// 分块读取并校验: 大块读优先 DMA 整块拷贝 (Flash→RAM), 回退逐字。
+    ///
+    /// 校验不一致时**整个分块重读一次**: 单次读回毛刺 (总线竞争/缓存
+    /// 一致性) 若直接判"非擦除态/编程失败", 会把整个 8KB 扇区永久标记
+    /// 为坏块 (见 [`permanent_block_failure`]), 实际数据无害。
+    fn chunk_verify(
+        address: u32,
+        expected: Option<&[u8]>,
+        scratch: &mut [u8],
+    ) -> Result<bool, FlashError> {
+        for _attempt in 0..2 {
+            Self::read_chunk(address, scratch)?;
+            let matched = match expected {
+                None => scratch.iter().all(|&b| b == 0xFF),
+                Some(exp) => scratch == exp,
+            };
+            if matched {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// 读取 [address, address+len) 到 `scratch` (长度 ≤1KiB 且为 4 的倍数;
+    /// 调用方保证地址在分区内且内存映射)。大块读优先 DMA 整块拷贝。
+    fn read_chunk(address: u32, scratch: &mut [u8]) -> Result<(), FlashError> {
+        let flash = unsafe { core::slice::from_raw_parts(address as *const u8, scratch.len()) };
+        if crate::dma::copy_try(flash, scratch) {
+            return Ok(());
+        }
+        // 回退逐字 (Flash 字读, 4B 粒度; 长度恒为 4 的倍数)
+        for (i, word) in scratch.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *word = crate::efm::read_word(address + (i * 4) as u32)
+                .map_err(FlashError::Controller)?
+                .to_le_bytes();
+        }
+        Ok(())
     }
 }
 
@@ -183,6 +206,10 @@ impl BlockDevice for InternalFlash {
     /// PEWERR (擦/写失败)、PGMISMTCH (回读不匹配) 与擦除后校验失败
     /// 表明该扇区单元已损坏 —— 文件系统可标记坏块并换位置重试。
     /// 掉电/超时/读冲突等模糊错误保持默认 false (Fatal, 需重挂载)。
+    ///
+    /// 校验类错误 (VerifyFailed/Mismatch) 在判永久前已经过一次
+    /// **重读确认** (见 [`chunk_verify`]), 单次总线/缓存毛刺不会
+    /// 把一个 8KB 扇区永久报废。
     fn permanent_block_failure(&self, error: &Self::Error) -> bool {
         matches!(
             error,
@@ -228,33 +255,18 @@ impl BlockDevice for InternalFlash {
 
         crate::efm::program(address, data).map_err(FlashError::Controller)?;
 
-        // 写后回读校验: 优先 DMA 整块回读 (Flash→RAM) 后比较, 回退逐字。
+        // 写后回读校验: 分块校验不一致时重读一次 (见 [`Self::chunk_verify`]),
+        // 单次读回毛刺不判永久坏块。优先 DMA 整块回读, 回退逐字。
         let mut scratch = [0u8; 1024];
         let mut offset = 0;
         while offset < data.len() {
             let chunk = (data.len() - offset).min(scratch.len());
-            // The programmed range was validated above and remains memory mapped.
-            let flash = unsafe {
-                core::slice::from_raw_parts((address + offset as u32) as *const u8, chunk)
-            };
-            if crate::dma::copy_try(flash, &mut scratch[..chunk]) {
-                if scratch[..chunk] != data[offset..offset + chunk] {
-                    return Err(FlashError::VerifyFailed);
-                }
-            } else {
-                for (index, expected) in data[offset..offset + chunk]
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .enumerate()
-                {
-                    let actual =
-                        crate::efm::read_word(address + offset as u32 + (index * 4) as u32)
-                            .map_err(FlashError::Controller)?;
-                    if actual.to_le_bytes() != *expected {
-                        return Err(FlashError::VerifyFailed);
-                    }
-                }
+            if !Self::chunk_verify(
+                address + offset as u32,
+                Some(&data[offset..offset + chunk]),
+                &mut scratch[..chunk],
+            )? {
+                return Err(FlashError::VerifyFailed);
             }
             offset += chunk;
         }

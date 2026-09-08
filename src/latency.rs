@@ -214,6 +214,10 @@ pub fn reset_peaks() {
     TICK_LATENCY_MAX.store(0, Ordering::Relaxed);
     TICK_LATENCY_FLASH_MAX.store(0, Ordering::Relaxed);
     LAST_TICK_CYCCNT.store(0, Ordering::Relaxed);
+    // 擦写窗口标记一并清零: 跨越 DWT 回绕 (21.5s) 的第二轮运行中,
+    // 陈旧窗口恰逢回绕对齐会把正常样本误归 Flash 桶 (信息性指标)
+    FLASH_WIN_START.store(0, Ordering::Relaxed);
+    FLASH_WIN_END.store(0, Ordering::Relaxed);
 }
 
 /// 最长关中断时间 (cycles, 不含 Flash 擦写窗口; 未初始化/无采样为 0)

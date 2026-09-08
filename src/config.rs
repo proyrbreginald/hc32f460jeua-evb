@@ -939,13 +939,17 @@ const _: () = assert!(
 /// 每个 shell 命令可单独通过该列表启用/禁用: 新增命令需在
 /// `src/shell.rs` 命令表注册并加入此列表。const 求值, 结果编译期确定。
 pub const fn cmd_enabled(name: &str) -> bool {
-    // dev 构建: 放宽禁用列表, 保留被 release 编译期裁剪的调试/自测命令
-    // (nano/selftest/soak), 使完整功能下可调试。命令是否实际注册仍由
-    // 对应模块的 #[cfg(shell_*)] 决定 (build.rs 已让 dev 恒注入这些 cfg),
-    // 此处只是允许其通过启用检查。
-    if cfg!(dev_profile)
-        && (eq_str(name, "nano") || eq_str(name, "selftest") || eq_str(name, "soak"))
-    {
+    // 编译期开启的大功能命令: 模块 cfg 直接豁免启用列表 (而不要求
+    // 同时在 CFG_SHELL_COMMANDS 中列出 —— 曾因列表不含 nano/selftest/
+    // soak 造成"代码已编译但命令被拒"的第三道门不一致; dev 构建恒注入
+    // 这些 cfg, 不受 release 裁剪影响)。
+    if cfg!(shell_nano) && eq_str(name, "nano") {
+        return true;
+    }
+    if cfg!(shell_selftest) && eq_str(name, "selftest") {
+        return true;
+    }
+    if cfg!(shell_soak) && eq_str(name, "soak") {
         return true;
     }
     let list = env!("CFG_SHELL_COMMANDS").as_bytes();

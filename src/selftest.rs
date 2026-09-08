@@ -541,14 +541,14 @@ pub(crate) fn run() {
         format_args!("recv() = {:?}", r),
     );
 
-    // 延时: uptime 前进
+    // 延时: uptime 前进 (回绕安全比较, 与 soak 的 wrapping 语义一致)
     let t0 = crate::rtos::uptime_ms();
     crate::rtos::thread_delay_ms(20).expect("selftest 延时必须在线程上下文");
     let t1 = crate::rtos::uptime_ms();
     check(
-        t1 >= t0 + 20,
+        t1.wrapping_sub(t0) >= 20,
         "线程延时: uptime 前进 ≥ 20ms",
-        format_args!("延时 20ms, 实际 {}ms", t1 - t0),
+        format_args!("延时 20ms, 实际 {}ms", t1.wrapping_sub(t0)),
     );
 
     // 线程强制删除与自然退出 (defunct 回收)

@@ -263,6 +263,24 @@ impl Semaphore {
     }
 }
 
+impl Drop for Semaphore {
+    /// 内核对象析构检查: 等待队列非空即 fail-fast。
+    ///
+    /// 侵入式队列挂着其他线程的 `suspend_node`, 带等待者析构会留下
+    /// 悬垂引用 (后续 release/超时回调解引用已释放内存)。当前工程
+    /// 只使用 `static` (永不析构), 此检查为堆分配/动态生命周期场景
+    /// 提供编译期无法排除的安全网。
+    fn drop(&mut self) {
+        critical_section::with(|_| unsafe {
+            let s = &mut *self.ptr();
+            assert!(
+                s.base.suspend_list.is_empty(),
+                "Semaphore 析构时仍有等待者 (内核对象不得在活动期释放)"
+            );
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 互斥量 (优先级继承)
 // ---------------------------------------------------------------------------
@@ -461,6 +479,21 @@ impl<T: ?Sized> Mutex<T> {
     /// 当前持有者 (诊断用)
     pub(crate) fn owner(&self) -> *mut ThreadInner {
         critical_section::with(|_| unsafe { (*self.ptr()).owner })
+    }
+}
+
+impl<T: ?Sized> Drop for Mutex<T> {
+    /// 内核对象析构检查: 等待队列非空或仍有持有者即 fail-fast
+    /// (见 [`Semaphore::drop`] 的说明; 守卫持有 `&self` 借用,
+    /// 正常代码不可能持有中析构, 此检查兜底)。
+    fn drop(&mut self) {
+        critical_section::with(|_| unsafe {
+            let m = &mut *self.ptr();
+            assert!(
+                m.base.suspend_list.is_empty() && m.owner.is_null(),
+                "Mutex 析构时仍有等待者/持有者 (内核对象不得在活动期释放)"
+            );
+        });
     }
 }
 
@@ -778,6 +811,19 @@ impl Event {
     }
 }
 
+impl Drop for Event {
+    /// 内核对象析构检查: 等待队列非空即 fail-fast (见 [`Semaphore::drop`] 说明)。
+    fn drop(&mut self) {
+        critical_section::with(|_| unsafe {
+            let e = &mut *self.ptr();
+            assert!(
+                e.base.suspend_list.is_empty(),
+                "Event 析构时仍有等待者 (内核对象不得在活动期释放)"
+            );
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 邮箱 (环形缓冲, 泛型消息)
 // ---------------------------------------------------------------------------
@@ -957,6 +1003,13 @@ impl<T: Copy> Mailbox<T> {
 
 impl<T> Drop for Mailbox<T> {
     fn drop(&mut self) {
+        critical_section::with(|_| unsafe {
+            let mb = self.inner.get_mut();
+            assert!(
+                mb.base.suspend_list.is_empty() && mb.sender_list.is_empty(),
+                "Mailbox 析构时仍有等待者 (内核对象不得在活动期释放)"
+            );
+        });
         let mb = self.inner.get_mut();
         let pool = mb.pool.load(core::sync::atomic::Ordering::Relaxed);
         if pool.is_null() {
@@ -1205,6 +1258,13 @@ impl MessageQueue {
 
 impl Drop for MessageQueue {
     fn drop(&mut self) {
+        critical_section::with(|_| unsafe {
+            let q = self.inner.get_mut();
+            assert!(
+                q.base.suspend_list.is_empty() && q.sender_list.is_empty(),
+                "MessageQueue 析构时仍有等待者 (内核对象不得在活动期释放)"
+            );
+        });
         let q = self.inner.get_mut();
         let pool = q.pool.load(core::sync::atomic::Ordering::Relaxed);
         if pool.is_null() {

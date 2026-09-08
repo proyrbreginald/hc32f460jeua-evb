@@ -1551,8 +1551,10 @@ pub(crate) fn run(args: &str) {
             crate::sram::clear_status(crate::sram::ERR_ALL);
             crate::log_error!("[soak] SRAM 错误: {:?}", e);
         }
-        // 堆用量峰值
+        // 堆用量峰值 (趋势判定须用"本次更新前"的历史峰值, 见下方
+        // 报告期比较 —— 若先并入再比较, 突破判断恒为假, 见缺陷记录)
         let used = crate::heap::used();
+        let prior_peak = peak_heap;
         if used > peak_heap {
             peak_heap = used;
         }
@@ -1585,15 +1587,16 @@ pub(crate) fn run(args: &str) {
         }
         // 周期进度报告 + 泄漏趋势检测
         if now.wrapping_sub(last_report) >= crate::config::SOAK_REPORT_INTERVAL_MS {
-            // 峰值突破趋势: 连续报告期突破历史峰值 → 疑似泄漏 (不改判定,
-            // 最终判定由结束值阈值决定; 正常压力平台期峰值稳定不触发)
-            if used > peak_heap + 2048 {
+            // 峰值突破趋势: 连续报告期突破"上一秒更新前"的历史峰值 →
+            // 疑似泄漏 (不改判定, 最终判定由结束值阈值决定; 正常压力
+            // 平台期峰值稳定不触发)
+            if used > prior_peak + 2048 {
                 peak_break_streak += 1;
                 if peak_break_streak >= 3 {
                     crate::log_warn!(
                         "[soak] 堆用量持续突破历史峰值 (疑似泄漏趋势): {}B (历史峰值 {}B)",
                         used,
-                        peak_heap
+                        prior_peak
                     );
                     peak_break_streak = 0;
                 }

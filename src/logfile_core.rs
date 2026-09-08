@@ -19,7 +19,8 @@
 
 use core::fmt::Write as _;
 
-/// 文件名最大长度 (`boot_` + 20 位序号 + `_` + 2 位段号 + `.log`)
+/// 文件名最大长度 (`boot_` + 20 位序号 + `_` + 段号(≤10 位) + `.log`; 兼容
+/// 旧版 2 位、新版 3 位定宽段号与超千段长稳运行)
 pub const NAME_CAP: usize = 40;
 /// 内容标记最大长度 (`\n----- boot #` + 20 位序号 + ` · UID ` + 26 位
 /// 唯一编号 + ` -----\n`)
@@ -46,7 +47,9 @@ pub fn segment_name(boot: u64, segment: u32, out: &mut [u8; NAME_CAP]) -> &[u8] 
     if segment == 0 {
         let _ = write!(sink, "boot_{:020}.log", boot);
     } else {
-        let _ = write!(sink, "boot_{:020}_{:02}.log", boot, segment);
+        // 段号定宽 3 位零填充 (字典序即时间序); ≥1000 时自然扩位,
+        // 解析端接受 2~10 位以兼容旧版两位段号与超千段的长稳运行。
+        let _ = write!(sink, "boot_{:020}_{:03}.log", boot, segment);
     }
     let pos = sink.pos;
     &out[..pos]
@@ -67,8 +70,10 @@ pub fn parse_segment_name(name: &str) -> Option<(u64, u32)> {
         return Some((boot, 0));
     }
     let seg = tail.strip_prefix('_')?.strip_suffix(".log")?;
-    if seg.len() != 2 {
-        return None; // 段号固定两位零填充
+    // 段号须为 2~10 位十进制 (版本 `{:02}` 旧文件与 `{:03}` 新文件,
+    // 兼容超千段的长稳运行; 1 位或更长的垃圾后缀拒绝)
+    if seg.len() < 2 || seg.len() > 10 || !seg.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
     let segment: u32 = seg.parse().ok()?;
     Some((boot, segment))
@@ -193,8 +198,26 @@ mod tests {
             Some((42, 7))
         );
         assert_eq!(
+            parse_segment_name("boot_00000000000000000042_007.log"),
+            Some((42, 7))
+        );
+        assert_eq!(
             core::str::from_utf8(segment_name(42, 7, &mut buf)).unwrap(),
-            "boot_00000000000000000042_07.log"
+            "boot_00000000000000000042_007.log"
+        );
+        // 段号 ≥100 曾因 `{:02}` 宽度与解析端"恰好两位"不一致而
+        // 对轮转/预算机制隐形 (现为 3 位定宽, 往返一致)
+        assert_eq!(
+            core::str::from_utf8(segment_name(1, 100, &mut buf)).unwrap(),
+            "boot_00000000000000000001_100.log"
+        );
+        assert_eq!(
+            parse_segment_name("boot_00000000000000000001_100.log"),
+            Some((1, 100))
+        );
+        assert_eq!(
+            parse_segment_name(core::str::from_utf8(segment_name(7, 999, &mut buf)).unwrap()),
+            Some((7, 999))
         );
     }
 

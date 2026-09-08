@@ -55,11 +55,11 @@ const SCB_BASE: usize = 0xE000_ED00;
 /// 栈顶 (与 link.ld 的 RAM 段末尾一致), 用于估算栈使用量
 const STACK_TOP: usize = 0x2002_7000;
 
-/// Cortex-M 异常帧布局与 EXC_RETURN 位。
-const BASIC_FRAME_WORDS: usize = 8;
-const BASIC_FRAME_BYTES: usize = BASIC_FRAME_WORDS * core::mem::size_of::<u32>();
-const FP_EXTENSION_WORDS: usize = 18;
-const FP_EXTENSION_BYTES: usize = FP_EXTENSION_WORDS * core::mem::size_of::<u32>();
+use crate::exception_frame as ef;
+/// Cortex-M 异常帧布局与 EXC_RETURN 位 (布局索引与主机回归测试见
+/// [`crate::exception_frame`])。
+use crate::exception_frame::{BASIC_WORDS, EXTENDED_BYTES, FP_WORDS, try_decode};
+
 const EXC_RETURN_USE_PSP: u32 = 1 << 2;
 const EXC_RETURN_BASIC_FRAME: u32 = 1 << 4;
 
@@ -147,10 +147,19 @@ unsafe extern "C" fn fault_diagnose(ipsr: u32, stacked_sp: u32, exc_return: u32,
 
 /// 打印异常压栈帧。
 ///
-/// basic frame 为 `[r0, r1, r2, r3, r12, lr, pc, xpsr]`。M4F 的
-/// `EXC_RETURN.bit4 == 0` 表示原始 SP 先指向 18 字的 FP 扩展区
-/// `[s0..s15, fpscr, reserved]`，basic frame 位于其后；bit4 == 1
-/// 时原始 SP 直接指向 basic frame。
+/// ARMv7-M 异常入口的压栈布局 (以异常入口时的 SP 为起点, 低地址在前):
+///
+/// ```text
+/// +0x00 r0  +0x04 r1  +0x08 r2  +0x0C r3
+/// +0x10 r12 +0x14 lr  +0x18 pc  +0x1C xpsr
+/// +0x20 s0  ...                   +0x5C s15
+/// +0x60 fpscr                     +0x64 reserved
+/// ```
+///
+/// `EXC_RETURN.bit4 == 0` 表示扩展帧 (含 FPU 上下文, 共 0x68 字节),
+/// **基本帧位于低地址、FP 上下文随后** (与 Cortex-M4F TRM / ARMv7-M ARM
+/// B3.3.2 一致); bit4 == 1 时仅有基本帧 (0x20 字节)。原始 SP 始终指向
+/// 基本帧的首字 r0。
 fn report_exception_frame(stacked_sp: u32, exc_return: u32, cfsr: u32) {
     write_fmt(format_args!(
         "  EXC_RETURN=0x{:08x}, 原始栈指针=0x{:08x}\r\n",
@@ -167,26 +176,30 @@ fn report_exception_frame(stacked_sp: u32, exc_return: u32, cfsr: u32) {
     }
 
     let extended = exc_return & EXC_RETURN_BASIC_FRAME == 0;
-    let extension_bytes = if extended { FP_EXTENSION_BYTES } else { 0 };
+    let total_bytes = if extended {
+        EXTENDED_BYTES
+    } else {
+        ef::BASIC_BYTES
+    };
     let raw = stacked_sp as usize;
-    let Some(frame_addr) = raw.checked_add(extension_bytes) else {
-        write_fmt(format_args!("  异常帧地址计算溢出, 跳过\r\n"));
-        return;
-    };
-    let Some(total_bytes) = extension_bytes.checked_add(BASIC_FRAME_BYTES) else {
-        write_fmt(format_args!("  异常帧长度计算溢出, 跳过\r\n"));
-        return;
-    };
     if !stack_range_is_readable(raw, total_bytes) {
         write_fmt(format_args!("  异常帧范围无效/未对齐, 跳过\r\n"));
         return;
     }
 
-    let mut words = [0u32; BASIC_FRAME_WORDS];
-    let frame = frame_addr as *const u32;
-    for (i, word) in words.iter_mut().enumerate() {
+    // 读原始压栈字 (首字 = 基本帧 r0; 扩展时拼接 FP 上下文), 交给
+    // 纯解码契约 (布局索引经主机回归测试锁定)。
+    let word_count = BASIC_WORDS + if extended { FP_WORDS } else { 0 };
+    let mut words = [0u32; BASIC_WORDS + FP_WORDS];
+    let frame = raw as *const u32;
+    for (i, word) in words[..word_count].iter_mut().enumerate() {
         *word = unsafe { core::ptr::read_volatile(frame.add(i)) };
     }
+    let Some(decoded) = try_decode(&words[..word_count], extended) else {
+        write_fmt(format_args!("  异常帧解码失败, 跳过\r\n"));
+        return;
+    };
+    let basic = decoded.basic;
     let stack_name = if exc_return & EXC_RETURN_USE_PSP != 0 {
         "PSP"
     } else {
@@ -195,12 +208,34 @@ fn report_exception_frame(stacked_sp: u32, exc_return: u32, cfsr: u32) {
     let frame_name = if extended { "extended FP" } else { "basic" };
     write_fmt(format_args!(
         "  异常帧 @0x{:08x} ({}，{}):\r\n    r0=0x{:08x} r1=0x{:08x} r2=0x{:08x} r3=0x{:08x}\r\n",
-        frame_addr, stack_name, frame_name, words[0], words[1], words[2], words[3]
+        raw, stack_name, frame_name, basic[0], basic[1], basic[2], basic[3]
     ));
     write_fmt(format_args!(
         "    r12=0x{:08x} lr=0x{:08x} pc=0x{:08x} xpsr=0x{:08x}\r\n",
-        words[4], words[5], words[6], words[7]
+        basic[4], basic[5], basic[6], basic[7]
     ));
+    if let Some(fp_regs) = decoded.fp {
+        write_fmt(format_args!(
+            "    s0 =0x{:08x} s1 =0x{:08x} s2 =0x{:08x} s3 =0x{:08x}\r\n",
+            fp_regs[0], fp_regs[1], fp_regs[2], fp_regs[3]
+        ));
+        write_fmt(format_args!(
+            "    s4 =0x{:08x} s5 =0x{:08x} s6 =0x{:08x} s7 =0x{:08x}\r\n",
+            fp_regs[4], fp_regs[5], fp_regs[6], fp_regs[7]
+        ));
+        write_fmt(format_args!(
+            "    s8 =0x{:08x} s9 =0x{:08x} s10=0x{:08x} s11=0x{:08x}\r\n",
+            fp_regs[8], fp_regs[9], fp_regs[10], fp_regs[11]
+        ));
+        write_fmt(format_args!(
+            "    s12=0x{:08x} s13=0x{:08x} s14=0x{:08x} s15=0x{:08x}\r\n",
+            fp_regs[12], fp_regs[13], fp_regs[14], fp_regs[15]
+        ));
+        write_fmt(format_args!(
+            "    fpscr=0x{:08x} reserved=0x{:08x}\r\n",
+            fp_regs[16], fp_regs[17]
+        ));
+    }
 }
 
 /// Cortex-M4/M4F 可生成的 EXC_RETURN 编码。

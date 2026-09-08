@@ -113,56 +113,78 @@ impl<D: BlockDevice> FileSystem<D> {
     /// empty snapshot is completely written and committed. Erase counters are
     /// monotonic across formats: the previous table is carried over and only
     /// the destination blocks are incremented.
+    ///
+    /// 与 [`mutate`] 相同的**坏块重试**: 首格式 (virgin 介质) 遇到坏死块时
+    /// 标记后换位重试 —— 否则坏块恰落在起始候选上时格式化永久失败
+    /// (坏块不可能自愈, 而首格式没有旧快照可回退; 实测复现)。
     pub fn format(mut device: D) -> Result<Self, Error<D::Error>> {
         let geometry = checked_geometry(&device)?;
         let previous = scan_active(&mut device, geometry)?;
-        let previous_wear = match previous {
-            Some(header) => read_wear_table(&mut device, &header)?,
+        let previous_wear = match &previous {
+            Some(header) => read_wear_table(&mut device, header)?,
             None => [0u16; MAX_WEAR_BLOCKS],
         };
-        // 饱和预防: 计数接近饱和时整体折半 (保留相对顺序与坏块标记)
-        let previous_wear = rescaled_wear(&previous_wear, geometry.block_count);
         let generation = previous
+            .as_ref()
             .map(|header| header.generation.wrapping_add(1))
             .unwrap_or(0);
         let table_size = wear_table_size(geometry.block_count);
         let span =
             checked_snapshot_span(table_size, geometry.block_size).ok_or(Error::InvalidGeometry)?;
-        let start_block = match &previous {
-            // 坏块被排除在候选之外; 无可用布局时报告空间不足
-            Some(active) => choose_start_block(active, span, &previous_wear, geometry.block_count)
-                .ok_or(Error::NoSpace)?,
-            None => 0,
-        };
-        let wear = incremented_wear(&previous_wear, start_block, span, geometry.block_count);
-        let mut table = [0u8; MAX_WEAR_TABLE_SIZE];
-        encode_wear_table(&wear, geometry.block_count, &mut table)
-            .map_err(|_| Error::InvalidGeometry)?;
-        let header = SnapshotHeader::new(
-            generation,
-            start_block,
-            table_size,
-            crc32_mpeg2(&table[..table_size as usize]),
-            0,
-            geometry,
-        )
-        .map_err(|_| Error::InvalidGeometry)?;
+        let block_count = geometry.block_count;
 
-        write_candidate(
-            &mut device,
-            &header,
-            previous.as_ref(),
-            Change::Clear,
-            &table[..table_size as usize],
-        )
-        .map_err(map_commit_error)?;
-        Ok(Self {
-            device,
-            geometry,
-            active: header,
-            recovery_required: false,
-            wear,
-        })
+        // 提交循环: 坏块重试 + 动态磨损均衡。有旧快照时经
+        // `choose_start_block` 避开其占位并选最轻磨损位; 首格式时从首个
+        // 不含坏块的候选起。
+        let mut wear = rescaled_wear(&previous_wear, block_count);
+        for _attempt in 0..MAX_COMMIT_ATTEMPTS {
+            let start_block = match &previous {
+                Some(active) => choose_start_block(active, span, &wear, block_count),
+                None => choose_virgin_start(span, &wear, block_count),
+            };
+            let Some(start_block) = start_block else {
+                break; // 坏块过多: 无可用布局
+            };
+            let incremented = incremented_wear(&wear, start_block, span, block_count);
+            let mut table = [0u8; MAX_WEAR_TABLE_SIZE];
+            encode_wear_table(&incremented, block_count, &mut table)
+                .map_err(|_| Error::InvalidGeometry)?;
+            let header = SnapshotHeader::new(
+                generation,
+                start_block,
+                table_size,
+                crc32_mpeg2(&table[..table_size as usize]),
+                0,
+                geometry,
+            )
+            .map_err(|_| Error::InvalidGeometry)?;
+
+            match write_candidate(
+                &mut device,
+                &header,
+                previous.as_ref(),
+                Change::Clear,
+                &table[..table_size as usize],
+            ) {
+                Ok(()) => {
+                    return Ok(Self {
+                        device,
+                        geometry,
+                        active: header,
+                        recovery_required: false,
+                        wear: incremented,
+                    });
+                }
+                Err(CommitError::Block { block, .. }) => {
+                    // 该块擦除/编程失败: 标记坏块 (RAM), 换位置重试。
+                    // 未提交的候选不可见, 换位安全 (旧快照未动)。
+                    wear = incremented;
+                    mark_bad(&mut wear, block);
+                }
+                Err(CommitError::Fatal(error)) => return Err(error),
+            }
+        }
+        Err(Error::NoSpace)
     }
 
     /// Return the owned device. Use this before remounting after an I/O error.
@@ -1634,19 +1656,33 @@ fn rescaled_wear(wear: &[u16; MAX_WEAR_BLOCKS], block_count: u32) -> [u16; MAX_W
     next
 }
 
+/// 无旧快照 (首格式) 时的首个可行候选起点: 依次找第一个完全不含
+/// 坏块的连续 `span` 块运行。全为坏块 (或坏块过多) 时返回 `None`。
+fn choose_virgin_start(span: u32, wear: &[u16; MAX_WEAR_BLOCKS], block_count: u32) -> Option<u32> {
+    let mut start = 0;
+    while start < block_count {
+        let mut bad = false;
+        let mut index = 0;
+        while index < span {
+            if wear[((start + index) % block_count) as usize] & WEAR_BAD_BIT != 0 {
+                bad = true;
+                break;
+            }
+            index += 1;
+        }
+        if !bad {
+            return Some(start);
+        }
+        start += 1;
+    }
+    None
+}
+
 /// 标记坏块 (仅内存; 随下一次成功提交的磨损表持久化)。
 ///
 /// 被标记块不再作为快照放置候选; 无重映射 —— 跳过即"管理"。
 fn mark_bad(wear: &mut [u16; MAX_WEAR_BLOCKS], block: u32) {
     wear[block as usize] |= WEAR_BAD_BIT;
-}
-
-/// CommitError → Error (format 等单次提交路径用)
-fn map_commit_error<E>(error: CommitError<E>) -> Error<E> {
-    match error {
-        CommitError::Block { error, .. } => Error::Device(error),
-        CommitError::Fatal(error) => error,
-    }
 }
 
 /// Read the active snapshot's per-block erase table.

@@ -20,6 +20,7 @@ mod peripherals;
 // ---- 内核基础设施 ----
 mod arch; // CPU 架构原语 facade (PRIMASK / WFI / DSB / 系统复位)
 mod critical_section; // PRIMASK 临界区 + 中断上下文检测 (ISR 误用防护)
+mod exception_frame; // ARMv7-M 异常压栈帧纯解码契约 (与 lib 同源, 主机回归单测)
 mod heap; // 全局堆分配器适配层 (临界区 + 链接脚本边界, 状态机见 lib)
 mod heap_layout; // 堆分配布局规划 + TLSF 尺寸级映射 (纯逻辑, 主机测试)
 mod heap_tlsf; // TLSF 两级隔离状态机 (与 lib 同源, 主机压力测试)

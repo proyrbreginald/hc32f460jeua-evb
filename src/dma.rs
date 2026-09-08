@@ -596,13 +596,17 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
     }
 
     /// 等待其他通道传输结束 (CHEN 写前置条件, 2ms 墙钟超时)。
+    ///
+    /// 判定源为 **CHEN 使能位** (对齐 DDL `DMA_ChCmd`: 写 CHEN 前等待
+    /// 其他通道的 CHEN 位清零)。通道"已使能但等待外设触发"时
+    /// `CHSTAT.CHACT` 可能为 0 而 CHEN 仍置位 —— 按 CHACT 判定会放行
+    /// 被硬件忽略的写入。超时时钟经 DWT 周期计数 (与 RTOS 节拍解耦,
+    /// 调度器启动前同样有效)。
     fn wait_other_channels_idle(&self) -> Result<(), DmaError> {
-        let own_bit = 1 << (16 + CH);
-        let mask = CHSTAT_CHACT;
-        let start = crate::rtos::uptime_ms();
-        while self.unit_reg(CHSTAT).read() & mask & !own_bit != 0 {
-            // 墙钟截止 (毫秒, 与节拍频率解耦, 回绕安全)
-            if crate::rtos::uptime_ms().wrapping_sub(start) >= 2 {
+        let mask = 0x0Fu32 & !(1u32 << (CH as u32));
+        let start = crate::arch::cycles_now();
+        while self.unit_reg(CHEN).read() & mask != 0 {
+            if elapsed_us_since(start) >= 2_000 {
                 return Err(DmaError::ChannelBusy);
             }
         }
@@ -649,18 +653,19 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
 
     /// 阻塞等待传输完成 (轮询 TC 标志, 墙钟超时)。
     ///
-    /// 截止时间取自单调毫秒时钟 ([`crate::rtos::uptime_ms`], 与循环
-    /// 速度及节拍频率无关, 回绕安全)。返回 true = 传输完成 (TC 置位);
-    /// false = 超时。超时后应检查 [`Dma::error_pending`] 区分错误与硬件
-    /// 停滞, 并 [`Dma::disable`] 中止残留传输。
+    /// 截止时间取自 DWT 周期计数 (见 [`elapsed_us_since`], 与 RTOS 节拍
+    /// 解耦, 调度器启动前同样有效, 回绕安全)。返回 true = 传输完成
+    /// (TC 置位); false = 超时。超时后应检查 [`Dma::error_pending`]
+    /// 区分错误与硬件停滞, 并 [`Dma::disable`] 中止残留传输。
+    ///
+    /// 注意: 超时值应远小于 DWT 32 位回绕周期 (200MHz 下约 21.5s)。
     pub fn wait_done(&self, timeout_us: u32) -> bool {
-        let timeout_ms = (u64::from(timeout_us)).div_ceil(1000) as u32;
-        let start = crate::rtos::uptime_ms();
+        let start = crate::arch::cycles_now();
         loop {
             if self.tc_pending() {
                 return true;
             }
-            if crate::rtos::uptime_ms().wrapping_sub(start) >= timeout_ms {
+            if elapsed_us_since(start) >= timeout_us {
                 return false;
             }
         }
@@ -984,7 +989,7 @@ pub fn uart_tx_try<const U: u8>(bytes: &[u8]) -> bool {
     {
         dma.clear_tc();
         // 启动边沿: 空闲 → TE 停 → 使能通道 → TE 起 (见函数文档)
-        if uart.dma_tx_arm(UART_TX_ARM_TIMEOUT_MS, crate::rtos::uptime_ms) {
+        if uart.dma_tx_arm(UART_TX_ARM_TIMEOUT_MS, monotonic_ms) {
             if dma.enable().is_ok() {
                 uart.dma_tx_fire();
                 // 超时 = 波特率耗时 ×2 + 1ms 余量 (u64 防长包溢出; 墙钟
@@ -1067,4 +1072,24 @@ pub fn copy_try(src: &[u8], dst: &mut [u8]) -> bool {
 /// copy_try 回退计数 (诊断用)。
 pub fn copy_fallback_count() -> u32 {
     COPY_FALLBACKS.load(Ordering::Relaxed)
+}
+
+// ============================== 单调时钟 (与 RTOS 节拍解耦) ==============================
+
+/// 自 `start` (CYCCNT) 起的微秒数。
+///
+/// 按当前 HCLK 换算周期数; DWT 与 SysTick/调度器无关, 启动阶段
+/// (单执行流) 同样有效, 差值回绕安全。仅用于毫秒/微秒级超时窗口
+/// (须远小于 DWT 32 位回绕周期: 200MHz 下约 21.5s)。
+fn elapsed_us_since(start: u32) -> u32 {
+    let hz = crate::clk::hclk_hz().max(1);
+    (u64::from(crate::arch::cycles_now().wrapping_sub(start)) * 1_000_000 / u64::from(hz)) as u32
+}
+
+/// 单调毫秒时钟 (DWT 按 HCLK 换算; 语义同 [`crate::rtos::uptime_ms`] 的
+/// 差分用法, 但调度器启动前同样有效)。供外部注入 [`crate::uart`]
+/// 的等待时钟使用。
+pub fn monotonic_ms() -> u32 {
+    let hz = crate::clk::hclk_hz().max(1);
+    (u64::from(crate::arch::cycles_now()) * 1_000 / u64::from(hz)) as u32
 }

@@ -6,6 +6,7 @@
 extern crate alloc;
 
 pub mod can_timing;
+pub mod exception_frame;
 pub mod heap_layout;
 pub mod heap_tlsf;
 pub mod logfile_core;

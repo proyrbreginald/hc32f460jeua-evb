@@ -9,7 +9,8 @@
 //! 条目经句柄 [`EntryMark`] 增量构建: [`begin_entry`] 预留长度头 →
 //! [`append_to_entry`] 逐块追加 (空间不足时**截断保存已写部分**,
 //! 不丢弃整条) → [`commit_entry`] 回填长度。`writing` 标记在提交前置位,
-//! 排空操作会等待其清除, 避免读到半成品条目。
+//! 排空前须经 [`wait_writer_idle`] 等待其清除 (在临界区**外**执行,
+//! 见 [`drain_into`] 的前置条件), 避免读到半成品条目。
 //!
 //! 超长条目 (单条超过缓冲容量) 在 `begin` 阶段因无空间被整体放弃。
 //!
@@ -69,6 +70,12 @@ pub struct EntryMark {
 impl<const CAP: usize> LogRing<CAP> {
     /// 空缓冲
     pub const fn new() -> Self {
+        // 长度头为 u16 (bit15 = 截断标记): 容量超过 15 位会静默截断
+        // (常量求值时即触发编译错误, 而非运行期数据损坏)
+        assert!(
+            CAP <= LEN_MASK as usize,
+            "logring 容量超过长度头位宽 (15 位)"
+        );
         Self {
             buf: [0; CAP],
             head: 0,
@@ -221,8 +228,17 @@ impl<const CAP: usize> LogRing<CAP> {
         self.writing.store(false, Ordering::Release);
     }
 
-    /// 等待进行中的条目提交 (排空前置条件; 有界轮询, 不依赖临界区)
-    fn wait_writer_idle(&self) -> bool {
+    /// 是否正在进行条目构建 (原子查询, 临界区内可用, 不自旋)。
+    pub fn is_writing(&self) -> bool {
+        self.writing.load(Ordering::Relaxed)
+    }
+
+    /// 等待进行中的条目提交 (排空前置条件; 有界轮询, 原子标志)。
+    ///
+    /// **不得在关中断临界区内调用**: 单核下写者线程无法推进, 等待只能
+    /// 跑满自旋。板上由调用方 (`crate::log`) 在临界区**外**执行;
+    /// 进入临界区后改用 [`is_writing`] 做单次判定。
+    pub fn wait_writer_idle(&self) -> bool {
         for _ in 0..10_000 {
             if !self.writing.load(Ordering::Acquire) {
                 return true;
@@ -233,13 +249,16 @@ impl<const CAP: usize> LogRing<CAP> {
 
     /// 把所有条目拷入 `out` (每条末尾补 `\n`), 然后清空缓冲。
     ///
-    /// 若存在进行中的条目 (增量写入), 有界等待其提交后读取; 极端情况
-    /// 下仍未提交则放弃本轮 (返回 0), 保证不读到半成品。
+    /// # 前置条件
+    ///
+    /// 调用前须确认**无进行中的条目**: 板上由调用方先经
+    /// [`wait_writer_idle`] 在临界区外等待; 调试构建以断言强制。
     /// 返回拷贝的字节数 (含换行符与损耗标记)。
     pub fn drain_into(&mut self, out: &mut alloc::vec::Vec<u8>) -> usize {
-        if !self.wait_writer_idle() {
-            return 0;
-        }
+        debug_assert!(
+            !self.is_writing(),
+            "排空须先等待无进行中条目 (临界区外 wait_writer_idle)"
+        );
         self.drain_locked_limited(out, usize::MAX)
     }
 
@@ -247,23 +266,26 @@ impl<const CAP: usize> LogRing<CAP> {
     /// 放不下的条目保留待下轮。`limit` 为本次可追加的字节上限
     /// (含换行符与标记; 单条超限时不截断、不取出)。
     ///
-    /// 同样有界等待进行中的条目; 返回拷贝的字节数 (0 = 无待排或
-    /// 首条放不下)。
+    /// 前置条件同上 (无进行中的条目)。返回拷贝的字节数
+    /// (0 = 无待排或首条放不下)。
     pub fn drain_into_limited(&mut self, out: &mut alloc::vec::Vec<u8>, limit: usize) -> usize {
-        if !self.wait_writer_idle() {
-            return 0;
-        }
+        debug_assert!(
+            !self.is_writing(),
+            "排空须先等待无进行中条目 (临界区外 wait_writer_idle)"
+        );
         self.drain_locked_limited(out, limit)
     }
 
     /// 无条件排空首条 (含前置损耗标记, 不受 `limit` 约束)。
     ///
     /// 供"超长条目独占一段"场景使用 (落盘轮转时首条比整个段还长,
-    /// 限量排空永远为 0, 必须强制取出保证进度)。返回拷贝的字节数。
+    /// 限量排空永远为 0, 必须强制取出保证进度)。前置条件同上。
+    /// 返回拷贝的字节数。
     pub fn drain_oldest_entry(&mut self, out: &mut alloc::vec::Vec<u8>) -> usize {
-        if !self.wait_writer_idle() {
-            return 0;
-        }
+        debug_assert!(
+            !self.is_writing(),
+            "排空须先等待无进行中条目 (临界区外 wait_writer_idle)"
+        );
         let mut copied = self.emit_drop_marker(out);
         if self.len == 0 {
             return copied;
@@ -483,16 +505,19 @@ mod tests {
     }
 
     #[test]
-    fn drain_waits_for_inflight_entry() {
-        // 增量条目进行中: 排空应等待提交后再读, 不读到半成品
+    fn wait_writer_idle_then_drain_committed_entry() {
+        // 增量条目进行中: 等待接口应失败 (有界); 提交后等待成功再排空,
+        // 不读到半成品。排空接口本身要求"无进行中条目"为前置条件
+        // (等待只能在临界区外执行, 见模块文档)。
         let mut ring = LogRing::<64>::new();
         let mut mark = ring.begin_entry().expect("begin 失败");
         ring.append_to_entry(&mut mark, b"in-flight");
-        // 模拟另一线程调用排空 (writing 已置位)
-        let mut out = Vec::new();
-        let n = ring.drain_into(&mut out);
-        assert_eq!(n, 0);
+        assert!(ring.is_writing());
+        assert!(!ring.wait_writer_idle());
         ring.commit_entry(&mark);
+        assert!(!ring.is_writing());
+        assert!(ring.wait_writer_idle());
+        let mut out = Vec::new();
         assert_eq!(ring.drain_into(&mut out), 10);
         assert_eq!(out, b"in-flight\n");
     }

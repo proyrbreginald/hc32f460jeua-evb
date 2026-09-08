@@ -20,7 +20,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TARGET="thumbv7em-none-eabihf"
-HOST_TARGET="x86_64-unknown-linux-gnu"
+# 主机测试目标: 从工具链探测 (aarch64/macOS 等宿主机同样可用)
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 QUICK="${1:-}"
 
 step() { printf '\n==> %s\n' "$*"; }

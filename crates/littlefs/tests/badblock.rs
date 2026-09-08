@@ -108,6 +108,39 @@ fn wear_rescale_preserves_order_and_bad_flags() {
     assert_eq!(fs.device().erase_counts()[3], 0);
 }
 
+/// 首格式块 0 坏死: 格式化必须标记坏块并换位重试成功 (旧实现永远选
+/// start=0 且无重试, virgin 设备首块坏死时格式化永久失败 —— 实测复现)。
+#[test]
+fn first_format_survives_dead_block_zero() {
+    let device = RamNor::new(BLOCK_SIZE, BLOCK_COUNT);
+    device.arm_dead_block(0);
+
+    let mut fs = FileSystem::format(device).unwrap();
+    // 空快照位于某有效块 (0 已标记坏, 且永不被擦除)
+    assert_eq!(fs.device().erase_counts()[0], 0, "坏块不应被擦除");
+    fs.write("state", b"v1").unwrap();
+    assert_eq!(read_all(&mut fs, "state").unwrap(), b"v1");
+
+    // 坏标记已持久化: 重挂载后继续格式化/写入仍成功
+    let device = fs.into_device();
+    let mut fs = FileSystem::mount(device).unwrap();
+    fs.write("state", b"v2").unwrap();
+    assert_eq!(read_all(&mut fs, "state").unwrap(), b"v2");
+}
+
+/// 全部候选块坏死: 首格式返回 NoSpace, 而不是永久卡在坏块上。
+#[test]
+fn first_format_all_blocks_dead_returns_no_space() {
+    let device = RamNor::new(BLOCK_SIZE, BLOCK_COUNT);
+    for block in 0..BLOCK_COUNT {
+        device.arm_dead_block(block);
+    }
+    assert!(matches!(
+        FileSystem::format(device),
+        Err(Error::<RamError>::NoSpace)
+    ));
+}
+
 fn alloc(seed: u32) -> Vec<u8> {
     (0..64).map(|index| (index * 31 + seed * 7) as u8).collect()
 }

@@ -154,10 +154,14 @@ CFG_LOG_COLOR = "true"  # 控制台 ANSI 颜色 (false=纯文本; 落盘文件�
 
 # [logfile] 日志自动保存到 /log/ (shell `log file on|off` 可运行时切换)
 CFG_LOG_FILE_ENABLE = "true"   # 落盘开关
-CFG_LOG_RING = "4096"          # RAM 日志缓冲 (字节; 满时丢最旧, 掉电丢失)
+CFG_LOG_RING = "16384"         # RAM 日志缓冲 (字节; 满时丢最旧, 掉电丢失)
 CFG_LOG_FILE_MAX = "4096"      # 单个日志文件上限 (字节; 超出则写入下一段文件)
 CFG_LOG_FILE_SLOTS = "4"       # 保留的日志文件数 (boot_<序号>[_<段号>].log)
-CFG_LOG_FLUSH_MS = "2000"      # 落盘线程刷新间隔 (毫秒; 越小越费 Flash)
+# 快照文件系统每次提交都重写整个快照并回收旧扇区 (含擦除), 刷新间隔
+# 即提交频率: 持续打日志时 2s 间隔约 5.4k~10.8k 次擦除/扇区/天 (数据手册
+# 表 3-56 最小 10k 次), 30s 间隔约 360~720 次/扇区/天。掉电丢失窗口
+# = 刷新间隔 + RAM 缓冲 (非 reboot 路径), 按现场可容忍度折中。
+CFG_LOG_FLUSH_MS = "30000"     # 落盘线程刷新间隔 (毫秒; 越小越费 Flash)
 CFG_APP_LOGFILE_STACK = "8192" # 落盘线程栈 (与 shell 同级: 文件系统写 + 格式化较深)
 CFG_APP_LOGFILE_PRIORITY = "3" # 低于 shell(1)/led(2), 高于 idle(31)
 CFG_APP_LOGFILE_TIMESLICE = "10"

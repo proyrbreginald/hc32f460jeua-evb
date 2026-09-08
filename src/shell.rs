@@ -1622,6 +1622,17 @@ fn read_line(
     // 命令执行期间提前输入，期间发生的硬件错误或软件环溢出也不会在
     // 新提示符出现时被清掉；受影响的下一行会被完整拒绝。
     let mut line = alloc::string::String::new();
+    // 行缓冲上限即 `max`: 一次预留, 后续增长不再触发堆分配。
+    // 预留失败 (堆紧张/碎片化) 时优雅返回"溢出"输入, 调用方整行拒绝
+    // (与项目其他路径的 try_reserve 纪律一致, 不 panic=abort 复位)。
+    if line.try_reserve(max).is_err() {
+        return InputLine {
+            text: line,
+            overflowed: true,
+            non_ascii: false,
+            rx_corrupted: false,
+        };
+    }
     let mut overflow = 0usize;
     let mut non_ascii = false;
     let mut history_offset = None;

@@ -5,7 +5,8 @@
 # 第一个参数为 cargo 构建产物路径 (无扩展名)。
 #
 # 用法:
-#   cargo run # 等价于: cargo run --release (构建 + 烧录)
+#   cargo run          # 构建 (默认 debug 配置) + 烧录
+#   cargo run --release # 构建 release (按配置裁剪) + 烧录
 #
 # 可选环境变量:
 #   PYOCD_PROBE   调试器 ID (等价于 pyocd 的 -u 参数, 缺省时自动选择)
@@ -45,5 +46,5 @@ if [[ -n "${FLASH_DRY_RUN:-}" ]]; then
     exit 0
 fi
 
-echo "==> 烧录 ${ELF_ELF}"
+echo "==> 烧录 ${ELF_ELF} (构建产物为 debug 配置, 生产请用 cargo run --release)"
 "${PYOCD_BIN}" flash "${PROBE_ARGS[@]}" --target "${TARGET}" "${ELF_ELF}"
