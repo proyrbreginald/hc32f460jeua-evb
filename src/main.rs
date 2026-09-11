@@ -174,18 +174,28 @@ pub(crate) fn main() -> ! {
         resources.system_clock_hz() / 1_000_000
     );
 
+    // 启动完成指示: SUCCESS 常亮, ERROR 熄灭 (此前的上电/初始化故障会
+    // 在对应路径点亮 ERROR; 心跳由 LED 线程翻转 WORK)
+    resources.indicate_boot_ok();
+
+    // 板载外部硬件看门狗 (CFG_HWDT_ENABLE): 使能 + 首次喂狗 + 创建喂狗线程。
+    // **放在启动最后一步**: 使能后到喂狗线程首次运行之间的窗口必须远小于
+    // CFG_HWDT_FEED_MS (横幅与日志输出可能耗时数百 ms)。
+    resources.start_hardware_watchdog();
+
     // 启动调度器, 永不返回
     rtos::start();
 }
 
 // ---- 演示线程 ----
 
-/// LED 线程: 每 500ms 翻转一次 (周期来自配置, 由线程调度而非中断分频)
+/// LED 线程: WORK 心跳, 每 CFG_APP_LED_BLINK_MS 翻转一次
+/// (周期来自配置, 由线程调度而非中断分频)
 extern "C" fn led_thread(_param: usize) {
     loop {
-        board::BoardResources::get().toggle_led();
+        board::BoardResources::get().toggle_led(board::Led::Work);
         // debug 级: 默认阈值 (info) 不输出, 可经 `log level debug` 打开
-        log_debug!("LED 翻转, uptime = {} ms", rtos::uptime_ms());
+        log_debug!("LED WORK 翻转, uptime = {} ms", rtos::uptime_ms());
         rtos::thread_delay_ms(config::APP_LED_BLINK_MS).expect("LED 延时必须在线程上下文");
     }
 }

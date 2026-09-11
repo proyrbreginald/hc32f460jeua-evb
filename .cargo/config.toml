@@ -18,17 +18,22 @@ CFG_CORE = "Cortex-M4F"
 CFG_HRC_FREQ = "16"
 # HRC 复位后是否停止 (ICG1.HRCSTOP): true=停止 (需 clk::hrc_cmd 启动,
 # 默认安全) / false=持续振荡 (复位即运行, 无需 hrc_cmd)
-CFG_HRC_STOP = "false"
+CFG_HRC_STOP = "true"
 # [clk] 外部晶振频率 (4~25MHz)
-CFG_XTAL_HZ = "8000000"
+CFG_XTAL_HZ = "12000000"
 # XTAL 起振配置: 稳定时间 1~9 (≈133µs~32ms, 5=2ms) / 驱动 ulow|low|mid|high
+# (RM 4.11.1 建议: 4~8MHz=ulow, 8~16MHz=low, 16~20MHz=mid, 20~25MHz=high)
 CFG_XTAL_STABLE_TIME = "5"
-CFG_XTAL_DRV = "ulow"
-CFG_XTAL_SUPDRV = "true"    # 超强驱动 (评估板默认开启, 对齐 DDL CLK_XTAL_SUPDRV_ON)
+CFG_XTAL_DRV = "low"
+CFG_XTAL_SUPDRV = "true"    # 起振期超强驱动 (稳定后硬件自动关闭, 不影响功耗)
 # MPLL 倍频分频 (PLLCLK = src ÷(m+1) ×(n+1) ÷(p+1); src: 0=XTAL, 1=HRC)
-CFG_PLL_SRC = "1"
-CFG_PLL_M = "1"
-CFG_PLL_N = "49"
+# 12MHz XTAL 方案: M=2 → 4MHz 输入, N=99 → VCO 400MHz, P=1 → 系统 200MHz
+# (VCO 240~480MHz、输入 1~25MHz 编译期校验)。12MHz 不能直跑系统时钟:
+# CANCLK 固定为 XTAL, 硬件要求 EXCLK ≥ 1.5×CANCLK(18MHz), 而 EXCLK 由
+# 系统时钟分频得到, 故系统时钟必须 ≥18MHz。
+CFG_PLL_SRC = "0"
+CFG_PLL_M = "2"
+CFG_PLL_N = "99"
 CFG_PLL_P = "1"
 CFG_PLL_Q = "1"
 CFG_PLL_R = "1"
@@ -53,11 +58,13 @@ CFG_PRIORITY_MAX = "32"
 CFG_IDLE_PRIORITY = "31"
 CFG_IDLE_STACK = "1024"
 
-# [uart] 控制台 USART: 单元 (1~4) / 引脚复用 (PA9=TX FSEL32, PA10=RX FSEL33)
-CFG_UART_UNIT = "1"
-CFG_UART_TX_PIN = "9"
+# [uart] 控制台 USART: 单元 (1~4) / 引脚复用
+# 本板: PC13 = USART3_TX, PH2 = USART3_RX (两者都是 Func_Grp2 引脚;
+# 数据手册表 2-2 中 Grp2 的 Func32/33 = USART3_TX/RX; 端口固定在 board.rs)
+CFG_UART_UNIT = "3"
+CFG_UART_TX_PIN = "13"
 CFG_UART_TX_FSEL = "32"
-CFG_UART_RX_PIN = "10"
+CFG_UART_RX_PIN = "2"
 CFG_UART_RX_FSEL = "33"
 CFG_UART_BAUDRATE = "115200"
 CFG_UART_OVERSAMPLE = "8"       # 8 或 16
@@ -90,27 +97,27 @@ CFG_DMA_COPY_CHANNEL = "0"           # 大块拷贝 DMA 通道 (0~3)
 CFG_DMA_COPY_MIN = "256"             # 触发 DMA 整块拷贝的最小长度 (字节)
 
 # [can] HC32F460 单路经典 CAN 2.0B
-# 本板仅将 PB7(TX)/PB6(RX) 引到 JP2，没有板载 CAN 收发器；正常模式需外接 PHY。
+# 本板 CAN 引脚 PB9(TX)/PB8(RX) 直接引出，没有板载 CAN 收发器；正常模式需外接 PHY。
 # CANCLK 固定为 XTAL；编译期校验 EXCLK>=1.5*CANCLK、<=1Mbit/s 位时序，
 # 且按 RM 建议不使用 SBT.PRESC=0 (实际预分频 1)。
 #
-# 1 Mbit/s @ 8MHz XTAL: 位时间只能是 8 个 CANCLK, 搜索结果为 PRESC=2、
-# SEG1=3、SEG2=1、SJW=1 (共 4 TQ, 采样点 75%, 误差 0ppm)。SJW 必须为 1:
-# SEG2 >= SJW 且 SEG1 >= SEG2+1, SJW=2 时一位至少 5 TQ, 无法整除 8 个
-# CANCLK, 位时序搜索失败并在编译期报错。1 Mbit/s 总线长度上限约 40m
-# (ISO 11898-2), 两端各 120Ω 终端; 采样点与 SJW 需与总线对端一致。
+# 1 Mbit/s @ 12MHz XTAL: 一位恰好 12 个 CANCLK, 搜索结果为 PRESC=3、SEG1=3、
+# SEG2=1、SJW=1 (共 4 TQ = 1µs, 采样点 75%, 误差 0ppm)。SJW=1 是 75% 采样点
+# 的前提: SJW=2 时 SEG2 ≥ 2、一位至少 5 TQ, 无法整除 12 个 CANCLK (只能退到
+# PRESC=2/6 TQ/66.7%)。1 Mbit/s 总线长度上限约 40m (ISO 11898-2), 两端各
+# 120Ω 终端; 采样点与 SJW 需与总线对端一致。
 CFG_CAN_ENABLE = "true"                 # true: 启动时初始化应用 CAN, 并编译 shell `can` 测试命令
                                          # (关闭时 CAN 驱动与 `can` 命令都不参与链接, 省 ~11.5 KiB)
 CFG_CAN_SELFTEST_ENABLE = "true"         # selftest/soak 的 CAN 内部回环项 (应用 CAN
                                          # 占用控制器时自动接管, 结束后按原模式恢复)
-CFG_CAN_TX_PIN = "7"                     # PortB Func_Grp2，默认 PB7 Func50
+CFG_CAN_TX_PIN = "9"                     # PortB Func_Grp2，PB9 Func50 = CAN_TxD
 CFG_CAN_TX_FSEL = "50"
-CFG_CAN_RX_PIN = "6"                     # PortB Func_Grp2，默认 PB6 Func51
+CFG_CAN_RX_PIN = "8"                     # PortB Func_Grp2，PB8 Func51 = CAN_RxD
 CFG_CAN_RX_FSEL = "51"
 CFG_CAN_BITRATE = "1000000"              # 1 Mbit/s (经典 CAN 上限)
 CFG_CAN_SAMPLE_POINT_PERMILLE = "750"    # 750 = 75.0%
 CFG_CAN_SJW = "1"                        # 1~8 TQ，且不大于 TimeSeg2
-                                         # (8MHz XTAL 下 1Mbit/s 必须为 1, 见上方说明)
+                                         # (见上方 1Mbit/s 位时序说明)
 CFG_CAN_MAX_BITRATE_ERROR_PPM = "10000"  # 10000 = 1%
 CFG_CAN_MODE = "normal"                  # normal|silent|internal-loopback|external-loopback|external-loopback-silent
 CFG_CAN_PTB_SINGLE_SHOT = "false"        # false = 自动重发
@@ -127,9 +134,12 @@ CFG_CAN_FILTER_MASK = "0x1FFF_FFFF"       # 默认接受全部 ID
 CFG_CAN_FILTER_TYPE = "both"              # both|standard|extended
 CFG_CAN_TIMEOUT_MS = "100"
 
-# [gpio] 板载 LED (PC13)
-CFG_LED_PIN = "13"
-CFG_LED_LEVEL = "high" # high / low
+# [gpio] 板载 LED (PortB 固定在 board.rs; 三者都是高电平点亮)
+# WORK=运行心跳, SUCCESS=启动完成, ERROR=panic/fault 或自检/soak 失败
+CFG_LED_WORK_PIN = "12"      # PB12 = LED_WORK
+CFG_LED_SUCCESS_PIN = "14"   # PB14 = LED_SUCCESS
+CFG_LED_ERROR_PIN = "13"     # PB13 = LED_ERROR
+CFG_LED_ACTIVE_LEVEL = "high" # high = 高电平点亮 / low = 低电平点亮
 
 # [shell] 终端登录 (改密码无需改代码)
 CFG_SHELL_USERNAME = "root"
@@ -191,11 +201,26 @@ CFG_TEST_REPORT_SLOTS = "1"
 # [rtc] 实时时钟 (LRC 源), 同时作为日志时间戳 (天:时:分:秒)
 CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
 
-# [wdt] 硬件看门狗 (最高优先级 supervisor 周期喂狗; 调试期建议关闭)
+# [wdt] MCU **内部**看门狗 (最高优先级 supervisor 周期喂狗; 调试/烧录期建议关闭)
+# 注意: 内部 WDT 在调试器停机期间继续计数, 长时间擦除会被它复位打断烧录。
 CFG_WDT_ENABLE = "true"
 CFG_WDT_STACK = "512"
 CFG_WDT_PRIORITY = "0"
 CFG_WDT_FEED_MS = "500"
+
+# [hwdt] 板载**外部**硬件看门狗 (与上面的内部 WDT 相互独立, 需主控主动喂)
+# 硬件语义: PB4 输出高电平禁用 / 低电平使能; 使能期间 PB5 必须在 1s 周期内
+# 给出一次电平跳变 (喂狗), 否则外部看门狗复位主控。上电后 PB4 为输入态,
+# 板载看门狗默认处于使能状态, 因此启动阶段会**先把 PB4 拉高禁用**再决定。
+# false = 启动即禁用且不创建喂狗线程 (烧录/调试必须;
+#         调试器停机时无法喂狗, 使能状态下会不断复位导致烧录失败);
+# true  = 启动即使能并创建喂狗线程 (产品部署)。
+CFG_HWDT_ENABLE = "false"
+CFG_HWDT_ENABLE_PIN = "4"    # PB4 使能控制 (高=禁用, 低=使能)
+CFG_HWDT_FEED_PIN = "5"      # PB5 喂狗 (每次喂狗翻转一次电平)
+CFG_HWDT_FEED_MS = "1000"    # 喂狗周期 (硬件要求 ≤1000ms; 余量不足可用 500)
+CFG_HWDT_STACK = "512"       # 喂狗线程栈
+CFG_HWDT_PRIORITY = "0"      # 喂狗线程优先级 (须高于所有应用线程)
 
 # [mpu] 内存保护单元 (FLASH 只读 + SRAM/外设 XN + 线程栈守卫, 默认开启)
 CFG_MPU_ENABLE = "true"

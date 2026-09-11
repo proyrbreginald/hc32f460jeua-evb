@@ -11,7 +11,6 @@
 
 use crate::can;
 use crate::clk;
-use crate::gpio;
 use crate::uart;
 
 // ============================== 编译期解析工具 ==============================
@@ -225,7 +224,12 @@ pub const PLL_N: u32 = parse_u32(env!("CFG_PLL_N"));
 pub const PLL_P: u32 = parse_u32(env!("CFG_PLL_P"));
 pub const PLL_Q: u32 = parse_u32(env!("CFG_PLL_Q"));
 pub const PLL_R: u32 = parse_u32(env!("CFG_PLL_R"));
-const _: () = assert!(PLL_SRC <= 1, "CFG_PLL_SRC 非法 (可用 0/1)");
+// PLL 源只能是 XTAL(0) / HRC(1); 用 match 而非比较, 避免常量配置下
+// 触发 clippy 的 absurd_extreme_comparisons
+const _: () = match PLL_SRC {
+    0 | 1 => {}
+    _ => panic!("CFG_PLL_SRC 非法 (可用 0/1)"),
+};
 // ---- MPLL 参数编译期校验 (对齐 DDL: 位宽 + VCO 输入/输出范围) ----
 /// 位宽与有效倍频/分频范围 (寄存器值+1 才是实际值: N→20~480, P/Q/R→2~16)
 const fn assert_pll_width(m: u32, n: u32, p: u32, q: u32, r: u32) {
@@ -335,6 +339,23 @@ pub const UART_TX_FSEL: u8 = parse_u8(env!("CFG_UART_TX_FSEL"));
 /// RX 引脚号 / 功能号 (CFG_UART_RX_PIN / CFG_UART_RX_FSEL)
 pub const UART_RX_PIN: u8 = parse_u8(env!("CFG_UART_RX_PIN"));
 pub const UART_RX_FSEL: u8 = parse_u8(env!("CFG_UART_RX_FSEL"));
+// 本板控制台复用固定在 board.rs: TX=PortC, RX=PortH (PC13/PH2 都是 Func_Grp2
+// 引脚)。按数据手册表 2-2, Grp2 的 USART3 = Func32/33、USART4 = Func36/37,
+// 单元号与功能号必须成对匹配, 否则会把引脚配到别的外设功能上。
+const _: () = assert!(
+    (UART_UNIT == 3 && UART_TX_FSEL == 32 && UART_RX_FSEL == 33)
+        || (UART_UNIT == 4 && UART_TX_FSEL == 36 && UART_RX_FSEL == 37),
+    "CFG_UART_UNIT/FSEL 必须成对: USART3=Func32/33 或 USART4=Func36/37 (Func_Grp2)"
+);
+// JEUA (LQFP64) 引脚表: PortC 只有 PC13~PC15, PortH 只有 PH0~PH2
+const _: () = assert!(
+    UART_TX_PIN >= 13 && UART_TX_PIN <= 15,
+    "CFG_UART_TX_PIN 必须为 PortC 上存在的 PC13~PC15"
+);
+const _: () = assert!(
+    UART_RX_PIN <= 2,
+    "CFG_UART_RX_PIN 必须为 PortH 上存在的 PH0~PH2"
+);
 /// 波特率 (bps) (CFG_UART_BAUDRATE)
 pub const UART_BAUDRATE: u32 = parse_u32(env!("CFG_UART_BAUDRATE"));
 const _: () = assert!(UART_BAUDRATE > 0, "CFG_UART_BAUDRATE 必须大于 0");
@@ -662,16 +683,26 @@ pub const CAN_CONFIG: can::Config = can::Config {
 
 // ============================== [gpio] ==============================
 
-/// 板载 LED 引脚号 (CFG_LED_PIN; 端口 PortC 固定在代码中)
-pub const LED_PIN: u8 = parse_u8(env!("CFG_LED_PIN"));
-/// LED 初始电平 (CFG_LED_LEVEL = high/low)
-pub const LED_INITIAL_LEVEL: gpio::Level = if eq_str(env!("CFG_LED_LEVEL"), "high") {
-    gpio::Level::High
-} else if eq_str(env!("CFG_LED_LEVEL"), "low") {
-    gpio::Level::Low
+/// 板载 LED 引脚号 (端口 PortB 固定在代码中)。三者均为高电平点亮:
+/// WORK=运行心跳, SUCCESS=启动完成, ERROR=故障 (panic/fault 或自检/soak 失败)。
+pub const LED_WORK_PIN: u8 = parse_u8(env!("CFG_LED_WORK_PIN"));
+pub const LED_SUCCESS_PIN: u8 = parse_u8(env!("CFG_LED_SUCCESS_PIN"));
+pub const LED_ERROR_PIN: u8 = parse_u8(env!("CFG_LED_ERROR_PIN"));
+/// LED 点亮极性 (CFG_LED_ACTIVE_LEVEL = high/low): high = 高电平点亮
+pub const LED_ACTIVE_HIGH: bool = if eq_str(env!("CFG_LED_ACTIVE_LEVEL"), "high") {
+    true
+} else if eq_str(env!("CFG_LED_ACTIVE_LEVEL"), "low") {
+    false
 } else {
-    panic!("CFG_LED_LEVEL 非法 (可用 high/low)")
+    panic!("CFG_LED_ACTIVE_LEVEL 非法 (可用 high/low)")
 };
+/// 三个 LED 共用同一端口且各自指示不同状态, 引脚不得重复
+const _: () = assert!(
+    LED_WORK_PIN != LED_SUCCESS_PIN
+        && LED_WORK_PIN != LED_ERROR_PIN
+        && LED_SUCCESS_PIN != LED_ERROR_PIN,
+    "CFG_LED_WORK/SUCCESS/ERROR_PIN 不能重复"
+);
 
 // ============================== [zmodem] ==============================
 
@@ -799,6 +830,67 @@ const _: () = assert!(
 const _: () = assert!(
     WDT_FEED_INTERVAL_MS > 0 && WDT_FEED_INTERVAL_MS <= 500,
     "CFG_WDT_FEED_MS 必须在 1~500ms 范围内"
+);
+
+// ============================== [hwdt] ==============================
+
+/// 板载**外部**硬件看门狗 (与 MCU 内部 [`WDT_ENABLE`] 是两套独立机制)。
+///
+/// 硬件语义 (由 PCB 决定): `PB{HWDT_ENABLE_PIN}` 输出**高电平禁用**、低电平
+/// 使能; 使能期间必须在 1s 周期内通过 `PB{HWDT_FEED_PIN}` 给出一次电平跳变
+/// (喂狗), 否则外部看门狗复位整个主控。
+///
+/// `CFG_HWDT_ENABLE=false` (默认) 时启动阶段先把使能脚拉高禁用, 不创建喂狗
+/// 线程 —— 烧录/调试期间调试器一停机就无法喂狗, 保持禁用才能正常烧录;
+/// `=true` 时启动阶段即使能并创建喂狗线程 (产品部署)。
+pub const HWDT_ENABLE: bool = if eq_str(env!("CFG_HWDT_ENABLE"), "true") {
+    true
+} else if eq_str(env!("CFG_HWDT_ENABLE"), "false") {
+    false
+} else {
+    panic!("CFG_HWDT_ENABLE 非法 (可用 true/false)")
+};
+/// 板载看门狗使能控制脚 (CFG_HWDT_ENABLE_PIN; 高=禁用, 低=使能; 端口 PortB 固定)
+pub const HWDT_ENABLE_PIN: u8 = parse_u8(env!("CFG_HWDT_ENABLE_PIN"));
+/// 板载看门狗喂狗脚 (CFG_HWDT_FEED_PIN; 每次喂狗翻转一次电平; 端口 PortB 固定)
+pub const HWDT_FEED_PIN: u8 = parse_u8(env!("CFG_HWDT_FEED_PIN"));
+/// 喂狗周期 (毫秒) (CFG_HWDT_FEED_MS): 每周期翻转一次喂狗脚。
+///
+/// 硬件要求 1s 周期内必须喂狗, 因此上限固定 1000ms; 若外部看门狗的超时窗口
+/// 接近 1s (或系统负载抖动大), 应配更小值 (如 500ms) 留出余量。
+pub const HWDT_FEED_INTERVAL_MS: u32 = parse_u32(env!("CFG_HWDT_FEED_MS"));
+/// 喂狗线程栈与优先级 (与内部 WDT supervisor 同样保持高优先级)。
+pub const HWDT_STACK_SIZE: usize = parse_u32(env!("CFG_HWDT_STACK")) as usize;
+pub const HWDT_PRIORITY: u8 = parse_u8(env!("CFG_HWDT_PRIORITY"));
+const _: () = assert!(
+    HWDT_STACK_SIZE >= 256 && HWDT_STACK_SIZE.is_multiple_of(8),
+    "CFG_HWDT_STACK 必须不小于 256 且按 8 字节对齐"
+);
+const _: () = assert!(
+    HWDT_PRIORITY < PRIORITY_MAX,
+    "CFG_HWDT_PRIORITY 必须在有效优先级范围内"
+);
+const _: () = assert!(
+    HWDT_FEED_INTERVAL_MS >= 1 && HWDT_FEED_INTERVAL_MS <= 1_000,
+    "CFG_HWDT_FEED_MS 必须在 1~1000ms 范围内 (板载看门狗要求 1s 周期喂狗)"
+);
+const _: () = assert!(
+    HWDT_ENABLE_PIN != HWDT_FEED_PIN,
+    "CFG_HWDT_ENABLE_PIN 与 CFG_HWDT_FEED_PIN 不能相同"
+);
+// 三个板载功能共用 PortB: 使能/喂狗脚不得与 CAN 或 LED 引脚冲突
+const _: () = assert!(
+    HWDT_ENABLE_PIN != CAN_TX_PIN
+        && HWDT_ENABLE_PIN != CAN_RX_PIN
+        && HWDT_FEED_PIN != CAN_TX_PIN
+        && HWDT_FEED_PIN != CAN_RX_PIN
+        && HWDT_ENABLE_PIN != LED_WORK_PIN
+        && HWDT_ENABLE_PIN != LED_SUCCESS_PIN
+        && HWDT_ENABLE_PIN != LED_ERROR_PIN
+        && HWDT_FEED_PIN != LED_WORK_PIN
+        && HWDT_FEED_PIN != LED_SUCCESS_PIN
+        && HWDT_FEED_PIN != LED_ERROR_PIN,
+    "CFG_HWDT_*_PIN 不能与 CAN/LED 的 PortB 引脚冲突"
 );
 
 // ============================== [console] ==============================
@@ -1015,6 +1107,10 @@ const _: () = assert!(
 const _: () = assert!(
     !WDT_ENABLE || (WDT_PRIORITY < APP_LED_PRIORITY && WDT_PRIORITY < APP_SHELL_PRIORITY),
     "启用 WDT 时 CFG_WDT_PRIORITY 必须高于所有应用线程"
+);
+const _: () = assert!(
+    !HWDT_ENABLE || (HWDT_PRIORITY < APP_LED_PRIORITY && HWDT_PRIORITY < APP_SHELL_PRIORITY),
+    "启用板载看门狗时 CFG_HWDT_PRIORITY 必须高于所有应用线程"
 );
 const _: () = assert!(APP_LED_BLINK_MS > 0, "CFG_APP_LED_BLINK_MS 必须大于 0");
 const _: () = assert!(

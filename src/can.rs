@@ -158,6 +158,15 @@ pub enum FilterType {
 }
 
 impl FilterType {
+    /// 名称 (与 `CFG_CAN_FILTER_TYPE` 取值一致, 诊断与 `sysinfo` 显示用)
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::StandardAndExtended => "both",
+            Self::StandardOnly => "standard",
+            Self::ExtendedOnly => "extended",
+        }
+    }
+
     const fn bits(self) -> u32 {
         match self {
             Self::StandardAndExtended => 0,

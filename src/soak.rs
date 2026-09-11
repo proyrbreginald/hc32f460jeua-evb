@@ -1861,6 +1861,10 @@ pub(crate) fn run(args: &str) {
     };
     let html = crate::soak_report_core::build(&data);
     let outcome = if pass { "PASS" } else { "FAIL" };
+    // 故障指示: 存在失败项时点亮板载 ERROR LED (与 selftest 失败一致)
+    if !pass {
+        crate::board::BoardResources::get().indicate_fault();
+    }
 
     // 报告写入失败/文件系统不可用时的紧凑控制台回退 (结果不丢失)
     let fallback_summary = |total_errors: u32, sram_errors: u32| {

@@ -371,6 +371,9 @@ fn report_fault_registers() -> u32 {
 /// 收尾: 按 [`STRATEGY`] 停机或软复位 (屏蔽中断, 防止被打断)
 fn terminate() -> ! {
     crate::arch::disable_interrupts();
+    // 故障指示: 点亮板载 ERROR LED (不依赖 BoardResources, 可在异常上下文调用)。
+    // reset 策略下软复位会重新初始化 GPIO, 该指示只在 halt 策略下保持。
+    crate::board::indicate_fault_early();
     match STRATEGY {
         PanicStrategy::Halt => loop {
             crate::arch::wait_for_interrupt();

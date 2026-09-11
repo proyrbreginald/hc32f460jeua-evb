@@ -1,4 +1,4 @@
-//! HC32F460JEUA-EVB 板级支持
+//! HC32F460JEUA 板级支持 (新板: 12MHz XTAL / USART3 控制台 / 三路 LED)
 //!
 //! 本模块集中描述开发板资源及其初始化顺序。SoC 驱动只提供硬件能力，
 //! 应用通过 [`Board`] / [`BoardResources`] 使用板载 LED 和控制台，避免
@@ -8,11 +8,98 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::gpio::{Config, Drive, Mode, Pin, PortA, PortB, PortC};
+use crate::gpio::{Config, Drive, Level, Mode, Pin, Port, PortB, PortC, PortH};
 use crate::uart::UartConfig;
 
-/// 板载 LED: PC13，引脚号保留现有编译期配置校验。
-type BoardLed = Pin<PortC, { crate::config::LED_PIN }>;
+/// 板载 LED (均为 PortB): WORK=运行心跳, SUCCESS=启动完成, ERROR=故障。
+/// 点亮极性由 `CFG_LED_ACTIVE_LEVEL` 决定 (本板高电平点亮)。
+type LedWork = Pin<PortB, { crate::config::LED_WORK_PIN }>;
+type LedSuccess = Pin<PortB, { crate::config::LED_SUCCESS_PIN }>;
+type LedError = Pin<PortB, { crate::config::LED_ERROR_PIN }>;
+
+/// 板载**外部**硬件看门狗引脚 (均为 PortB, 见 `CFG_HWDT_*`):
+/// 使能脚高电平禁用/低电平使能, 喂狗脚每次喂狗翻转一次电平。
+type HwdtEnablePin = Pin<PortB, { crate::config::HWDT_ENABLE_PIN }>;
+type HwdtFeedPin = Pin<PortB, { crate::config::HWDT_FEED_PIN }>;
+
+/// 板载 LED 标识 (shell `led` 命令与板级指示 API 共用)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Led {
+    /// 运行心跳 (由 LED 线程周期翻转)
+    Work,
+    /// 启动完成 (系统初始化成功后常亮)
+    Success,
+    /// 故障 (panic/fault 或自检/soak 失败时常亮)
+    Error,
+}
+
+impl Led {
+    /// 名称 (shell 命令与日志显示)
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Success => "success",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// 板载 LED 点亮时的输出电平 (极性来自 `CFG_LED_ACTIVE_LEVEL`)
+const fn led_on_level() -> Level {
+    if crate::config::LED_ACTIVE_HIGH {
+        Level::High
+    } else {
+        Level::Low
+    }
+}
+
+/// 板载 LED 熄灭时的输出电平
+const fn led_off_level() -> Level {
+    if crate::config::LED_ACTIVE_HIGH {
+        Level::Low
+    } else {
+        Level::High
+    }
+}
+
+/// 按点亮极性写 LED 电平 (泛型以覆盖三路 LED 各自的 const 泛型引脚类型)
+fn set_led_pin<P: Port, const N: u8>(pin: Pin<P, N>, on: bool) {
+    pin.set_level(if on { led_on_level() } else { led_off_level() });
+}
+
+/// 读 LED 是否点亮 (PODR 输出电平 + 点亮极性)
+fn led_pin_is_on<P: Port, const N: u8>(pin: Pin<P, N>) -> bool {
+    (pin.output_level() == Level::High) == crate::config::LED_ACTIVE_HIGH
+}
+
+/// 上电初始化一路 LED: 推挽输出、初始熄灭 (泛型以覆盖各自的引脚类型)
+fn configure_led<P: Port, const N: u8>(pin: Pin<P, N>) {
+    pin.configure(Config {
+        mode: Mode::Output,
+        pull_up: false,
+        drive: Drive::Low,
+        initial_level: led_off_level(),
+        invert: false,
+    });
+}
+
+/// panic/fault 早期故障指示: 点亮 ERROR LED, 不依赖 [`BoardResources`] 是否已初始化。
+///
+/// 直接按编译期配置构造引脚并配置为输出 (Board::init 之前发生的故障也能点亮),
+/// 只做 GPIO 寄存器写入与 PWPR 解锁, 不分配、不加锁、不依赖调度器, 因此可在
+/// 异常上下文调用。注意 `CFG_PANIC_STRATEGY=reset` 时软复位会重新初始化 GPIO,
+/// ERROR 常亮仅在 `halt` 策略下保持。
+pub fn indicate_fault_early() {
+    let pin = Pin::<PortB, { crate::config::LED_ERROR_PIN }>::new();
+    pin.configure(Config {
+        mode: Mode::Output,
+        pull_up: false,
+        drive: Drive::Low,
+        initial_level: led_off_level(),
+        invert: false,
+    });
+    pin.set_level(led_on_level());
+}
 
 /// HC32F460JEUA-EVB 板级入口。
 pub struct Board {
@@ -25,7 +112,11 @@ pub struct Board {
 /// 是零大小能力 token, 一次性获取 (`Peripherals::take` 的位图/CAS) 后
 /// 运行路径按编译期配置重建等价句柄, 无需在此常驻。
 pub struct BoardResources {
-    led: BoardLed,
+    led_work: LedWork,
+    led_success: LedSuccess,
+    led_error: LedError,
+    hwdt_enable_pin: HwdtEnablePin,
+    hwdt_feed_pin: HwdtFeedPin,
     console: crate::config::ConsoleUart,
     can: crate::can::Can,
     clocks: crate::clk::Clocks,
@@ -61,6 +152,26 @@ impl Board {
             crc,
             clocks,
         } = self.peripherals;
+        // 板载外部看门狗: 复位后使能脚为输入态, 板上看门狗默认处于使能, 因此
+        // 在**时钟初始化之前**就把使能脚拉高禁用 (PB4 高=禁用), 避免 XTAL 起振
+        // + PLL 锁定期间被外部看门狗复位 (GPIO 不受 FCG 门控, 此时可安全配置)。
+        let hwdt_enable = gpio.pin::<PortB, { crate::config::HWDT_ENABLE_PIN }>();
+        hwdt_enable.configure(Config {
+            mode: Mode::Output,
+            pull_up: false,
+            drive: Drive::Low,
+            initial_level: Level::High, // 高 = 禁用 (安全默认)
+            invert: false,
+        });
+        let hwdt_feed = gpio.pin::<PortB, { crate::config::HWDT_FEED_PIN }>();
+        hwdt_feed.configure(Config {
+            mode: Mode::Output,
+            pull_up: false,
+            drive: Drive::Low,
+            initial_level: Level::Low,
+            invert: false,
+        });
+
         let clocks = clocks.freeze();
 
         // DMA/CRC 句柄为 ZST 能力 token: 独占获取已在 `Peripherals::take`
@@ -72,7 +183,11 @@ impl Board {
         let _ = crc;
 
         let resources = BoardResources {
-            led: gpio.pin::<PortC, { crate::config::LED_PIN }>(),
+            led_work: gpio.pin::<PortB, { crate::config::LED_WORK_PIN }>(),
+            led_success: gpio.pin::<PortB, { crate::config::LED_SUCCESS_PIN }>(),
+            led_error: gpio.pin::<PortB, { crate::config::LED_ERROR_PIN }>(),
+            hwdt_enable_pin: hwdt_enable,
+            hwdt_feed_pin: hwdt_feed,
             console,
             can,
             clocks,
@@ -92,16 +207,40 @@ impl Board {
             crate::log_debug!("MPU: 已使能 (FLASH 只读, SRAM/外设 XN, 线程栈守卫)");
         }
 
-        resources.led.configure(Config {
-            mode: Mode::Output,
-            pull_up: false,
-            drive: Drive::Low,
-            initial_level: crate::config::LED_INITIAL_LEVEL,
-            invert: false,
-        });
-        gpio.pin::<PortA, { crate::config::UART_TX_PIN }>()
+        // 板载外部看门狗: 使能脚已在时钟初始化前配置为"禁用"; 这里只报告配置,
+        // 真正的"使能 + 首次喂狗"放在调度器启动前最后一步
+        // ([`Self::start_hardware_watchdog`]), 以免控制台/RTC 初始化与横幅输出
+        // 占用掉喂狗窗口。
+        crate::log_debug!(
+            "HWDT: PB{} 已配置为使能控制 (当前{}), 喂狗脚 PB{}",
+            crate::config::HWDT_ENABLE_PIN,
+            if crate::config::HWDT_ENABLE {
+                "禁用, 启动末尾使能"
+            } else {
+                "禁用 (CFG_HWDT_ENABLE=false)"
+            },
+            crate::config::HWDT_FEED_PIN
+        );
+
+        // 三路 LED 全灭起步 (点亮电平由 CFG_LED_ACTIVE_LEVEL 决定);
+        // 控制台 = PC13(USART3_TX)/PH2(USART3_RX), CAN = PB9/PB8 (Func_Grp2)。
+        configure_led(resources.led_work);
+        configure_led(resources.led_success);
+        configure_led(resources.led_error);
+        crate::log_debug!(
+            "LED: work=PB{} success=PB{} error=PB{} ({})",
+            crate::config::LED_WORK_PIN,
+            crate::config::LED_SUCCESS_PIN,
+            crate::config::LED_ERROR_PIN,
+            if crate::config::LED_ACTIVE_HIGH {
+                "高电平点亮"
+            } else {
+                "低电平点亮"
+            }
+        );
+        gpio.pin::<PortC, { crate::config::UART_TX_PIN }>()
             .set_func(crate::config::UART_TX_FSEL);
-        gpio.pin::<PortA, { crate::config::UART_RX_PIN }>()
+        gpio.pin::<PortH, { crate::config::UART_RX_PIN }>()
             .set_func(crate::config::UART_RX_FSEL);
         if crate::config::CAN_ENABLE {
             gpio.pin::<PortB, { crate::config::CAN_TX_PIN }>()
@@ -253,18 +392,102 @@ impl BoardResources {
         unsafe { (*RESOURCES.0.get()).assume_init_ref() }
     }
 
-    /// 翻转板载 LED。
-    pub fn toggle_led(&self) {
-        self.led.toggle();
+    /// 设置指定 LED 点亮/熄灭 (点亮极性由 `CFG_LED_ACTIVE_LEVEL` 决定)。
+    pub fn set_led(&self, led: Led, on: bool) {
+        match led {
+            Led::Work => set_led_pin(self.led_work, on),
+            Led::Success => set_led_pin(self.led_success, on),
+            Led::Error => set_led_pin(self.led_error, on),
+        }
     }
 
-    /// 设置板载 LED 输出电平。
-    pub fn set_led(&self, on: bool) {
-        if on {
-            self.led.set_high();
-        } else {
-            self.led.set_low();
+    /// 翻转指定 LED (心跳等周期指示用; 单次原子写, 无需临界区)。
+    pub fn toggle_led(&self, led: Led) {
+        match led {
+            Led::Work => self.led_work.toggle(),
+            Led::Success => self.led_success.toggle(),
+            Led::Error => self.led_error.toggle(),
         }
+    }
+
+    /// 指定 LED 当前是否点亮 (读 PODR 输出电平 + 点亮极性)。
+    pub fn led_is_on(&self, led: Led) -> bool {
+        match led {
+            Led::Work => led_pin_is_on(self.led_work),
+            Led::Success => led_pin_is_on(self.led_success),
+            Led::Error => led_pin_is_on(self.led_error),
+        }
+    }
+
+    /// 启动完成指示: SUCCESS 常亮, ERROR 熄灭 (`main` 在系统就绪后调用)。
+    pub fn indicate_boot_ok(&self) {
+        self.set_led(Led::Error, false);
+        self.set_led(Led::Success, true);
+    }
+
+    /// 故障指示: ERROR 常亮 (panic/fault 与自检/soak 失败路径调用)。
+    ///
+    /// 默认 release 配置不编译 selftest/soak, 因此本方法对应用代码保留,
+    /// 未引用时不视为缺陷。
+    #[allow(dead_code)]
+    pub fn indicate_fault(&self) {
+        self.set_led(Led::Success, false);
+        self.set_led(Led::Error, true);
+    }
+
+    /// 板载外部看门狗喂狗: 翻转喂狗脚 (每次调用产生一次电平跳变)。
+    ///
+    /// 使能状态下必须保证相邻两次调用的间隔不超过
+    /// `CFG_HWDT_FEED_MS`(硬件要求 1s 周期), 否则外部看门狗复位主控。
+    pub fn hwdt_feed(&self) {
+        self.hwdt_feed_pin.toggle();
+    }
+
+    /// 使能/禁用板载外部看门狗 (使能脚: 低电平使能, 高电平禁用)。
+    ///
+    /// 重新使能后必须在一个喂狗周期内调用 [`Self::hwdt_feed`]; 禁用期间
+    /// 无需喂狗 (烧录/调试时应保持禁用)。
+    pub fn set_hwdt_enabled(&self, enable: bool) {
+        self.hwdt_enable_pin
+            .set_level(if enable { Level::Low } else { Level::High });
+    }
+
+    /// 板载外部看门狗当前是否使能 (读使能脚输出电平: 低 = 使能)。
+    pub fn hwdt_enabled(&self) -> bool {
+        self.hwdt_enable_pin.output_level() == Level::Low
+    }
+
+    /// 按编译期配置使能板载外部看门狗并创建喂狗线程 (`CFG_HWDT_ENABLE=true` 时)。
+    ///
+    /// 必须在调度器启动前、且尽量靠近 `rtos::start()` 时调用: 使能之后到喂狗
+    /// 线程首次运行之间的窗口必须远小于 `CFG_HWDT_FEED_MS`, 否则外部看门狗会
+    /// 在启动阶段复位主控。禁用配置下保持 PB4 高电平且不创建线程。
+    pub fn start_hardware_watchdog(&self) {
+        if !crate::config::HWDT_ENABLE {
+            return;
+        }
+        assert!(
+            !crate::rtos::scheduler_started(),
+            "板载看门狗喂狗线程必须在调度器启动前创建"
+        );
+        // 先建线程再使能: 线程已就绪, 使能后立即喂一次, 之后由线程周期喂狗
+        let _ = crate::rtos::thread_create(
+            "hwdt",
+            crate::config::HWDT_STACK_SIZE,
+            crate::config::HWDT_PRIORITY,
+            0,
+            hardware_watchdog_supervisor,
+            0,
+        );
+        self.set_hwdt_enabled(true);
+        self.hwdt_feed();
+        crate::log_debug!(
+            "HWDT: 已使能 (PB{} 低=使能, PB{} 每 {}ms 喂狗, 线程 P{})",
+            crate::config::HWDT_ENABLE_PIN,
+            crate::config::HWDT_FEED_PIN,
+            crate::config::HWDT_FEED_INTERVAL_MS,
+            crate::config::HWDT_PRIORITY
+        );
     }
 
     /// 当前系统时钟频率。
@@ -435,6 +658,20 @@ extern "C" fn watchdog_supervisor(_param: usize) {
             gap.max(crate::config::WDT_FEED_INTERVAL_MS),
             Ordering::Relaxed,
         );
+    }
+}
+
+/// 板载外部看门狗喂狗线程: 周期翻转喂狗脚。
+///
+/// 与内部 WDT supervisor 同策略 —— 高优先级 + 主动休眠: 合法的长时间轮询
+/// 输出不会饿死它; 只有 SysTick/PendSV/调度长期停滞才会漏喂, 此时由外部
+/// 看门狗复位整个主控 (这正是它存在的意义)。
+extern "C" fn hardware_watchdog_supervisor(_param: usize) {
+    let board = BoardResources::get();
+    loop {
+        board.hwdt_feed();
+        crate::rtos::thread_delay_ms(crate::config::HWDT_FEED_INTERVAL_MS)
+            .expect("板载看门狗喂狗必须在线程上下文运行");
     }
 }
 

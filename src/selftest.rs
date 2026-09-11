@@ -386,6 +386,7 @@ pub(crate) fn run_can() {
         Err(error) => {
             crate::log_error!("[FAIL] CAN: {}", error);
             crate::println!("[selftest] CAN 完成: 0 通过, 1 失败 ({})", error);
+            crate::board::BoardResources::get().indicate_fault();
         }
     }
 }
@@ -737,6 +738,8 @@ pub(crate) fn run() {
         crate::println!("[selftest] 完成: {} 通过, {} 失败", pass, fail);
         if fail > 0 {
             crate::println!("[selftest] 存在失败项, 详见上方红色 [ERR] 输出");
+            // 故障指示: 板载 ERROR LED 常亮 (成功时不改动 SUCCESS 的启动指示)
+            crate::board::BoardResources::get().indicate_fault();
         }
     }
 }

@@ -17,11 +17,12 @@ shell 运行在独立 RTOS 线程中，经控制台 UART 的中断接收环获�
 | 命令 | 作用 |
 |---|---|
 | `help`、`whoami`、`pwd` | 帮助、身份和当前目录 |
-| `sysinfo`、`uptime`、`ps`、`free` | 系统、时间、线程和堆信息 |
+| `sysinfo`、`uptime`、`ps`、`free` | 系统、时间、线程和堆信息；`sysinfo` 的"配置"一节在 `CFG_CAN_ENABLE=true` 时还打印 CAN 位速率/采样点/时序（PRESC/SEG/SJW/SBT）/引脚/筛选器/策略与当前运行状态 |
 | `cd`、`ls`、`mkdir`、`rmdir` | 目录切换、枚举、创建和删除空目录 |
 | `cat`、`write`、`stat`、`rm`、`mv` | 文件读写、元数据、删除和原子重命名 |
 | `df`、`fsck`、`mount`、`mkfs --force` | 容量、校验、挂载和强制格式化 |
-| `led`、`clear`、`echo`、`history` | 板载 LED、终端和历史操作 |
+| `led` | 板载 LED：`led <work\|success\|error> [on\|off\|toggle\|status]`（PB12/PB14/PB13） |
+| `clear`、`echo`、`history` | 终端清屏、回显和历史操作 |
 | `can` | CAN 真机测试：`status`/`init`/`deinit`/`send`/`recv`/`listen`（需 `CFG_CAN_ENABLE=true`） |
 | `log` | 应用日志开关、级别、颜色和落盘开关 |
 | `sz`、`rz` | ZMODEM 文件发送和接收（需启用） |
@@ -64,7 +65,7 @@ shell 运行在独立 RTOS 线程中，经控制台 UART 的中断接收环获�
 
 `can` 命令面向真实总线（内部回环见 `selftest can`），需以
 `CFG_CAN_ENABLE=true` 编译：`can init normal` 后 `can send`/`can recv`/
-`can listen` 经 PB7/PB6 与外部收发器收发，配合 CAN 转 USB 适配器（主机
+`can listen` 经 PB9/PB8 与外部收发器收发，配合 CAN 转 USB 适配器（主机
 `candump`/`cansend`）验证电气链路、过滤器与错误计数；接收/监听期间按 ESC 中止。
 接线、位速率一致性和外部回环自检步骤见
 [驱动参考](DRIVERS.md#can-外部总线测试配合-can-转-usb-适配器)。

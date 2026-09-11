@@ -16,11 +16,28 @@ UART、CAN、SysTick 和 WDT 必须使用该快照计算分频，不能假定配
 - `gpio::Pin<P, N>` 以端口和引脚 const 泛型编码资源，配置、复用和写 1 原子输出
   操作由 `with_unlocked` 临界区保护；HC32F460 无内部下拉；
 - `uart` 支持 USART1~4、8/9 位数据、校验、停止位、过采样、小数波特率和中断 RX
-  环；裸驱动只发出 OS 无关通知；
+  环；裸驱动只发出 OS 无关通知。本板控制台 = **USART3**：PC13=TX、PH2=RX
+  （Func_Grp2 引脚，表 2-2 的 Func32/33），换单元/换引脚时的合法组合由
+  `config.rs` 编译期校验（USART3=Func32/33 或 USART4=Func36/37）；
 - `uart_rtos` 把通知转换为容量为 1 的 RTOS 信号量，重复通知可以合并，数据真值仍
   在 RX 环中；
 - `dma` 提供 DMA1/2 四通道、外设触发、软件拷贝、TC/错误中断和 LLP 重配置；当前
   集成包括长控制台输出 TX 卸载及 Flash→RAM 大块拷贝，忙或过短请求回退轮询。
+
+### 板载 LED (PortB, 高电平点亮)
+
+`board::BoardResources` 用 [`board::Led`] 统一寻址三路 LED，点亮极性由
+`CFG_LED_ACTIVE_LEVEL` 决定（本板 high）：
+
+| LED | 引脚 | 语义 |
+|---|---|---|
+| `Led::Work` | PB12 | 运行心跳，LED 线程每 `CFG_APP_LED_BLINK_MS` 翻转 |
+| `Led::Success` | PB14 | 启动完成，`main` 在系统就绪后常亮（`indicate_boot_ok`） |
+| `Led::Error` | PB13 | 故障，panic/fault（`indicate_fault_early`，不依赖板级初始化）、`selftest` 失败、`soak` FAIL 时常亮（`indicate_fault`） |
+
+`CFG_PANIC_STRATEGY=reset` 时软复位会重新初始化 GPIO，ERROR 常亮只在 `halt`
+策略下保持。shell `led <work|success|error> [on|off|toggle|status]` 用于手动
+点灯与上板核对极性。
 
 ## Flash、文件系统与 CRC
 
@@ -38,8 +55,8 @@ UART、CAN、SysTick 和 WDT 必须使用该快照计算分频，不能假定配
 
 `can` 仅实现经典 CAN 2.0B：11/29 位 ID、数据帧/RTR、8 个过滤器、PTB 发送、STB
 队列、10 槽 RX FIFO、状态和错误计数。位时序由 `can_timing` 纯算法搜索后编码。
-CANCLK 固定来自 XTAL，配置和硬件限制在编译期校验。EVB 没有 CAN PHY，正常模式和
-外部回环必须外接收发器与终端电阻；内部回环不需要 PHY。
+CANCLK 固定来自 XTAL，配置和硬件限制在编译期校验。本板没有 CAN PHY（PB9/PB8
+仅引出信号），正常模式和外部回环必须外接收发器与终端电阻；内部回环不需要 PHY。
 
 ### CAN 外部总线测试（配合 CAN 转 USB 适配器）
 
@@ -58,15 +75,16 @@ can listen 30 normal              # 连续监听 30s（normal 会发 ACK；silen
 
 接线与前提：
 
-- PB7(TX)/PB6(RX) 是 3.3V 逻辑引脚（JP2），**必须外接 CAN 收发器**（TJA1050、
-  SN65HVD230 等），不能直接接 CANH/CANL；总线两端各 120Ω 终端电阻，两端共地；
-- XTAL 必须起振：CAN 是全工程唯一以 XTAL 为通信时钟的模块，`can init` 失败时
-  会返回 `XtalNotReady`；
+- PB9(TX)/PB8(RX) 是 3.3V 逻辑引脚（Func_Grp2 复用 Func50/51），**必须外接 CAN
+  收发器**（TJA1050、SN65HVD230 等），不能直接接 CANH/CANL；总线两端各 120Ω
+  终端电阻，两端共地；
+- XTAL 必须起振：CAN 通信时钟固定为 XTAL，`can init` 失败时会返回
+  `XtalNotReady`；
 - 板端与适配器的位速率/采样点/SJW 必须一致（默认 1 Mbps、75%、SJW=1，
-  `CFG_CAN_BITRATE`/`CFG_CAN_SAMPLE_POINT_PERMILLE`/`CFG_CAN_SJW`）。8 MHz
-  XTAL 下 1 Mbit/s 的一位只有 8 个 CANCLK：搜索结果为 PRESC=2、SEG1=3、
-  SEG2=1（4 TQ/位，误差 0 ppm），且 SJW 只能是 1（SJW=2 时一位至少 5 TQ，
-  不能整除），改大 SJW 会直接编译报错；
+  `CFG_CAN_BITRATE`/`CFG_CAN_SAMPLE_POINT_PERMILLE`/`CFG_CAN_SJW`）。12 MHz
+  XTAL 下 1 Mbit/s 的一位是 12 个 CANCLK：搜索结果为 PRESC=3、SEG1=3、
+  SEG2=1（4 TQ/位，误差 0 ppm）。SJW=1 是取 75% 采样点的前提：SJW=2 时一位
+  至少 5 TQ，无法整除 12 个 CANCLK，只能退到 PRESC=2/6 TQ/66.7%；
 - 位速率越高总线越短：1 Mbit/s 按 ISO 11898-2 建议不超过约 40 m（500 kbps
   约 100 m），两端各 120Ω 终端电阻、共地，支线尽量短；
 - `can` 命令是**编译期开关**：需 `CFG_CAN_ENABLE=true` 才会编译（该开关同时
@@ -93,6 +111,27 @@ cangen can0 -g 10 -I 5            # 周期压测（配合 can listen 观察错�
 + `can send` 对比 `candump`（验 TX）→ 主机 `cansend` + 板端 `can recv`（验 RX 与
 过滤器）→ `cangen` + `can listen`（验采样点容忍度与错误计数）。发送没有对端应答
 时控制器会持续重发，`can send` 会在 200ms 后返回并报告 TEC/REC 与错误类型。
+
+## 看门狗
+
+两套独立机制，都由 `board` 管理、在调度器启动前建立：
+
+- **MCU 内部 WDT**（`CFG_WDT_ENABLE`，`src/wdt.rs`）：PCLK3 计数、溢出复位，
+  supervisor 线程每 `CFG_WDT_FEED_MS` 喂狗（默认 500 ms，硬件溢出约 2.68 s）；
+- **板载外部硬件看门狗**（`CFG_HWDT_ENABLE`，`src/board.rs`）：由主控的 GPIO 主动
+  喂狗 —— **PB4 输出高电平禁用、低电平使能**；使能期间必须在 1 s 周期内通过
+  **PB5 给出一次电平跳变**（每次喂狗翻转一次电平），否则外部看门狗复位整机。
+  喂狗周期 `CFG_HWDT_FEED_MS` 上限固定 1000 ms（编译期校验），超时窗口接近 1 s
+  时可配 500 ms 留余量。
+
+启动顺序（`Board::init`）：复位后使能脚为输入态、板上看门狗默认使能，因此固件在
+**时钟初始化之前**先把 PB4 拉高禁用；随后按配置决定是否使能 —— `true` 时即使能并
+立即喂一次，再由最高优先级 `hwdt` 线程周期喂狗；`false` 时保持禁用且不创建线程
+（烧录/调试必须，调试器停机期间无法喂狗）。
+
+运行期 API：`BoardResources::hwdt_feed()` / `set_hwdt_enabled(bool)` /
+`hwdt_enabled()`。`CFG_PANIC_STRATEGY=halt` 时 panic 停在死循环，使能状态下外部
+看门狗会在一周期后复位整机（自动恢复）；`reset` 策略则由软复位直接重启。
 
 ## RTC、SRAM、MPU 与中断
 

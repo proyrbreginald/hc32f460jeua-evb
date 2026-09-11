@@ -20,10 +20,11 @@
 //! 各 USART 的可用引脚按封装不同, 需查数据手册表 2-1/2-2:
 //! - USART1: PA9=TX (Func32), PA10=RX (Func33), Func_Grp1;
 //! - USART2: 功能号 36/37/38/39 (TX/RX/RTS/CTS, Grp1);
-//! - USART3: 功能号 48/49/50/51 (TX/RX/RTS/CTS, Grp2);
-//! - USART4: 功能号 52/53/54/55 (TX/RX/RTS/CTS, Grp2);
-//! - 具体引脚是否支持某功能号以引脚功能表为准 (同一功能号在不同引脚
-//!   可能对应不同外设), 常量见 [`crate::gpio::func`]。
+//! - USART3: 功能号 32/33/34/35 (TX/RX/RTS/CTS, Grp2);
+//! - USART4: 功能号 36/37/38/39 (TX/RX/RTS/CTS, Grp2);
+//! - 具体引脚是否支持某功能号以引脚所属功能组 (Func_Grp1/Grp2) 为准,
+//!   组内 Func32~63 分配见表 2-2; 本板控制台 PC13/PH2 属 Grp2 → USART3。
+//!   常量见 [`crate::gpio::func`]。
 //!
 //! Func_Grp1/Grp2 由引脚硬件固定, 无需软件配置。
 //! [`Uart::init`] 只配置外设本身, 引脚复用 (PFSR.FSEL) 需单独调用

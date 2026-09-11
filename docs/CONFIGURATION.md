@@ -14,15 +14,16 @@
 | `CFG_CLK_SOURCE`、`CFG_DIV_*` | 系统/总线时钟 | 源为 `mrc`/`hrc`/`xtal`/`pll`；分频为 1/2/4/8/16 |
 | `CFG_SYSTICK_HZ`、`CFG_TICKS_PER_SEC` | RTOS 节拍 | 两者必须一致；默认 1000 Hz |
 | `CFG_PRIORITY_*`、`CFG_IDLE_*` | 调度器 | 优先级数值越小越高；idle 默认 31 |
-| `CFG_UART_*` | 控制台 USART、引脚、格式、RX 缓冲和 IRQ | USART 1~4；过采样 8/16；数据位 8/9；校验和停止位组合由代码校验 |
+| `CFG_UART_*` | 控制台 USART、引脚、格式、RX 缓冲和 IRQ | USART 1~4；本板 USART3(PC13/PH2)；单元与 Func 组合编译期校验 |
 | `CFG_DMA_*` | DMA 控制台 TX 和大块内存拷贝 | 单元 1/2、通道 0~3；TX 与 COPY 通道不得相同 |
 | `CFG_CAN_*` | 经典 CAN 模式、位时序、过滤器和 RX 策略 | 最高 1 Mbit/s；时序、ID、掩码和采样点编译期校验 |
-| `CFG_LED_*` | 板载 LED | EVB 默认 PC13；端口类型固定在 `board.rs` |
+| `CFG_LED_*` | 板载三路 LED（work/success/error）与点亮极性 | 均为 PortB；引脚号编译期校验且不得重复 |
 | `CFG_SHELL_*` | 登录、历史、输入缓冲和命令列表 | 命令列表只控制注册；大功能另有编译期开关 |
 | `CFG_NANO_*`、`CFG_ZMODEM_*` | nano 和 ZMODEM 参数 | 受对应功能开关裁剪；接收大小不得超过快照容量 |
 | `CFG_LOG_*`、`CFG_LOGFILE_*` | 应用日志、RAM 环和 Flash 轮转 | 刷新越频繁，Flash 擦写越多；落盘文件无 ANSI 颜色 |
 | `CFG_CONSOLE_*` | 控制台输出节流 | 行间间隙用于降低 USB 转串口丢字节风险 |
-| `CFG_RTC_*`、`CFG_WDT_*` | RTC 时间戳和看门狗 | WDT 调试时建议关闭；supervisor 运行于最高优先级 |
+| `CFG_RTC_*`、`CFG_WDT_*` | RTC 时间戳和 MCU 内部看门狗 | WDT 调试时建议关闭；supervisor 运行于最高优先级 |
+| `CFG_HWDT_*` | 板载**外部**硬件看门狗（PB4 高=禁用/低=使能，PB5 周期喂狗） | 喂狗周期 ≤1000 ms；引脚不得与 CAN/LED 冲突；烧录/调试必须 `CFG_HWDT_ENABLE=false` |
 | `CFG_MPU_*` | 内存属性和栈守卫 | 守卫大小为 2 的幂，且必须与 `link.ld` 一致 |
 | `CFG_APP_*`、`CFG_SOAK_*` | 演示线程、自检和长期压力测试 | `soak` 开启时自动编译 selftest |
 
@@ -60,4 +61,8 @@ release 裁剪掩盖类型错误。
 
 默认 shell 凭据是开发值，不适用于产品；`CFG_PANIC_STRATEGY=halt` 便于调试，
 无人值守设备通常应评估 `reset`；WDT 会在调试器断点期间继续计数，调试时应关闭或
-避免暂停超过溢出时间。CAN 正常模式需要外接收发器，板上 PB6/PB7 只是引出信号。
+避免暂停超过溢出时间。CAN 正常模式需要外接收发器，板上 PB9/PB8 只是引出信号。
+
+产品部署时另需开启**板载外部看门狗**（`CFG_HWDT_ENABLE=true`）：它不依赖 MCU
+内部状态，内核锁死或时钟异常也能复位整机；但调试器停机期间无法喂狗，因此**烧录
+与断点调试必须保持 `CFG_HWDT_ENABLE=false`**（内部 `CFG_WDT_ENABLE` 同理）。

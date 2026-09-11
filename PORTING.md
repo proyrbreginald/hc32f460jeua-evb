@@ -23,8 +23,8 @@ SoC drivers                  RTOS core
 - `rtos`: 调度、线程、定时器和 IPC；提供通用 idle/context-switch hook，
   不反向依赖具体板级设备。MPU 使用切换 hook，WDT 由 BSP supervisor 管理。
 - SoC drivers: HC32F460 的寄存器地址、位域、时钟门控和外设状态机。
-- `board`: 消费芯片能力，绑定 PC13 LED、控制台引脚、IRQ line/priority、
-  时钟与初始化顺序，并向应用交付受限资源。
+- `board`: 消费芯片能力，绑定板载 LED（WORK/SUCCESS/ERROR）、控制台引脚、
+  IRQ line/priority、时钟与初始化顺序，并向应用交付受限资源。
 - OS adapters: 把裸驱动的非阻塞/ISR 通知转换成 RTOS semaphore、timeout
   或未来的 async wake，不让寄存器驱动依赖某个操作系统。
 

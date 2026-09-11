@@ -233,8 +233,33 @@ mod tests {
     use super::{BitTiming, MAX_CLASSIC_BITRATE, calculate};
 
     const CANONICAL_500K: Option<BitTiming> = calculate(8_000_000, 500_000, 750, 2, 0);
-    /// 工程默认位速率 (CFG_CAN_BITRATE=1M, CFG_CAN_SJW=1, XTAL=8MHz)。
+    /// 本板默认位速率 (CFG_CAN_BITRATE=1M, CFG_CAN_SJW=1, XTAL=12MHz)。
+    const CANONICAL_1M_12MHZ: Option<BitTiming> = calculate(12_000_000, 1_000_000, 750, 1, 10_000);
+    /// 8MHz CANCLK 参考位时序 (算法覆盖; 上一代板卡配置)。
     const CANONICAL_1M: Option<BitTiming> = calculate(8_000_000, 1_000_000, 750, 1, 10_000);
+
+    #[test]
+    fn canonical_12mhz_1m_timing_and_sbt_encoding_are_stable() {
+        let timing = CANONICAL_1M_12MHZ.unwrap();
+
+        // 12MHz CANCLK / 1Mbit/s => 一位恰好 12 个 CANCLK; 4 TQ/位
+        // (PRESC=3, TQ=250ns) 时采样点 75% 正好落在 SEG1=3/SEG2=1。
+        assert_eq!(timing.prescaler, 3);
+        assert_eq!(timing.time_seg1, 3);
+        assert_eq!(timing.time_seg2, 1);
+        assert_eq!(timing.sjw, 1);
+        assert_eq!(timing.total_time_quanta(), 4);
+        assert_eq!(timing.actual_bitrate(12_000_000), 1_000_000);
+        assert_eq!(timing.sample_point_permille(), 750);
+        assert_eq!(timing.error_ppm(12_000_000, 1_000_000), 0);
+        assert_eq!(timing.register_value(), 0x0200_0001);
+
+        // SJW=2 时一位至少 5 TQ, 无法整除 12 个 CANCLK: 只能退到
+        // PRESC=2 / 6 TQ / 66.7% 采样点, 因此本板保持 SJW=1 以取 75%。
+        let sjw2 = calculate(12_000_000, 1_000_000, 750, 2, 10_000).unwrap();
+        assert_eq!(sjw2.total_time_quanta(), 6);
+        assert_eq!(sjw2.sample_point_permille(), 667);
+    }
 
     #[test]
     fn canonical_8mhz_1m_timing_and_sbt_encoding_are_stable() {

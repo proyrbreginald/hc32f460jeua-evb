@@ -62,7 +62,8 @@ cargo run --release
 ```
 
 烧录脚本优先使用仓库 `.venv/bin/pyocd`，并把 ELF 复制到固定输出位置供调试。
-默认串口参数为 USART1、PA9/PA10、115200 8N1、无流控。上电后应看到启动横幅，
+默认串口参数为 USART3、PC13(TX)/PH2(RX)、115200 8N1、无流控。上电后应看到启动
+横幅（PB12 WORK 心跳闪烁、PB14 SUCCESS 常亮），
 默认使用 `root` / `root` 登录；产品部署前必须修改凭据和 panic/WDT 策略。
 
 ## 5. 目标板回归清单
@@ -104,3 +105,56 @@ cargo run --release
 
 调试器断点后 WDT 复位：开发调试时关闭 `CFG_WDT_ENABLE`，或避免暂停超过硬件
 溢出时间；这是硬件计数行为，不是调度器超时。
+
+## 7. 烧录与调试故障
+
+### `cannot read register ipsr because core #0 is not halted`
+
+这是 **pyocd 烧录失败**（不是编译失败）：`Erasing...` 阶段 pyocd 把 flash 算法
+（本芯片的算法在 **SRAM 0x2000_0000** 执行）调到目标上运行，等它命中结束断点；
+算法没跑完时它会 `halt()` 再读 IPSR，此时若内核不在可停止状态就抛这句。判定
+依据：pyocd 的擦除/编程超时是 10 s，**毫秒级失败 = 内核当时处于 RESET /
+SLEEPING / LOCKUP，或 SWD 链路已断**。
+
+按下面顺序排查（`scripts/flash.sh` 支持同名环境变量，失败时也会打印这份阶梯）：
+
+1. **SWD 降速**：`FLASH_FREQ=250k cargo run --release`。新板/长排线/无地线回流
+   时 1 MHz 默认时钟常常不稳；
+2. **复位下连接**：`FLASH_CONNECT=under-reset cargo run --release`。需要调试器
+   nRST 与板子相连；它在固件运行前就停住内核，可绕开下面两类固件干扰；
+3. **整片擦除**：`FLASH_MASS_ERASE=1 cargo run --release`，清理半擦除/受保护的
+   Flash（一次失败的擦除会留下部分扇区为空，重新烧录前先整片擦除更干净）；
+4. **独立供电**：用板子自己的电源而不是调试器 3.3V，确认共地。擦除的电流尖峰
+   造成欠压时，表现正是"擦到一半内核复位"；
+5. **读寄存器确认现场**：
+   ```bash
+   .venv/bin/pyocd commander -t hc32f460xe -N -c "read32 0xE000EDF0"  # DHCSR
+   .venv/bin/pyocd commander -t hc32f460xe -c "read32 0xE000ED90"     # MPU_CTRL
+   ```
+   DHCSR 的 S_RESET_ST/S_HALT/S_SLEEP/S_LOCKUP 位说明当时内核状态；MPU_CTRL=0x5
+   表示固件的 MPU 正在生效。
+
+两类**固件侧**干扰（都用 `connect_mode=under-reset` 规避）：
+
+- **看门狗（两套都要关）**：
+  - *MCU 内部 WDT*（`CFG_WDT_ENABLE=true`）溢出约 2.68 s，且硬件在调试停机期间
+    继续计数，调试器一 halt，supervisor 停止喂狗，长时间擦除会被它复位打断；
+  - *板载外部硬件看门狗*（`CFG_HWDT_ENABLE=true`，PB4 使能/PB5 喂狗）由主控 GPIO
+    喂狗，停机即停止喂狗，1 s 周期内就会复位整机。本板实测：**外部看门狗使能时
+    烧录会在擦除中途失败**（现象与本节开头的报错一致），`CFG_HWDT_ENABLE=false`
+    （固件启动即把 PB4 拉高禁用）后烧录正常；
+  - 因此烧录/产线/断点调试都必须用 `CFG_HWDT_ENABLE=false` + `CFG_WDT_ENABLE=false`；
+    若目标上已运行"看门狗使能"的固件，可先用 `under-reset`（在固件配置 GPIO 之前
+    停住内核）或板上的看门狗禁用措施把它停掉；
+- **MPU 把 SRAM 设为 XN**：本工程 MPU 区域 R2 将 SRAM 标为"可读写、不可执行"
+  （`src/mpu.rs`），而 pyocd 的 HC32F460 flash 算法恰恰在 SRAM 里执行。若在
+  *已运行该固件* 的目标上以默认 `connect_mode=halt` 连接，算法取指会触发
+  MemManage 故障。`under-reset` 在固件配置 MPU 之前停住内核，可避免此冲突；
+  诊断对照可烧一版 `CFG_MPU_ENABLE=false`。
+
+### 烧录脚本环境变量
+
+`scripts/flash.sh` 支持 `PYOCD_PROBE`/`PYOCD_TARGET`/`PYOCD`/`FLASH_FREQ`/
+`FLASH_CONNECT`/`FLASH_RESET_TYPE`/`FLASH_MASS_ERASE`/`FLASH_EXTRA`/
+`FLASH_AUTO_RETRY`（首次失败自动用 500 kHz + under-reset 重试一次）/
+`FLASH_DRY_RUN`（只打印命令）。

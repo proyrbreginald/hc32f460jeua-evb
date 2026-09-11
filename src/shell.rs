@@ -376,7 +376,11 @@ static COMMANDS: &[Command] = &[
     cmd("level", "磨损均衡: 快照搬到磨损最低区", cmd_level),
     cmd("mount", "重新挂载", cmd_mount),
     cmd("mkfs", "清空: mkfs --force", cmd_mkfs),
-    cmd("led", "LED on|off", cmd_led),
+    cmd(
+        "led",
+        "LED: led <work|success|error> [on|off|toggle]",
+        cmd_led,
+    ),
     #[cfg(can_enabled)]
     cmd(
         "can",
@@ -685,8 +689,10 @@ fn cmd_sysinfo(state: &mut ShellState, _rest: &str) -> CmdResult {
     sysinfo_line(
         "UART",
         format_args!(
-            "USART{} {} bps {}{}{} (过采样 {}, 分频 {}, 流控 {}, 噪声滤波 {})",
+            "USART{} (PC{}/PH{}) {} bps {}{}{} (过采样 {}, 分频 {}, 流控 {}, 噪声滤波 {})",
             config::UART_UNIT,
+            config::UART_TX_PIN,
+            config::UART_RX_PIN,
             config::UART_BAUDRATE,
             db,
             par,
@@ -710,12 +716,147 @@ fn cmd_sysinfo(state: &mut ShellState, _rest: &str) -> CmdResult {
             config::UART_RX_IRQ_PRIORITY
         ),
     );
+
+    // ---- CAN (仅 CFG_CAN_ENABLE=true 时编译, 与驱动/`can` 命令同门控) ----
+    #[cfg(can_enabled)]
+    {
+        let timing = config::CAN_BIT_TIMING;
+        // CANCLK 固定为 XTAL (与实际位时序计算同源: `Can::init` 用 Clocks 快照的
+        // xtal_hz(), 其值即配置的 XTAL 频率)
+        let canclk = crate::clk::XTAL_HZ;
+        sysinfo_line(
+            "CAN",
+            format_args!(
+                "{} bps (实际 {}, 误差 {} ppm), 采样点 {}‰, {} TQ, 模式 {}",
+                config::CAN_BITRATE,
+                timing.actual_bitrate(canclk),
+                timing.error_ppm(canclk, config::CAN_BITRATE),
+                timing.sample_point_permille(),
+                timing.total_time_quanta(),
+                config::CAN_MODE.name()
+            ),
+        );
+        sysinfo_line(
+            "CAN 时序",
+            format_args!(
+                "PRESC={} SEG1={} SEG2={} SJW={}, SBT={:#010X}, 误差上限 {} ppm, CANCLK={} Hz",
+                timing.prescaler,
+                timing.time_seg1,
+                timing.time_seg2,
+                timing.sjw,
+                timing.register_value(),
+                config::CAN_MAX_BITRATE_ERROR_PPM,
+                canclk
+            ),
+        );
+        sysinfo_line(
+            "CAN 引脚",
+            format_args!(
+                "PB{}(TX,Func{}) PB{}(RX,Func{}), 筛选 {} ID={:#X} MASK={:#X}",
+                config::CAN_TX_PIN,
+                config::CAN_TX_FSEL,
+                config::CAN_RX_PIN,
+                config::CAN_RX_FSEL,
+                config::CAN_FILTER_TYPE.name(),
+                config::CAN_FILTER_ID,
+                config::CAN_FILTER_MASK
+            ),
+        );
+        sysinfo_line(
+            "CAN 策略",
+            format_args!(
+                "自动重发 PTB/STB {}/{}, 优先级 {}, 自应答 {}, 收错误帧 {}",
+                if config::CAN_PTB_SINGLE_SHOT {
+                    "关"
+                } else {
+                    "开"
+                },
+                if config::CAN_STB_SINGLE_SHOT {
+                    "关"
+                } else {
+                    "开"
+                },
+                match config::CAN_STB_PRIORITY {
+                    crate::can::StbPriority::Fifo => "fifo",
+                    crate::can::StbPriority::LowestIdFirst => "id",
+                },
+                if config::CAN_SELF_ACK { "开" } else { "关" },
+                if config::CAN_RX_ALL_FRAMES {
+                    "开"
+                } else {
+                    "关"
+                }
+            ),
+        );
+        sysinfo_line(
+            "CAN 阈值",
+            format_args!(
+                "警告 RX {} / 错误 {}, RX 溢出 {}, 收发超时 {} ms",
+                config::CAN_RX_WARN_LIMIT,
+                config::CAN_ERROR_WARN_LIMIT,
+                match config::CAN_RX_OVERFLOW {
+                    crate::can::RxOverflowMode::OverwriteOldest => "overwrite-oldest",
+                    crate::can::RxOverflowMode::DiscardNewest => "discard-newest",
+                },
+                config::CAN_TIMEOUT_MS
+            ),
+        );
+        // 运行状态: 未初始化时控制器时钟被门控, 状态寄存器不可读, 只报状态
+        let board_can = crate::board::BoardResources::get().can();
+        match board_can.work_mode() {
+            Some(mode) => {
+                let info = board_can.error_info();
+                sysinfo_line(
+                    "CAN 状态",
+                    format_args!(
+                        "已初始化 ({}), TEC={} REC={}, RX FIFO {:?}, 最近错误 {:?}",
+                        mode.name(),
+                        info.tx_count,
+                        info.rx_count,
+                        board_can.rx_buffer_status(),
+                        info.kind
+                    ),
+                );
+            }
+            None => sysinfo_line(
+                "CAN 状态",
+                format_args!("未初始化 (shell `can init` 可启用)"),
+            ),
+        }
+    }
+
+    sysinfo_line(
+        "WDT",
+        format_args!(
+            "MCU 内部看门狗 {}, 喂狗 {} ms, 优先级 P{}",
+            if config::WDT_ENABLE { "开" } else { "关" },
+            config::WDT_FEED_INTERVAL_MS,
+            config::WDT_PRIORITY
+        ),
+    );
+    sysinfo_line(
+        "HWDT",
+        format_args!(
+            "板载看门狗 当前{}, PB{} 使能控制 (高=禁/低=使能), PB{} 每 {} ms 喂狗, P{}",
+            if crate::board::BoardResources::get().hwdt_enabled() {
+                "使能"
+            } else {
+                "禁用"
+            },
+            config::HWDT_ENABLE_PIN,
+            config::HWDT_FEED_PIN,
+            config::HWDT_FEED_INTERVAL_MS,
+            config::HWDT_PRIORITY
+        ),
+    );
     sysinfo_line(
         "LED",
         format_args!(
-            "PC{} (初始{})",
-            config::LED_PIN,
-            if config::LED_INITIAL_LEVEL == crate::gpio::Level::High {
+            "work=PB{} success=PB{} error=PB{} ({}点亮)",
+            config::LED_WORK_PIN,
+            config::LED_SUCCESS_PIN,
+            config::LED_ERROR_PIN,
+            if config::LED_ACTIVE_HIGH {
                 "高电平"
             } else {
                 "低电平"
@@ -1400,18 +1541,60 @@ fn cmd_mkfs(state: &mut ShellState, rest: &str) -> CmdResult {
     CmdResult::Ok
 }
 
-/// LED 控制
+/// LED 控制: `led <work|success|error> [on|off|toggle|status]`
 fn cmd_led(_state: &mut ShellState, rest: &str) -> CmdResult {
-    match rest.trim() {
+    use crate::board::Led;
+    let mut words = rest.split_whitespace();
+    let name = words.next().unwrap_or("");
+    let action = words.next().unwrap_or("status");
+    let led = match name {
+        "work" | "w" => Led::Work,
+        "success" | "ok" | "s" => Led::Success,
+        "error" | "err" | "e" => Led::Error,
+        _ => {
+            println!("用法: led <work|success|error> [on|off|toggle|status]");
+            return CmdResult::Ok;
+        }
+    };
+    let board = crate::board::BoardResources::get();
+    match action {
         "on" => {
-            crate::board::BoardResources::get().set_led(true);
-            println!("LED on");
+            board.set_led(led, true);
+            println!("LED {} on", led.name());
         }
         "off" => {
-            crate::board::BoardResources::get().set_led(false);
-            println!("LED off");
+            board.set_led(led, false);
+            println!("LED {} off", led.name());
         }
-        _ => println!("用法: led on|off"),
+        "toggle" => {
+            board.toggle_led(led);
+            println!(
+                "LED {} {}",
+                led.name(),
+                if board.led_is_on(led) { "on" } else { "off" }
+            );
+        }
+        "status" => {
+            println!(
+                "LED work={} success={} error={}",
+                if board.led_is_on(Led::Work) {
+                    "on"
+                } else {
+                    "off"
+                },
+                if board.led_is_on(Led::Success) {
+                    "on"
+                } else {
+                    "off"
+                },
+                if board.led_is_on(Led::Error) {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+        }
+        _ => println!("用法: led <work|success|error> [on|off|toggle|status]"),
     }
     CmdResult::Ok
 }

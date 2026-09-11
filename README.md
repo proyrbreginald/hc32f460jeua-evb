@@ -27,14 +27,17 @@ RT-Thread v5.2.2 语义移植的单核 RTOS。
 
 - `thumbv7em-none-eabihf` 目标，Cortex-M4F FPU，定制启动代码、链接脚本和完整
   异常/144 路外设中断向量表；
-- MRC/HRC/XTAL/MPLL 时钟链，失败自动回退并把实际频率快照传给各驱动；
+- MRC/HRC/XTAL/MPLL 时钟链（12 MHz XTAL → 200 MHz），失败自动回退并把实际频率
+  快照传给各驱动；
 - GPIO、USART1~4、DMA1/2、经典 CAN 2.0B、RTC、EFM Flash、CRC、SRAMC、MPU；
 - TLSF 全局堆，支持任意 2 的幂对齐，checked 算术拒绝越界布局；
 - 32 级位图抢占调度、时间片轮转、优先级继承互斥量、信号量、事件、邮箱、消息
   队列、硬定时器和线程僵尸回收；
 - 固定容量日志环、分级/彩色日志、Flash 日志轮转、串口 shell 和 ZMODEM；
 - 有界、无堆、断电安全的整快照文件系统；
-- DWT 实时指标、WDT supervisor、MPU 栈守卫、panic/fault 诊断、自检和长期 soak。
+- DWT 实时指标、MPU 栈守卫、panic/fault 诊断、自检和长期 soak；
+- 两套看门狗：MCU 内部 WDT（PCLK3 计数、溢出复位）与**板载外部硬件看门狗**
+  （PB4 高=禁用/低=使能，PB5 按 `CFG_HWDT_FEED_MS` 周期喂狗，默认启动禁用）。
 
 ## 快速开始
 
@@ -65,9 +68,13 @@ cargo build --release          # release
 cargo run --release
 ```
 
-默认控制台为 USART1：PA9 TX、PA10 RX，115200 8N1、无流控。启动后使用
-`root`/`root` 登录；产品部署前必须修改 `.cargo/config.toml` 中的凭据，并根据
-现场需求调整 WDT 和 panic 策略。
+默认控制台为 USART3：PC13 TX、PH2 RX（Func_Grp2 复用），115200 8N1、无流控。
+系统时钟由 12 MHz 外部晶振经 MPLL 倍频到 200 MHz，同一晶振同时作为 CAN 通信
+时钟；板载三路 LED：PB12=WORK（心跳）、PB14=SUCCESS（启动完成）、
+PB13=ERROR（故障），均为高电平点亮。启动后使用
+`root`/`root` 登录；产品部署前必须修改 `.cargo/config.toml` 中的凭据，开启板载
+外部看门狗（`CFG_HWDT_ENABLE=true`）并按现场需求调整 WDT 和 panic 策略 ——
+注意烧录/调试必须保持 `CFG_WDT_ENABLE=false` + `CFG_HWDT_ENABLE=false`。
 
 ## 目录结构
 
