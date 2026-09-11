@@ -4,6 +4,10 @@
 //! **同步执行** (由 shell 的 `selftest` 命令调用, 完成后才出下一提示符);
 //! 每项检查后轮询 ESC, 按下即中断剩余项。
 //!
+//! CAN 项在应用 CAN (`CFG_CAN_ENABLE`) 或 shell `can init` 已占用控制器时
+//! **临时接管** (RESET 会清空收发队列), 测试结束按原工作模式恢复; 只有
+//! CAN IRQ 消费者仍注册 (接管会架空其中断路由) 时跳过。
+//!
 //! 日志分级: **trace** 级输出每项执行细节 (实际返回值/耗时等,
 //! `log level trace` 打开), **info** 级输出 PASS/FAIL 结果;
 //! 汇总一行始终打印 (命令的执行结果, 不受日志开关影响)。
@@ -78,7 +82,6 @@ const CAN_SELFTEST_FRAMES: [crate::can::TxFrame; 3] = [
 
 #[derive(Clone, Copy, Debug)]
 enum CanSelftestError {
-    ApplicationCanEnabled,
     IrqConsumerRegistered,
     Aborted,
     Driver(crate::can::CanError),
@@ -97,6 +100,7 @@ enum CanSelftestError {
         before: crate::can::ErrorInfo,
         after: crate::can::ErrorInfo,
     },
+    RestoreApplication(crate::can::CanError),
     RestoreClock(crate::clk::ClkError),
 }
 
@@ -109,7 +113,6 @@ impl From<crate::can::CanError> for CanSelftestError {
 impl core::fmt::Display for CanSelftestError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::ApplicationCanEnabled => write!(f, "应用 CAN 已启用，不能取得独占控制权"),
             Self::IrqConsumerRegistered => write!(f, "CAN IRQ consumer 仍已注册"),
             Self::Aborted => write!(f, "用户按 ESC 中止"),
             Self::Driver(error) => write!(f, "驱动错误: {:?}", error),
@@ -143,6 +146,7 @@ impl core::fmt::Display for CanSelftestError {
                 "内部回环使错误计数增加: REC {}->{}, TEC {}->{}",
                 before.rx_count, after.rx_count, before.tx_count, after.tx_count
             ),
+            Self::RestoreApplication(error) => write!(f, "恢复应用 CAN 失败: {:?}", error),
             Self::RestoreClock(error) => write!(f, "恢复 XTAL 状态失败: {:?}", error),
         }
     }
@@ -201,40 +205,63 @@ fn expect_filter_rejection(
     Ok(())
 }
 
-fn restore_can(can: &crate::can::Can, xtal_was_enabled: bool) -> Result<(), CanSelftestError> {
-    can.deinit();
-    if !xtal_was_enabled {
+fn restore_can(
+    board: &crate::board::BoardResources,
+    previous_mode: Option<crate::can::WorkMode>,
+    xtal_was_enabled: bool,
+) -> Result<(), CanSelftestError> {
+    board
+        .can_release(previous_mode)
+        .map_err(CanSelftestError::RestoreApplication)?;
+    // 接管恢复后控制器仍在使用 XTAL; 只有测试前本就未初始化 (因而也未
+    // 使能 XTAL) 时才关闭它, 恢复测试前的电源状态。
+    if previous_mode.is_none() && !xtal_was_enabled {
         crate::clk::xtal_cmd(false).map_err(CanSelftestError::RestoreClock)?;
     }
     Ok(())
 }
 
+/// CAN 内部回环自检结果 (调用方据此报告接管与原模式恢复情况)。
+#[derive(Clone, Copy, Debug)]
+struct CanLoopbackReport {
+    timing: crate::can_timing::BitTiming,
+    /// 接管前的工作模式 (`None` = 控制器原本空闲, 测试后保持未初始化)
+    previous_mode: Option<crate::can::WorkMode>,
+}
+
 /// Internal loopback does not drive the TX pin and automatically generates ACK, so it
 /// is safe on this board without a PHY. The test still exercises both TX buffer
 /// classes and the receive acceptance path used in normal operation.
-fn can_loopback_test() -> Result<crate::can_timing::BitTiming, CanSelftestError> {
-    if crate::config::CAN_ENABLE {
-        return Err(CanSelftestError::ApplicationCanEnabled);
-    }
-    let can = crate::board::BoardResources::get().can();
+///
+/// 应用 CAN (`CFG_CAN_ENABLE`) 或 shell `can init` 已占用控制器时, 先临时接管
+/// (RESET 清空收发队列), 测试结束后按原工作模式恢复; 仅当 IRQ 消费者仍注册
+/// (接管会架空其路由) 时拒绝执行。
+fn can_loopback_test() -> Result<CanLoopbackReport, CanSelftestError> {
+    let board = crate::board::BoardResources::get();
+    let can = board.can();
     if can.irq_registered() {
         return Err(CanSelftestError::IrqConsumerRegistered);
     }
+    let clocks = board.clocks();
     let xtal_was_enabled = crate::clk::xtal_enabled();
+    let previous_mode = board.can_takeover();
     let test = (|| {
-        let timing = can.init(crate::can::Config {
-            mode: crate::can::WorkMode::InternalLoopback,
-            filters: &CAN_SELFTEST_FILTERS,
-            self_ack: false,
-            ptb_single_shot: false,
-            stb_single_shot: false,
-            stb_priority: crate::can::StbPriority::Fifo,
-            rx_warn_limit: 10,
-            rx_all_frames: false,
-            rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
-            interrupts: crate::can::Interrupts::ALL,
-            ..crate::config::CAN_CONFIG
-        })?;
+        let timing = can.init(
+            clocks,
+            crate::can::Config {
+                mode: crate::can::WorkMode::InternalLoopback,
+                filters: &CAN_SELFTEST_FILTERS,
+                self_ack: false,
+                ptb_single_shot: false,
+                stb_single_shot: false,
+                stb_priority: crate::can::StbPriority::Fifo,
+                rx_warn_limit: 10,
+                rx_all_frames: false,
+                rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
+                interrupts: crate::can::Interrupts::ALL,
+                ..crate::config::CAN_CONFIG
+            },
+        )?;
 
         while can.try_receive().is_some() {}
         can.clear_status(can.status());
@@ -314,8 +341,11 @@ fn can_loopback_test() -> Result<crate::can_timing::BitTiming, CanSelftestError>
         Ok(timing)
     })();
 
-    match restore_can(can, xtal_was_enabled) {
-        Ok(()) => test,
+    match restore_can(board, previous_mode, xtal_was_enabled) {
+        Ok(()) => test.map(|timing| CanLoopbackReport {
+            timing,
+            previous_mode,
+        }),
         Err(error) => Err(error),
     }
 }
@@ -326,29 +356,35 @@ pub(crate) fn run_can() {
         crate::println!("[selftest] CAN 已跳过 (CFG_CAN_SELFTEST_ENABLE=false)");
         return;
     }
-    if crate::config::CAN_ENABLE {
-        crate::println!("[selftest] CAN 已跳过 (应用 CAN 已启用，测试会清空收发队列)");
-        return;
-    }
-    if crate::board::BoardResources::get().can().irq_registered() {
+    let can = crate::board::BoardResources::get().can();
+    if can.irq_registered() {
         crate::println!("[selftest] CAN 已跳过 (CAN IRQ consumer 仍已注册)");
         return;
     }
+    if can.is_initialized() {
+        crate::println!("[selftest] CAN: 临时接管控制器 (清空收发队列, 测试后按原模式恢复)");
+    }
     crate::log_info!("[selftest] 开始 CAN 内部回环自检");
     match can_loopback_test() {
-        Ok(timing) => {
+        Ok(report) => {
             crate::log_info!("[PASS] CAN: 过滤器/PTB/STB/标准帧/扩展帧/RTR");
-            crate::println!(
-                "[selftest] CAN 完成: 1 通过, 0 失败 ({} bps, 采样点 {}‰)",
-                timing.actual_bitrate(crate::clk::XTAL_HZ),
-                timing.sample_point_permille()
-            );
+            let bps = report.timing.actual_bitrate(crate::clk::XTAL_HZ);
+            let sample = report.timing.sample_point_permille();
+            match report.previous_mode {
+                Some(mode) => crate::println!(
+                    "[selftest] CAN 完成: 1 通过, 0 失败 ({bps} bps, 采样点 {sample}‰, 已恢复 {} 模式)",
+                    mode.name()
+                ),
+                None => crate::println!(
+                    "[selftest] CAN 完成: 1 通过, 0 失败 ({bps} bps, 采样点 {sample}‰)"
+                ),
+            }
         }
         Err(CanSelftestError::Aborted) => {
             crate::println!("[selftest] CAN 已中断 (ESC)");
         }
         Err(error) => {
-            crate::log_info!("[FAIL] CAN: {}", error);
+            crate::log_error!("[FAIL] CAN: {}", error);
             crate::println!("[selftest] CAN 完成: 0 通过, 1 失败 ({})", error);
         }
     }
@@ -371,7 +407,8 @@ pub(crate) fn run() {
             crate::log_info!("[PASS] {}", name);
         } else {
             fail += 1;
-            crate::log_info!("[FAIL] {}", name);
+            // 失败项以 error 级 (红色 [ERR]) 输出, 与通过项的绿色区分
+            crate::log_error!("[FAIL] {}", name);
         }
         // 每项后检查 ESC (中断剩余项)
         if abort_requested() {
@@ -536,14 +573,14 @@ pub(crate) fn run() {
         format_args!("recv() = {:?}", r),
     );
 
-    // 延时: uptime 前进
+    // 延时: uptime 前进 (回绕安全比较, 与 soak 的 wrapping 语义一致)
     let t0 = crate::rtos::uptime_ms();
     crate::rtos::thread_delay_ms(20).expect("selftest 延时必须在线程上下文");
     let t1 = crate::rtos::uptime_ms();
     check(
-        t1 >= t0 + 20,
+        t1.wrapping_sub(t0) >= 20,
         "线程延时: uptime 前进 ≥ 20ms",
-        format_args!("延时 20ms, 实际 {}ms", t1 - t0),
+        format_args!("延时 20ms, 实际 {}ms", t1.wrapping_sub(t0)),
     );
 
     // 线程强制删除与自然退出 (defunct 回收)
@@ -660,16 +697,20 @@ pub(crate) fn run() {
         );
     }
 
-    // RESET 会清空硬件 RX/STB，应用 CAN/IRQ consumer 存在时不能安全接管。
+    // 应用 CAN / shell `can init` 占用控制器时临时接管 (RESET 清空收发队列),
+    // 测试后按原工作模式恢复; 仅 IRQ 消费者仍注册时无法安全接管。
     if !aborted.get() {
         let can = crate::board::BoardResources::get().can();
         if !crate::config::CAN_SELFTEST_ENABLE {
             crate::println!("[SKIP] CAN (CFG_CAN_SELFTEST_ENABLE=false)");
-        } else if crate::config::CAN_ENABLE {
-            crate::println!("[SKIP] CAN (应用 CAN 已启用，测试会清空收发队列)");
         } else if can.irq_registered() {
             crate::println!("[SKIP] CAN (CAN IRQ consumer 仍已注册)");
         } else {
+            if can.is_initialized() {
+                crate::println!(
+                    "[selftest] CAN: 临时接管控制器 (清空收发队列, 测试后按原模式恢复)"
+                );
+            }
             let result = can_loopback_test();
             if matches!(result, Err(CanSelftestError::Aborted)) {
                 aborted.set(true);
@@ -694,5 +735,8 @@ pub(crate) fn run() {
         );
     } else {
         crate::println!("[selftest] 完成: {} 通过, {} 失败", pass, fail);
+        if fail > 0 {
+            crate::println!("[selftest] 存在失败项, 详见上方红色 [ERR] 输出");
+        }
     }
 }

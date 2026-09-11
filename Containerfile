@@ -1,23 +1,30 @@
-# 1. 换成更轻量的基础镜像（debian:slim 只有约 30MB，且与 Ubuntu 一样使用 apt）
+# 开发容器: Debian slim + Python (pyocd) + Rust (最新 stable)。
+# 容器内还需: python3 -m venv .venv && .venv/bin/pip install pyocd
+# (见 README"开发环境容器")。
 FROM debian:bookworm-slim
 
-# 2. 设置环境变量
+# 实际 cargo 家目录为 /root/.cargo (PATH 已指向)
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# 3. 将所有安装与清理步骤合并在“同一条 RUN 指令”中
+# 所有安装与清理步骤合并在同一条 RUN 指令中 (镜像层最小化)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     python3 \
     python3-venv \
     && \
-    # 3. 安装 Rust 时指定 --profile minimal（只安装 rustc/cargo/std，不安装几百兆的文档）
+    # 安装最新 stable Rust: minimal profile + rustfmt/clippy
+    # (scripts/verify.sh 的前置条件) + 目标双架构
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
        --no-modify-path \
        --profile minimal \
        --default-toolchain stable \
+       --component rustfmt \
+       --component clippy \
+       --target thumbv7em-none-eabihf \
+       --target x86_64-unknown-linux-gnu \
     && \
-    # 4. 清理无用的编译依赖和缓存
+    # 清理: 移除 curl、apt 列表与 cargo 缓存 (路径为 /root/.cargo)
     apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /usr/local/cargo/registry/cache/* \
-    && rm -rf /usr/local/cargo/git/db/*
+    && rm -rf /root/.cargo/registry/cache/* \
+    && rm -rf /root/.cargo/registry/src/*

@@ -12,11 +12,17 @@
 //! 控制台 UART 同时承载协议字节与状态文本。协议接收端对帧前字节一律
 //! 按垃圾丢弃 (lrzsz 的 `zgethdr` 语义), 因此**仅在帧间空闲点**打印:
 //! 会话开始/结束、文件开始 (决定/跳过) 与文件完成 (提交)。数据流中
-//! 不打印任何内容, 避免干扰对端 (尤其流式 `ZCRCG` 阶段)。
+//! 的进度输出经 [`crate::console::write_fmt_raw`] 无锁通道 (受协议
+//! 垃圾预算保护, ~40B/500ms, 且会话期间唯一写入者)。
+//!
+//! **会话互斥**: 会话进行期间 [`crate::console`] 对普通线程打印整体
+//! 静默 (见 console 模块"ZMODEM 会话静默"), 业务线程日志/提示符不会
+//! 与协议字节交错; 会话经 RAII 守卫标注, 任何返回路径都会恢复。
 //!
 //! 中止: 帧间等待时按 ESC 取消会话 (发送 CAN×5 通知对端)。
 
 use crate::config;
+use crate::console::{self, write_fmt_raw};
 use crate::println;
 use crate::uart_rtos::UartRtosExt;
 use crate::zmodem::{self, SendFile, ZmConfig, ZmError, ZmPort};
@@ -26,6 +32,23 @@ use super::{CmdResult, ShellState, mounted_filesystem};
 
 /// 进度输出节流 (毫秒)
 const PROGRESS_INTERVAL_MS: u32 = 500;
+
+/// ZMODEM 会话 RAII 守卫: 进入数据收发时静默其他线程打印, 离开时恢复。
+/// 任何返回路径 (含错误) 析构都保证恢复。
+struct SessionActive;
+
+impl SessionActive {
+    fn enter() -> Self {
+        console::set_session_active(true);
+        Self
+    }
+}
+
+impl Drop for SessionActive {
+    fn drop(&mut self) {
+        console::set_session_active(false);
+    }
+}
 
 // ============================== UART 端口适配 ==============================
 
@@ -198,9 +221,18 @@ pub(super) fn cmd_sz(state: &mut ShellState, rest: &str) -> CmdResult {
                 } else {
                     (100 * sent).checked_div(total).unwrap_or(0)
                 };
-                crate::print!("\r 已发送 {}/{} B ({}%)", sent, total, pct);
+                // 协议自身的进度: 经无锁通道 (会话静默不影响; 数据流中
+                // 的少量状态字节受对端垃圾预算保护, 见模块说明)
+                write_fmt_raw(core::format_args!(
+                    "\r 已发送 {}/{} B ({}%)",
+                    sent,
+                    total,
+                    pct
+                ));
             }
         };
+        // 会话静默: 数据收发期间业务线程打印整体丢弃, 防协议被污染
+        let _session = SessionActive::enter();
         zmodem::send_session(
             &mut port,
             &zm_config(),
@@ -244,27 +276,44 @@ pub(super) fn cmd_rz(state: &mut ShellState, rest: &str) -> CmdResult {
             println!("rz: 文件系统未挂载");
             return CmdResult::Ok;
         };
+        // 会话静默: 数据收发期间业务线程打印整体丢弃, 防协议被污染
+        let _session = SessionActive::enter();
         // 两个回调 (decide/commit) 分时独占文件系统句柄, 用 RefCell 共享
         let filesystem = RefCell::new(filesystem);
         let capacity = buffer.len();
         let mut decide = |raw_name: &[u8], size: u32| {
+            // 状态输出经无锁通道: 本回调运行在帧间空闲点 (try_init 内),
+            // 且会话内唯一写入者即本线程 (普通打印已被静默)
             let Some(name) = sanitize_name(raw_name) else {
-                println!("rz: 跳过: 文件名无效");
+                write_fmt_raw(core::format_args!("rz: 跳过: 文件名无效\r\n"));
                 return false;
             };
             if size > capacity as u32 {
-                println!("rz: 跳过 {} ({} B 超过 {} B 上限)", name, size, capacity);
+                write_fmt_raw(core::format_args!(
+                    "rz: 跳过 {} ({} B 超过 {} B 上限)\r\n",
+                    name,
+                    size,
+                    capacity
+                ));
                 return false;
             }
             // 预检文件系统剩余容量 (整文件原子写入)
             match filesystem.borrow_mut().max_write_size(name) {
                 Ok(available) if size as usize <= available as usize => true,
                 Ok(available) => {
-                    println!("rz: 跳过 {} (文件系统剩余 {} B)", name, available);
+                    write_fmt_raw(core::format_args!(
+                        "rz: 跳过 {} (文件系统剩余 {} B)\r\n",
+                        name,
+                        available
+                    ));
                     false
                 }
                 Err(error) => {
-                    println!("rz: 跳过 {} ({})", name, super::fs_error_summary(&error));
+                    write_fmt_raw(core::format_args!(
+                        "rz: 跳过 {} ({})\r\n",
+                        name,
+                        super::fs_error_summary(&error)
+                    ));
                     false
                 }
             }
@@ -274,10 +323,18 @@ pub(super) fn cmd_rz(state: &mut ShellState, rest: &str) -> CmdResult {
                 return Err(ZmError::Protocol("文件名无效"));
             };
             filesystem.borrow_mut().write(name, data).map_err(|error| {
-                println!("rz: 写入失败: {}", super::fs_error_summary(&error));
+                write_fmt_raw(core::format_args!(
+                    "rz: 写入失败: {}\r\n",
+                    super::fs_error_summary(&error)
+                ));
                 ZmError::File("文件系统写入失败")
             })?;
-            println!("rz: 已接收 {} ({} B)", name, data.len());
+            // 帧间空闲点 (文件数据接收完成、下一帧头之前)
+            write_fmt_raw(core::format_args!(
+                "rz: 已接收 {} ({} B)\r\n",
+                name,
+                data.len()
+            ));
             Ok(())
         };
         let mut progress = |_received: u32, _total: u32| {

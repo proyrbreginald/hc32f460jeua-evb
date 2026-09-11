@@ -74,6 +74,17 @@ pub enum DataWidth {
     Word = 4,
 }
 
+/// CRC 硬件句柄。句柄本身为零大小类型，所有权由 `Peripherals` 管理。
+pub struct Crc {
+    _private: (),
+}
+
+impl Crc {
+    pub(crate) const fn take() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// CRC 配置 (对齐 DDL `stc_crc_init_t`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Config {
@@ -216,17 +227,13 @@ pub fn accumulate(data: &[u8], width: DataWidth) {
             }
         }
         DataWidth::HalfWord => {
-            for chunk in data.chunks_exact(2) {
-                let v = u16::from_le_bytes([chunk[0], chunk[1]]);
-                dat0.write_u16(v);
+            for chunk in data.as_chunks::<2>().0 {
+                dat0.write_u16(u16::from_le_bytes(*chunk));
             }
         }
         DataWidth::Word => {
-            for chunk in data.chunks_exact(4) {
-                let mut b = [0u8; 4];
-                b.copy_from_slice(chunk);
-                let v = u32::from_le_bytes(b);
-                dat0.write(v);
+            for chunk in data.as_chunks::<4>().0 {
+                dat0.write(u32::from_le_bytes(*chunk));
             }
         }
     }

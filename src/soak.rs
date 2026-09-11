@@ -1089,24 +1089,35 @@ fn wait_can_tx(can: &crate::can::Can, buffer: crate::can::TxBuffer) -> bool {
 /// CAN 压力: 内部回环持续收发, 校验帧内容与错误计数
 extern "C" fn can_worker(param: usize) {
     let w = &WORKERS[param];
-    let can = crate::board::BoardResources::get().can();
+    let board = crate::board::BoardResources::get();
+    let can = board.can();
+    let clocks = board.clocks();
     let xtal_was_enabled = crate::clk::xtal_enabled();
+    // 应用 CAN / shell `can init` 已占用控制器时临时接管 (RESET 清空收发
+    // 队列), 压力结束后按原工作模式恢复。
+    let previous_mode = board.can_takeover();
+    if previous_mode.is_some() {
+        crate::log_debug!("[soak] CAN: 临时接管控制器, 结束后按原模式恢复");
+    }
     let mut ok = true;
 
     if can
-        .init(crate::can::Config {
-            mode: crate::can::WorkMode::InternalLoopback,
-            filters: &SOAK_CAN_FILTERS,
-            self_ack: false,
-            ptb_single_shot: false,
-            stb_single_shot: false,
-            stb_priority: crate::can::StbPriority::Fifo,
-            rx_warn_limit: 10,
-            rx_all_frames: false,
-            rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
-            interrupts: crate::can::Interrupts::ALL,
-            ..crate::config::CAN_CONFIG
-        })
+        .init(
+            clocks,
+            crate::can::Config {
+                mode: crate::can::WorkMode::InternalLoopback,
+                filters: &SOAK_CAN_FILTERS,
+                self_ack: false,
+                ptb_single_shot: false,
+                stb_single_shot: false,
+                stb_priority: crate::can::StbPriority::Fifo,
+                rx_warn_limit: 10,
+                rx_all_frames: false,
+                rx_overflow: crate::can::RxOverflowMode::DiscardNewest,
+                interrupts: crate::can::Interrupts::ALL,
+                ..crate::config::CAN_CONFIG
+            },
+        )
         .is_err()
     {
         ok = false;
@@ -1186,8 +1197,12 @@ extern "C" fn can_worker(param: usize) {
             w.beat();
         }
     }
-    can.deinit();
-    if !xtal_was_enabled {
+    // 结束接管: 原本已初始化时按原工作模式恢复应用 CAN; 原本空闲则保持
+    // 未初始化, 并还原测试前的 XTAL 电源状态。
+    if board.can_release(previous_mode).is_err() {
+        ok = false;
+    }
+    if previous_mode.is_none() && !xtal_was_enabled {
         let _ = crate::clk::xtal_cmd(false);
     }
     if !ok {
@@ -1331,12 +1346,13 @@ fn parse_args(args: &str) -> Option<(u32, Option<Vec<Selection>>)> {
 // ============================== 监控器 ==============================
 
 /// 可选的 CAN 压力跳过原因 (None = 可运行)
+///
+/// 应用 CAN 已初始化时由 [`can_worker`] 临时接管控制器 (RESET 清空收发队列)
+/// 并在压力结束后按原工作模式恢复, 因此只有显式关闭自检或 IRQ 消费者仍
+/// 注册时才跳过。
 fn can_skip_reason() -> Option<&'static str> {
     if !crate::config::CAN_SELFTEST_ENABLE {
         return Some("CFG_CAN_SELFTEST_ENABLE=false");
-    }
-    if crate::config::CAN_ENABLE {
-        return Some("应用 CAN 已启用 (会清空收发队列)");
     }
     if crate::board::BoardResources::get().can().irq_registered() {
         return Some("CAN IRQ consumer 仍已注册");
@@ -1404,12 +1420,23 @@ pub(crate) fn run(args: &str) {
     // PI 握手复位 (防御: 上次异常退出残留)
     PI_HOG_GO.store(false, Ordering::Relaxed);
     PI_HOG_ACK.store(false, Ordering::Relaxed);
+    // 累计统计复位: 本次运行的报告不得混入先前运行的数据
+    PI_MAX_WAIT.store(0, Ordering::Relaxed);
+    PI_ROUNDS.store(0, Ordering::Relaxed);
+    HEAP_ALLOC_FAILURES.store(0, Ordering::Relaxed);
+    TIMER_TICKS.store(0, Ordering::Relaxed);
+    IRQ_TICKS.store(0, Ordering::Relaxed);
+    for slot in STACK_PEAK.iter() {
+        slot.store(0, Ordering::Relaxed);
+    }
     // 直方图复位
     for b in DELAY_HIST.iter() {
         b.store(0, Ordering::Relaxed);
     }
     DELAY_SAMPLES.store(0, Ordering::Relaxed);
     DELAY_MAX.store(0, Ordering::Relaxed);
+    // 硬实时指标复位: 关中断/节拍延迟峰值从本次运行起重新累计
+    crate::latency::reset_peaks();
 
     // ---- 基线快照 ----
     let heap_base = crate::heap::used();
@@ -1536,8 +1563,10 @@ pub(crate) fn run(args: &str) {
             crate::sram::clear_status(crate::sram::ERR_ALL);
             crate::log_error!("[soak] SRAM 错误: {:?}", e);
         }
-        // 堆用量峰值
+        // 堆用量峰值 (趋势判定须用"本次更新前"的历史峰值, 见下方
+        // 报告期比较 —— 若先并入再比较, 突破判断恒为假, 见缺陷记录)
         let used = crate::heap::used();
+        let prior_peak = peak_heap;
         if used > peak_heap {
             peak_heap = used;
         }
@@ -1570,15 +1599,16 @@ pub(crate) fn run(args: &str) {
         }
         // 周期进度报告 + 泄漏趋势检测
         if now.wrapping_sub(last_report) >= crate::config::SOAK_REPORT_INTERVAL_MS {
-            // 峰值突破趋势: 连续报告期突破历史峰值 → 疑似泄漏 (不改判定,
-            // 最终判定由结束值阈值决定; 正常压力平台期峰值稳定不触发)
-            if used > peak_heap + 2048 {
+            // 峰值突破趋势: 连续报告期突破"上一秒更新前"的历史峰值 →
+            // 疑似泄漏 (不改判定, 最终判定由结束值阈值决定; 正常压力
+            // 平台期峰值稳定不触发)
+            if used > prior_peak + 2048 {
                 peak_break_streak += 1;
                 if peak_break_streak >= 3 {
                     crate::log_warn!(
                         "[soak] 堆用量持续突破历史峰值 (疑似泄漏趋势): {}B (历史峰值 {}B)",
                         used,
-                        peak_heap
+                        prior_peak
                     );
                     peak_break_streak = 0;
                 }
@@ -1658,7 +1688,29 @@ pub(crate) fn run(args: &str) {
         .iter()
         .map(|&id| WORKERS[id.index()].errors.load(Ordering::Relaxed))
         .sum();
-    let pass = total_errors == 0 && sram_errors == 0 && leak_ok && mtx_ok;
+
+    // ---- 硬实时指标判定 (DWT 实测峰值, 见 latency 模块) ----
+    let critical_cycles = crate::latency::max_critical_cycles();
+    let critical_flash_cycles = crate::latency::max_critical_flash_cycles();
+    let tick_latency_cycles = crate::latency::max_tick_latency_cycles();
+    let tick_latency_flash_cycles = crate::latency::max_tick_latency_flash_cycles();
+    let critical_us = crate::latency::cycles_to_us(critical_cycles);
+    let critical_flash_us = crate::latency::cycles_to_us(critical_flash_cycles);
+    let tick_latency_us = crate::latency::cycles_to_us(tick_latency_cycles);
+    let tick_latency_flash_us = crate::latency::cycles_to_us(tick_latency_flash_cycles);
+    let latency_ok = critical_us <= crate::config::SOAK_MAX_CRITICAL_US
+        && tick_latency_us <= crate::config::SOAK_MAX_IRQ_LATENCY_US;
+    if !latency_ok {
+        crate::log_error!(
+            "[soak] 硬实时指标超限: 最长关中断 {}µs (限 {}µs), 节拍到达延迟 {}µs (限 {}µs)",
+            critical_us,
+            crate::config::SOAK_MAX_CRITICAL_US,
+            tick_latency_us,
+            crate::config::SOAK_MAX_IRQ_LATENCY_US
+        );
+    }
+
+    let pass = total_errors == 0 && sram_errors == 0 && leak_ok && mtx_ok && latency_ok;
 
     // ---- 汇总报告: 单文件 HTML → /test/ (控制台仅保留结果一行) ----
     clear_bar();
@@ -1798,6 +1850,13 @@ pub(crate) fn run(args: &str) {
         wdt_enabled: crate::config::WDT_ENABLE,
         wdt_feed_gap_ms,
         wdt_timeout_ms,
+        critical_us,
+        critical_limit_us: crate::config::SOAK_MAX_CRITICAL_US,
+        critical_flash_us,
+        tick_latency_us,
+        tick_latency_limit_us: crate::config::SOAK_MAX_IRQ_LATENCY_US,
+        tick_latency_flash_us,
+        latency_ok,
         rows: &rows,
     };
     let html = crate::soak_report_core::build(&data);
@@ -1806,14 +1865,22 @@ pub(crate) fn run(args: &str) {
     // 报告写入失败/文件系统不可用时的紧凑控制台回退 (结果不丢失)
     let fallback_summary = |total_errors: u32, sram_errors: u32| {
         crate::println!(
-            "[soak]   摘要: {} 压力线程, 总错误 {}, SRAM {}, 堆净增 {}B, 线程 {}→{}, 互斥量 {}",
+            "[soak]   摘要: {} 压力线程, 总错误 {}, SRAM {}, 堆净增 {}B, 线程 {}→{}, 互斥量 {}, 实时性 {}",
             spawned.len(),
             total_errors,
             sram_errors,
             net_growth,
             thread_base,
             thread_end,
-            if mtx_ok { "通过" } else { "失败" }
+            if mtx_ok { "通过" } else { "失败" },
+            if latency_ok { "通过" } else { "失败" }
+        );
+        crate::println!(
+            "[soak]   实时性: 最长关中断 {}µs (限 {}µs), 节拍延迟 {}µs (限 {}µs)",
+            critical_us,
+            crate::config::SOAK_MAX_CRITICAL_US,
+            tick_latency_us,
+            crate::config::SOAK_MAX_IRQ_LATENCY_US
         );
     };
     if let Some(mut fs) = crate::filesystem::mounted() {

@@ -12,7 +12,7 @@
 //!
 //! # 命令系统
 //!
-//! 命令注册在静态表 [`COMMANDS`] 中 (名称/别名/帮助/执行函数), 分发逻辑
+//! 命令注册在静态表 [`COMMANDS`] 中 (名称/帮助/执行函数), 分发逻辑
 //! 与命令实现解耦。**新增命令 = 表内追加一项 + 加入 `CFG_SHELL_COMMANDS`
 //! 启用列表**, 无需修改分发/帮助代码。
 //!
@@ -21,11 +21,11 @@
 //! 且不显示在 `help` 中。命令内部参数 (如 `led` 的引脚、`selftest` 的
 //! 开关) 仍由各自的 `CFG_*` 配置控制。
 //!
-//! 当前命令: `help` / `sysinfo`(info) / `uptime` / `ps` / `free`(mem) /
+//! 当前命令: `help` / `sysinfo` / `uptime` / `ps` / `free` /
 //! `echo` / `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` /
-//! `write`(put) / `nano` / `sz` / `rz` / `rm` / `mv` / `stat` / `df`(fsinfo) /
-//! `fsck` / `mount` / `mkfs` / `led` / `log` / `selftest` / `soak` / `clear` /
-//! `whoami` / `reboot` / `logout`(exit)。
+//! `write` / `nano` / `sz` / `rz` / `rm` / `mv` / `stat` / `df` /
+//! `fsck` / `mount` / `mkfs` / `led` / `can` / `log` / `selftest` / `soak` /
+//! `clear` / `whoami` / `reboot` / `logout`。
 //!
 //! # 输入处理
 //!
@@ -38,6 +38,10 @@ mod editor;
 mod path;
 #[cfg(shell_zmodem)]
 mod zmodem;
+
+/// CAN 真机测试命令 (外部总线, 配合 CAN 转 USB 适配器; 随 CFG_CAN_ENABLE 编译)
+#[cfg(can_enabled)]
+mod can;
 
 use crate::config;
 use crate::heap;
@@ -321,10 +325,8 @@ enum CmdResult {
 
 /// 命令描述符: 注册在静态命令表中, 由 [`dispatch`] 统一查找/执行
 struct Command {
-    /// 主命令名 (`CFG_SHELL_COMMANDS` 按此名控制启用)
+    /// 命令名 (`CFG_SHELL_COMMANDS` 按此名控制启用)
     name: &'static str,
-    /// 别名 (可为空)
-    aliases: &'static [&'static str],
     /// 帮助文本 (一行说明, 不含命令名)
     help: &'static str,
     /// 执行函数: Shell 状态 + 命令名之后的剩余文本 (含前导空白)
@@ -334,13 +336,11 @@ struct Command {
 /// 命令表项构造器
 const fn cmd(
     name: &'static str,
-    aliases: &'static [&'static str],
     help: &'static str,
     handler: fn(&mut ShellState, &str) -> CmdResult,
 ) -> Command {
     Command {
         name,
-        aliases,
         help,
         handler,
     }
@@ -348,54 +348,54 @@ const fn cmd(
 
 /// 命令表: 新增命令 = 追加一项, 并加入 `CFG_SHELL_COMMANDS` 启用列表
 static COMMANDS: &[Command] = &[
-    cmd("help", &[], "命令列表", cmd_help),
-    cmd(
-        "sysinfo",
-        &["info"],
-        "系统信息 (型号/时钟/节拍)",
-        cmd_sysinfo,
-    ),
-    cmd("uptime", &[], "运行时间", cmd_uptime),
-    cmd("ps", &[], "线程列表", cmd_ps),
-    cmd("free", &["mem"], "堆内存统计", cmd_free),
-    cmd("echo", &[], "回显 <文本>", cmd_echo),
-    cmd("history", &[], "历史命令; -c 清空", cmd_history),
-    cmd("pwd", &[], "当前路径", cmd_pwd),
-    cmd("cd", &[], "切换路径: cd [目录]", cmd_cd),
-    cmd("ls", &[], "列出: ls [路径]", cmd_ls),
-    cmd("mkdir", &[], "建目录: mkdir <目录>", cmd_mkdir),
-    cmd("rmdir", &[], "删目录: rmdir <目录>", cmd_rmdir),
-    cmd("cat", &[], "读文件: cat <文件>", cmd_cat),
-    cmd("write", &["put"], "原子写: write <文件> [文本]", cmd_write),
+    cmd("help", "命令列表", cmd_help),
+    cmd("sysinfo", "系统信息 (型号/时钟/节拍)", cmd_sysinfo),
+    cmd("uptime", "运行时间", cmd_uptime),
+    cmd("ps", "线程列表", cmd_ps),
+    cmd("free", "堆内存统计", cmd_free),
+    cmd("echo", "回显 <文本>", cmd_echo),
+    cmd("history", "历史命令; -c 清空", cmd_history),
+    cmd("pwd", "当前路径", cmd_pwd),
+    cmd("cd", "切换路径: cd [目录]", cmd_cd),
+    cmd("ls", "列出: ls [路径]", cmd_ls),
+    cmd("mkdir", "建目录: mkdir <目录>", cmd_mkdir),
+    cmd("rmdir", "删目录: rmdir <目录>", cmd_rmdir),
+    cmd("cat", "读文件: cat <文件>", cmd_cat),
+    cmd("write", "原子写: write <文件> [文本]", cmd_write),
     #[cfg(shell_nano)]
-    cmd("nano", &[], "全屏编辑: nano <文件>", cmd_nano),
+    cmd("nano", "全屏编辑: nano <文件>", cmd_nano),
     #[cfg(shell_zmodem)]
-    cmd("sz", &[], "发送 (ZMODEM): sz <文件>...", zmodem::cmd_sz),
+    cmd("sz", "发送 (ZMODEM): sz <文件>...", zmodem::cmd_sz),
     #[cfg(shell_zmodem)]
-    cmd("rz", &[], "接收 (ZMODEM): rz (主机 sz)", zmodem::cmd_rz),
-    cmd("rm", &[], "删文件: rm <文件>", cmd_rm),
-    cmd("mv", &[], "移动: mv <旧> <新>", cmd_mv),
-    cmd("stat", &[], "路径信息: stat <路径>", cmd_stat),
-    cmd("df", &["fsinfo"], "文件系统容量/状态", cmd_df),
-    cmd("fsck", &[], "校验当前快照", cmd_fsck),
-    cmd("level", &[], "磨损均衡: 快照搬到磨损最低区", cmd_level),
-    cmd("mount", &[], "重新挂载", cmd_mount),
-    cmd("mkfs", &[], "清空: mkfs --force", cmd_mkfs),
-    cmd("led", &[], "LED on|off", cmd_led),
+    cmd("rz", "接收 (ZMODEM): rz (主机 sz)", zmodem::cmd_rz),
+    cmd("rm", "删文件: rm <文件>", cmd_rm),
+    cmd("mv", "移动: mv <旧> <新>", cmd_mv),
+    cmd("stat", "路径信息: stat <路径>", cmd_stat),
+    cmd("df", "文件系统容量/状态", cmd_df),
+    cmd("fsck", "校验当前快照", cmd_fsck),
+    cmd("level", "磨损均衡: 快照搬到磨损最低区", cmd_level),
+    cmd("mount", "重新挂载", cmd_mount),
+    cmd("mkfs", "清空: mkfs --force", cmd_mkfs),
+    cmd("led", "LED on|off", cmd_led),
+    #[cfg(can_enabled)]
+    cmd(
+        "can",
+        "CAN 测试: status|init|send|recv|listen",
+        can::cmd_can,
+    ),
     #[cfg(shell_selftest)]
-    cmd("selftest", &[], "自检: selftest [all|can]", cmd_selftest),
+    cmd("selftest", "自检: selftest [all|can]", cmd_selftest),
     #[cfg(shell_soak)]
-    cmd("soak", &[], "长稳: soak [分钟] [项|场景] (0=ESC)", cmd_soak),
+    cmd("soak", "长稳: soak [分钟] [项|场景] (0=ESC)", cmd_soak),
     cmd(
         "log",
-        &[],
         "日志开关/级别/落盘 (on|off|level <级>|file)",
         cmd_log,
     ),
-    cmd("clear", &[], "清屏", cmd_clear),
-    cmd("whoami", &[], "当前用户", cmd_whoami),
-    cmd("reboot", &[], "软复位", cmd_reboot),
-    cmd("logout", &["exit"], "重新登录", cmd_logout),
+    cmd("clear", "清屏", cmd_clear),
+    cmd("whoami", "当前用户", cmd_whoami),
+    cmd("reboot", "软复位", cmd_reboot),
+    cmd("logout", "重新登录", cmd_logout),
 ];
 
 /// shell 线程入口: 启动文件系统 → 登录 → 命令循环 (永不返回)
@@ -478,14 +478,14 @@ fn command_loop(state: &mut ShellState) {
         }
         state.history.push(cmd);
         if !dispatch(state, cmd) {
-            return; // logout / exit
+            return; // logout
         }
     }
 }
 
 /// 执行命令; 返回 false 表示退出 shell (重新登录)
 ///
-/// 在 [`COMMANDS`] 表中按主名/别名查找, 命中后检查 `CFG_SHELL_COMMANDS`
+/// 在 [`COMMANDS`] 表中按命令名查找, 命中后检查 `CFG_SHELL_COMMANDS`
 /// 启用列表, 通过则调用执行函数 (参数 = 命令名之后的剩余文本)。
 fn dispatch(state: &mut ShellState, line: &str) -> bool {
     let mut words = line.split_whitespace();
@@ -493,10 +493,7 @@ fn dispatch(state: &mut ShellState, line: &str) -> bool {
         return true;
     };
     let rest = &line[name.len()..];
-    let Some(cmd) = COMMANDS
-        .iter()
-        .find(|c| c.name == name || c.aliases.contains(&name))
-    else {
+    let Some(cmd) = COMMANDS.iter().find(|c| c.name == name) else {
         println!("{}: command not found (try `help`)", name);
         return true;
     };
@@ -507,7 +504,7 @@ fn dispatch(state: &mut ShellState, line: &str) -> bool {
     (cmd.handler)(state, rest) == CmdResult::Ok
 }
 
-/// 命令帮助: 仅列出 `CFG_SHELL_COMMANDS` 中启用的命令 (含别名)
+/// 命令帮助: 仅列出 `CFG_SHELL_COMMANDS` 中启用的命令
 fn cmd_help(_state: &mut ShellState, _rest: &str) -> CmdResult {
     println!("可用命令 (CFG_SHELL_COMMANDS 控制启用):");
     for c in COMMANDS {
@@ -515,14 +512,11 @@ fn cmd_help(_state: &mut ShellState, _rest: &str) -> CmdResult {
             continue;
         }
         println!("  {:<14} {}", c.name, c.help);
-        for alias in c.aliases {
-            println!("  {:<14} ({} 的别名)", alias, c.name);
-        }
     }
     CmdResult::Ok
 }
 
-/// 系统信息 (info/sysinfo): 运行状态 + 配置摘要
+/// 系统信息 (sysinfo): 运行状态 + 配置摘要
 fn cmd_sysinfo(state: &mut ShellState, _rest: &str) -> CmdResult {
     println!(
         "{} v{} — RT-Thread 架构的 Rust RTOS",
@@ -771,7 +765,7 @@ fn display_width(s: &str) -> usize {
     s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
-/// 输出 info 分节标题 (标题 + 分隔线, 总宽 48 列)
+/// 输出 sysinfo 分节标题 (标题 + 分隔线, 总宽 48 列)
 fn sysinfo_section(title: &str) {
     print!("── {} ", title);
     for _ in display_width(title)..44 {
@@ -780,7 +774,7 @@ fn sysinfo_section(title: &str) {
     println!();
 }
 
-/// 输出 info 一行 (标签按显示宽度对齐到 12 列)
+/// 输出 sysinfo 一行 (标签按显示宽度对齐到 12 列)
 fn sysinfo_line(label: &str, args: core::fmt::Arguments<'_>) {
     print!("  {}", label);
     for _ in display_width(label)..12 {
@@ -1638,6 +1632,17 @@ fn read_line(
     // 命令执行期间提前输入，期间发生的硬件错误或软件环溢出也不会在
     // 新提示符出现时被清掉；受影响的下一行会被完整拒绝。
     let mut line = alloc::string::String::new();
+    // 行缓冲上限即 `max`: 一次预留, 后续增长不再触发堆分配。
+    // 预留失败 (堆紧张/碎片化) 时优雅返回"溢出"输入, 调用方整行拒绝
+    // (与项目其他路径的 try_reserve 纪律一致, 不 panic=abort 复位)。
+    if line.try_reserve(max).is_err() {
+        return InputLine {
+            text: line,
+            overflowed: true,
+            non_ascii: false,
+            rx_corrupted: false,
+        };
+    }
     let mut overflow = 0usize;
     let mut non_ascii = false;
     let mut history_offset = None;

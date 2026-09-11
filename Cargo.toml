@@ -24,7 +24,8 @@ opt-level = 1
 panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开
 
 [profile.release]
-# 体积优先; 当前 `arm-none-eabi-size` 的 text+data 约为 96.5KiB。
+# 体积优先; 本机实测 `arm-none-eabi-size` text+data: 默认裁剪配置约 91.3KiB,
+# 全功能配置约 151.2KiB (随工具链变化, 见 README "体积优化与功能裁剪")。
 # 对性能敏感的版本应在真机基准后再改用 opt-level=2/3。
 opt-level = "z"
 panic = "abort" # 发生 panic 时直接中止，不进行堆栈展开

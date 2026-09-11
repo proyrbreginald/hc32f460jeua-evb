@@ -447,7 +447,10 @@ const _: () = assert!(
 );
 /// 控制台 TX DMA 通道 (CFG_DMA_TX_CHANNEL = 0~3)
 pub const DMA_TX_CHANNEL: u8 = parse_u8(env!("CFG_DMA_TX_CHANNEL"));
-const _: () = assert!(DMA_TX_CHANNEL <= 3, "CFG_DMA_TX_CHANNEL 非法 (可用 0~3)");
+const _: () = match DMA_TX_CHANNEL {
+    0..=3 => {}
+    _ => panic!("CFG_DMA_TX_CHANNEL 非法 (可用 0~3)"),
+};
 /// 触发 DMA 发送的最小输出长度 (字节) (CFG_DMA_TX_MIN)
 ///
 /// 低于该阈值的输出 (逐字节轮询开销更小) 保持原轮询路径; 阈值同时
@@ -465,10 +468,10 @@ const _: () = assert!(
     "CFG_DMA_COPY_UNIT 非法 (可用 1/2)"
 );
 pub const DMA_COPY_CHANNEL: u8 = parse_u8(env!("CFG_DMA_COPY_CHANNEL"));
-const _: () = assert!(
-    DMA_COPY_CHANNEL <= 3,
-    "CFG_DMA_COPY_CHANNEL 非法 (可用 0~3)"
-);
+const _: () = match DMA_COPY_CHANNEL {
+    0..=3 => {}
+    _ => panic!("CFG_DMA_COPY_CHANNEL 非法 (可用 0~3)"),
+};
 /// TX 与 COPY 不得共用同一通道 (同一通道被两个功能同时配置会互相覆盖)
 const _: () = assert!(
     !(DMA_ENABLE && DMA_TX_UNIT == DMA_COPY_UNIT && DMA_TX_CHANNEL == DMA_COPY_CHANNEL),
@@ -817,6 +820,7 @@ const _: () = assert!(
 ///
 /// - `halt`: 屏蔽中断后 wfi 死循环 (调试期推荐, 便于 gdb 现场检查);
 /// - `reset`: 软复位重启 (产品部署推荐, 尽快恢复服务)。
+///
 /// 见 [`crate::panic::PanicStrategy`]。
 pub const PANIC_STRATEGY: crate::panic::PanicStrategy =
     if eq_str(env!("CFG_PANIC_STRATEGY"), "halt") {
@@ -935,6 +939,19 @@ const _: () = assert!(
 /// 每个 shell 命令可单独通过该列表启用/禁用: 新增命令需在
 /// `src/shell.rs` 命令表注册并加入此列表。const 求值, 结果编译期确定。
 pub const fn cmd_enabled(name: &str) -> bool {
+    // 编译期开启的大功能命令: 模块 cfg 直接豁免启用列表 (而不要求
+    // 同时在 CFG_SHELL_COMMANDS 中列出 —— 曾因列表不含 nano/selftest/
+    // soak 造成"代码已编译但命令被拒"的第三道门不一致; dev 构建恒注入
+    // 这些 cfg, 不受 release 裁剪影响)。
+    if cfg!(shell_nano) && eq_str(name, "nano") {
+        return true;
+    }
+    if cfg!(shell_selftest) && eq_str(name, "selftest") {
+        return true;
+    }
+    if cfg!(shell_soak) && eq_str(name, "soak") {
+        return true;
+    }
     let list = env!("CFG_SHELL_COMMANDS").as_bytes();
     let name = name.as_bytes();
     let mut i = 0;
@@ -1030,6 +1047,15 @@ pub const SOAK_FLASH_INTERVAL_MS: u32 = parse_u32(env!("CFG_SOAK_FLASH_INTERVAL_
 const _: () = assert!(
     SOAK_FLASH_INTERVAL_MS >= 1000,
     "CFG_SOAK_FLASH_INTERVAL_MS 应不小于 1000"
+);
+/// 硬实时判定阈值: 允许的最长关中断 (PRIMASK) 时间 (微秒, 实测峰值)
+pub const SOAK_MAX_CRITICAL_US: u32 = parse_u32(env!("CFG_SOAK_MAX_CRITICAL_US"));
+/// 硬实时判定阈值: 允许的最长 SysTick ISR 到达延迟 (微秒, 不含 Flash
+/// 擦写 bus hold 窗口, 实测峰值)
+pub const SOAK_MAX_IRQ_LATENCY_US: u32 = parse_u32(env!("CFG_SOAK_MAX_IRQ_LATENCY_US"));
+const _: () = assert!(
+    SOAK_MAX_CRITICAL_US > 0 && SOAK_MAX_IRQ_LATENCY_US > 0,
+    "CFG_SOAK_MAX_CRITICAL_US / CFG_SOAK_MAX_IRQ_LATENCY_US 必须大于 0"
 );
 
 /// 测试报告预算: `/test/` 目录保留的报告文件数 (超出删除最旧;

@@ -38,12 +38,17 @@
 //! 接近或超过 PC 端读取能力时, USB 转串口 (CH340) 缓冲可能溢出并
 //! 丢弃字节, 表现为"行尾截断" (与打印交错无关)。需要可靠全量输出时
 //! 应限制输出速率或改用带流控的接口。
+//!
+//! # ZMODEM 会话静默
+//!
+//! ZMODEM 会话进行期间, 普通线程打印 (经 [`write_bytes_raw`]) 整体
+//! **静默丢弃**: 协议字节与业务日志/提示符交错会直接破坏 FCS 校验与
+//! 重传语义 (shell 的 `sz`/`rz` 命令经 [`set_session_active`] 标注)。
+//! 协议自身的进度输出与 panic 诊断走 [`write_fmt_raw`] 无锁通道,
+//! 不受静默影响 (该通道的既有"可能与 ISR 诊断交错"约束同前)。
 
 use crate::rtos::{Mutex, Timeout};
 use core::sync::atomic::{AtomicBool, Ordering};
-
-/// 控制台输出串口 (编译期绑定: `.cargo/config.toml` 的 `CFG_UART_UNIT`)
-pub type ConsoleUart = crate::config::ConsoleUart;
 
 /// 打印互斥量 (优先级继承): 串行化线程上下文的打印输出
 ///
@@ -54,6 +59,16 @@ static PRINT_MUTEX: Mutex<()> = Mutex::new(());
 /// 控制台是否就绪: UART 初始化前 (`mark_ready` 前) 的打印**静默丢弃**,
 /// 防止在 UART 时钟未使能时访问 USART (TXE 读回 0 导致等待死循环)。
 static READY: AtomicBool = AtomicBool::new(false);
+
+/// ZMODEM 会话进行中: 会话期间普通线程打印**静默丢弃**(见模块文档),
+/// 防止业务线程输出与协议字节交错并破坏 FCS/重传; 协议自身的进度
+/// 输出走无锁通道, 不受影响。panic/fault 诊断同样不受影响。
+static ZMODEM_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// 标记 ZMODEM 会话开始/结束 (由 `shell/zmodem.rs` 的 RAII 守卫调用)。
+pub fn set_session_active(active: bool) {
+    ZMODEM_SESSION.store(active, Ordering::Release);
+}
 
 /// 标记控制台就绪 (由应用在 UART 初始化完成后调用一次)
 pub fn mark_ready() {
@@ -89,24 +104,31 @@ pub fn write_fmt(args: core::fmt::Arguments<'_>) {
     }
 }
 
-/// 无锁输出格式化内容 (仅限中断上下文/panic 诊断使用)
+/// 无锁输出格式化内容 (仅限中断上下文/panic 诊断/ZMODEM 会话进度使用)
 ///
-/// 不获取打印锁, 不阻塞; 输出可能与其他上下文交错。
+/// 不获取打印锁, 不阻塞; 输出可能与其他上下文交错。**不受
+/// ZMODEM 会话静默影响** (panic 诊断与协议自身的状态输出必须可见)。
 pub fn write_fmt_raw(args: core::fmt::Arguments<'_>) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
-    let mut uart = ConsoleUart::take();
-    let _ = core::fmt::write(&mut uart, args);
+    let uart = crate::board::BoardResources::get().console();
+    let mut writer = uart;
+    let _ = core::fmt::write(&mut writer, args);
 }
 
 /// 无锁输出原始字节 (调用方负责持锁/不交错约束)
+///
+/// ZMODEM 会话期间静默丢弃 (业务线程输出会破坏协议流; 协议自身与
+/// panic 诊断经 [`write_fmt_raw`] 不受影响)。
 fn write_bytes_raw(bytes: &[u8]) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
-    let uart = ConsoleUart::take();
-    uart.write(bytes);
+    if ZMODEM_SESSION.load(Ordering::Acquire) {
+        return;
+    }
+    crate::board::BoardResources::get().console().write(bytes);
 }
 
 /// 打印锁内执行 `f`, `f` 收到原始字节写出器 (输出不会与其他线程交错)。

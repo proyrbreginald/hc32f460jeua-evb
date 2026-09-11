@@ -76,7 +76,7 @@ const CMU_CKSWR: usize = 0x26; // 系统时钟源选择 (8 位)
 const CMU_PLLCR: usize = 0x2A; // MPLL 控制 (8 位)
 const CMU_XTALCR: usize = 0x32; // XTAL 控制 (8 位)
 const CMU_HRCCR: usize = 0x36; // HRC 控制 (8 位, HRCSTP=0 开启)
-const CMU_MRCCR: usize = 0x3A; // MRC 控制 (8 位, MRCSTP=0 开启)
+const CMU_MRCCR: usize = 0x38; // MRC 控制 (8 位, MRCSTP=0 开启; SVD/CMSIS 一致)
 const CMU_OSCSTBSR: usize = 0x3C; // 振荡器稳定状态 (8 位)
 const CMU_MCO1CFGR: usize = 0x3D; // MCO1 配置 (MCOSEL/MCODIV/MCOEN)
 const CMU_MCO2CFGR: usize = 0x3E; // MCO2 配置
@@ -224,6 +224,93 @@ impl ClockSource {
     }
 }
 
+/// 时钟树配置入口，只能由 [`crate::peripherals::Peripherals`] 构造。
+pub struct ClockController {
+    _private: (),
+}
+
+impl ClockController {
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+
+    /// 应用编译期配置并冻结实际时钟树。
+    ///
+    /// 初始化失败时硬件保持或回退到可用时钟源；错误随快照保存，调用者
+    /// 可在控制台就绪后报告，同时所有驱动仍使用实测寄存器值。
+    pub fn freeze(self) -> Clocks {
+        let error = init().err();
+        Clocks::read(error)
+    }
+}
+
+/// 冻结后、按硬件寄存器读取的实际时钟频率。
+pub struct Clocks {
+    source: Option<ClockSource>,
+    system: u32,
+    hclk: u32,
+    pclk0: u32,
+    pclk1: u32,
+    pclk2: u32,
+    pclk3: u32,
+    pclk4: u32,
+    exclk: u32,
+    xtal: u32,
+    error: Option<ClkError>,
+}
+
+impl Clocks {
+    fn read(error: Option<ClkError>) -> Self {
+        Self {
+            source: active_clock_source(),
+            system: system_clock_hz(),
+            hclk: hclk_hz(),
+            pclk0: pclk0_hz(),
+            pclk1: pclk1_hz(),
+            pclk2: pclk2_hz(),
+            pclk3: pclk3_hz(),
+            pclk4: pclk4_hz(),
+            exclk: exclk_hz(),
+            xtal: XTAL_HZ,
+            error,
+        }
+    }
+
+    pub const fn source(&self) -> Option<ClockSource> {
+        self.source
+    }
+    pub const fn system_hz(&self) -> u32 {
+        self.system
+    }
+    pub const fn hclk_hz(&self) -> u32 {
+        self.hclk
+    }
+    pub const fn pclk0_hz(&self) -> u32 {
+        self.pclk0
+    }
+    pub const fn pclk1_hz(&self) -> u32 {
+        self.pclk1
+    }
+    pub const fn pclk2_hz(&self) -> u32 {
+        self.pclk2
+    }
+    pub const fn pclk3_hz(&self) -> u32 {
+        self.pclk3
+    }
+    pub const fn pclk4_hz(&self) -> u32 {
+        self.pclk4
+    }
+    pub const fn exclk_hz(&self) -> u32 {
+        self.exclk
+    }
+    pub const fn xtal_hz(&self) -> u32 {
+        self.xtal
+    }
+    pub const fn error(&self) -> Option<ClkError> {
+        self.error
+    }
+}
+
 /// 时钟初始化: **按 .cargo/config.toml 配置**启动时钟源并切换系统时钟。
 ///
 /// 编排 (任一步失败自动回退, 结果经 [`xtal_status`] 查询):
@@ -233,7 +320,7 @@ impl ClockSource {
 /// - pll: **按 `CFG_PLL_SRC` 启动对应源** (0=XTAL/1=HRC) → 总线分频 →
 ///   PLL 锁定 → FLASH/SRAM/GPIO 等待 + 高性能电源 → 切换; 失败降级为
 ///   PLL 源直通 (无晶振的板子可配 HRC 源)。
-pub fn init() -> Result<(), ClkError> {
+fn init() -> Result<(), ClkError> {
     match crate::config::CLOCK_SOURCE {
         ClockSource::Mrc => Ok(()),
         ClockSource::Hrc => {
@@ -445,7 +532,7 @@ pub fn switch_to_pll() -> Result<(), ClkError> {
     let fcg = fcg_close();
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_PLL);
-    delay_short();
+    delay_us(30);
     cmu_lock();
     fcg_restore(fcg);
     // 使能 Flash 缓存 (对齐 BSP_CLK_Init: CacheRamReset + CacheCmd)
@@ -478,8 +565,7 @@ fn fcg_close() -> [u32; 4] {
     write32(PWC_BASE + PWC_FCG2, FCG2_DEFAULT);
     write32(PWC_BASE + PWC_FCG3, FCG3_DEFAULT);
     // 等待外设时钟关闭稳定 (对齐 DDL CLK_SYSCLK_SW_STB = 30µs)
-    delay_short();
-    delay_short();
+    delay_us(30);
     saved
 }
 
@@ -492,8 +578,7 @@ fn fcg_restore(saved: [u32; 4]) {
     // 恢复 FCG0 写保护 (PRT0=0, 复位默认态)
     crate::mmio::Reg::new(PWC_BASE + PWC_FCG0PC).write(FCG0PC_LOCK);
     // 等待外设时钟恢复稳定
-    delay_short();
-    delay_short();
+    delay_us(30);
 }
 
 /// 总线时钟分频配置 (SCFGR), 分频系数来自 .cargo/config.toml `CFG_DIV_*`:
@@ -534,7 +619,7 @@ pub fn set_bus_clock_div() {
     };
     cmu_unlock();
     write32(CMU_BASE + CMU_SCFGR, scfgr);
-    delay_short(); // 对齐 DDL CLK_SYSCLK_SW_STB
+    delay_us(30); // 对齐 DDL CLK_SYSCLK_SW_STB
     cmu_lock();
     if let Some(saved) = fcg {
         fcg_restore(saved);
@@ -592,8 +677,7 @@ fn pwc_high_performance() {
     pwrc2.write_u8(value);
     mdswcr.write_u8(MD_SWITCH_CMD);
     // 等待模式切换完成 (~30us @ 8MHz)
-    delay_short();
-    delay_short();
+    delay_us(30);
 }
 
 /// 等待振荡器稳定标志置位 (带超时)
@@ -709,7 +793,7 @@ pub fn switch_to_hrc() -> Result<(), ClkError> {
     };
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_HRC);
-    delay_short();
+    delay_us(30);
     cmu_lock();
     if let Some(saved) = fcg {
         fcg_restore(saved);
@@ -735,7 +819,7 @@ pub fn switch_to_xtal() -> Result<(), ClkError> {
     cmu_unlock();
     write8(CMU_BASE + CMU_CKSWR, CLK_SRC_XTAL);
     // 等待时钟源切换稳定 (对齐 DDL CLK_SYSCLK_SW_STB)
-    delay_short();
+    delay_us(30);
     cmu_lock();
     if let Some(saved) = fcg {
         fcg_restore(saved);
@@ -934,10 +1018,16 @@ fn write32(addr: usize, value: u32) {
 }
 
 /// 短延时 (时钟源切换稳定等待)
-fn delay_short() {
-    for _ in 0..200 {
-        unsafe {
-            core::arch::asm!("nop");
-        }
-    }
+/// 校准的微秒级短延时 (DWT 周期计数, 与节拍/调度器解耦)。
+///
+/// 对齐 DDL `DDL_DelayUS` 的用途 —— 如系统时钟源切换后的稳定窗口
+/// (`CLK_SYSCLK_SW_STB = 30µs`, hc32_ll_clk.c)。按当前 HCLK 换算目标
+/// 周期数 (切换前 MRC 8MHz 与切换后 200MHz 均按实际频率计算, 延时
+/// 不少于目标值)。旧实现为固定 200 NOP (~2µs), 与 DDL 30µs 窗口相差
+/// 一个数量级。仅启动/重配路径调用 (单执行流)。
+fn delay_us(us: u32) {
+    let hz = hclk_hz().max(1);
+    let cycles = ((u64::from(us) * u64::from(hz)) / 1_000_000) as u32;
+    let start = crate::arch::cycles_now();
+    while crate::arch::cycles_now().wrapping_sub(start) < cycles {}
 }

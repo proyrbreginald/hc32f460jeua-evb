@@ -114,10 +114,14 @@ destination of a later transaction.
 ### Erase-count wear leveling (format v1.1)
 
 Every snapshot payload begins with a fixed per-block erase table: one
-little-endian `u16` counter per block, padded to a program-unit boundary and
-covered by the payload CRC. Counters are monotonic across reformats and
-saturate at the `u16` width. This is the littlefs-style dynamic/static scheme,
-adapted to a whole-snapshot copy-on-write filesystem:
+little-endian `u16` per block, padded to a program-unit boundary and covered
+by the payload CRC. Counters are monotonic across reformats. Entry semantics:
+low 15 bits hold the erase counter, bit 15 marks the block as **bad**
+(permanently unusable). The counters are **rescaled** (halved, preserving
+relative order and bad flags) whenever any counter reaches 30 000, so
+saturation — and the resulting loss of leveling discrimination — never occurs.
+This is the littlefs-style dynamic/static scheme, adapted to a whole-snapshot
+copy-on-write filesystem:
 
 - **Dynamic wear leveling**: each mutation computes its destination span and
   scans every non-overlapping start position, choosing the run with the lowest
@@ -132,6 +136,15 @@ adapted to a whole-snapshot copy-on-write filesystem:
   committed relocation used to rebalance an idle filesystem whose blocks were
   worn unevenly by restricted large-span placements; it is a no-op (no device
   writes) when all counters are within one of each other.
+- **Bad-block skipping**: runs containing a bad block are never placement
+  candidates. A device error is only classified as a dead block when the
+  adapter's `permanent_block_failure` hook confirms that power and bus are
+  still functional and the failure is specific to that block (e.g. the
+  controller's PEWERR / program-mismatch flags); every other error — power
+  loss, timeout, torn bus cycle — remains fatal and forces a remount. A dead
+  block is marked in RAM and the commit is retried at a different location;
+  the flag persists with the next successful commit's wear table and the block
+  is skipped forever (no remapping, by design).
 
 The wear table travels inside each committed snapshot, so a torn relocation
 mounts the previous complete snapshot with its previous counters; recovery is
@@ -158,8 +171,9 @@ renames, so recovery cannot expose a partially moved tree.
 
 The format has no recursive removal, implicit parent creation, append log,
 random overwrite, streaming file handle, sparse file, symbolic link,
-permissions, timestamps, extended attributes, bad-block relocation, or
-encryption. The erase counters are `u16` (saturating); a partition whose every
-block reaches the saturation point is reported honestly by the counters rather
-than remapped. CRC detects accidental corruption and torn writes; it is not a
-security MAC.
+permissions, timestamps, extended attributes, bad-block **remapping**, or
+encryption. Dead blocks are marked and skipped forever (see above) rather
+than remapped; when no placement run remains, mutations fail with `NoSpace`
+and the old snapshot stays intact. Erase counters are 15 bits and are
+rescaled before saturation. CRC detects accidental corruption and torn
+writes; it is not a security MAC.

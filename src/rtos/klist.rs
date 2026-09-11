@@ -65,8 +65,12 @@ impl<T> KCell<T> {
     ///
     /// # Safety
     ///
-    /// 同一临界区内不得对同一单元生成重叠引用。令牌证明中断已关闭，
-    /// 但不跟踪具体 `KCell` 的借用状态。
+    /// 同一临界区内不得对同一单元生成重叠引用。令牌证明中断已关闭,
+    /// 但不跟踪具体 `KCell` 的借用状态: [`CriticalSection`] 可复制,
+    /// 且本方法以 `&self` 借入 —— 借用检查器只保证返回引用不逃逸,
+    /// **不会**阻止同一临界区内对同一 `KCell` 重复调用本方法产生
+    /// 重叠 `&mut`。别名规则由调用方按内核不变量 (嵌套 `KCell::get`
+    /// 不得交叠) 自行保证。
     #[inline]
     #[allow(clippy::mut_from_ref)] // 访问经临界区令牌 (CriticalSection) 授权
     pub unsafe fn get<'cs>(&self, _cs: CriticalSection<'cs>) -> &'cs mut T {

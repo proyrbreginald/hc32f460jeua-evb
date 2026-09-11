@@ -93,15 +93,24 @@ CFG_DMA_COPY_MIN = "256"             # 触发 DMA 整块拷贝的最小长度 (�
 # 本板仅将 PB7(TX)/PB6(RX) 引到 JP2，没有板载 CAN 收发器；正常模式需外接 PHY。
 # CANCLK 固定为 XTAL；编译期校验 EXCLK>=1.5*CANCLK、<=1Mbit/s 位时序，
 # 且按 RM 建议不使用 SBT.PRESC=0 (实际预分频 1)。
-CFG_CAN_ENABLE = "false"                 # true: 启动时初始化应用 CAN
-CFG_CAN_SELFTEST_ENABLE = "true"         # 应用 CAN 启用时内部回环项会安全跳过
+#
+# 1 Mbit/s @ 8MHz XTAL: 位时间只能是 8 个 CANCLK, 搜索结果为 PRESC=2、
+# SEG1=3、SEG2=1、SJW=1 (共 4 TQ, 采样点 75%, 误差 0ppm)。SJW 必须为 1:
+# SEG2 >= SJW 且 SEG1 >= SEG2+1, SJW=2 时一位至少 5 TQ, 无法整除 8 个
+# CANCLK, 位时序搜索失败并在编译期报错。1 Mbit/s 总线长度上限约 40m
+# (ISO 11898-2), 两端各 120Ω 终端; 采样点与 SJW 需与总线对端一致。
+CFG_CAN_ENABLE = "true"                 # true: 启动时初始化应用 CAN, 并编译 shell `can` 测试命令
+                                         # (关闭时 CAN 驱动与 `can` 命令都不参与链接, 省 ~11.5 KiB)
+CFG_CAN_SELFTEST_ENABLE = "true"         # selftest/soak 的 CAN 内部回环项 (应用 CAN
+                                         # 占用控制器时自动接管, 结束后按原模式恢复)
 CFG_CAN_TX_PIN = "7"                     # PortB Func_Grp2，默认 PB7 Func50
 CFG_CAN_TX_FSEL = "50"
 CFG_CAN_RX_PIN = "6"                     # PortB Func_Grp2，默认 PB6 Func51
 CFG_CAN_RX_FSEL = "51"
-CFG_CAN_BITRATE = "500000"
+CFG_CAN_BITRATE = "1000000"              # 1 Mbit/s (经典 CAN 上限)
 CFG_CAN_SAMPLE_POINT_PERMILLE = "750"    # 750 = 75.0%
-CFG_CAN_SJW = "2"                        # 1~8 TQ，且不大于 TimeSeg2
+CFG_CAN_SJW = "1"                        # 1~8 TQ，且不大于 TimeSeg2
+                                         # (8MHz XTAL 下 1Mbit/s 必须为 1, 见上方说明)
 CFG_CAN_MAX_BITRATE_ERROR_PPM = "10000"  # 10000 = 1%
 CFG_CAN_MODE = "normal"                  # normal|silent|internal-loopback|external-loopback|external-loopback-silent
 CFG_CAN_PTB_SINGLE_SHOT = "false"        # false = 自动重发
@@ -129,12 +138,12 @@ CFG_SHELL_LOGIN_TRIES = "3"    # 登录失败允许次数
 CFG_SHELL_LINE_BUF = "128"     # 输入行缓冲区 (字节)
 CFG_SHELL_HISTORY_SIZE = "8"   # RAM 中保留的历史命令条数 (重启后清空)
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
-CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,nano,rm,mv,stat,df,fsck,level,mount,mkfs,led,log,selftest,soak,sz,rz,clear,whoami,reboot,logout"
+CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,rm,mv,stat,df,fsck,level,mount,mkfs,led,can,log,sz,rz,clear,whoami,reboot,logout"
 
 # 功能编译期开关 (true/false): false 时对应命令与其全部代码不编译, 直接省
 # FLASH。注意: soak 依赖 selftest 的 ESC 中断支持, soak=true 时 selftest
 # 自动随带编译 (build.rs 强制), 与 CFG_APP_SELFTEST_ENABLE 取值无关。
-CFG_SHELL_NANO_ENABLE = "true"       # nano 全屏编辑器 (省 ~3 KiB)
+CFG_SHELL_NANO_ENABLE = "false"      # nano 全屏编辑器 (省 ~8 KiB; 业务运行不需)
 CFG_SHELL_ZMODEM_ENABLE = "true"     # sz/rz 文件传输 (省 ~7 KiB + CRC 表)
 
 # [nano] 轻量全屏文本编辑器 (ASCII, ANSI 终端; 行列为自动探测失败时的回退值)
@@ -145,7 +154,7 @@ CFG_NANO_MAX_BYTES = "16384"      # 单文件编辑上限 (≤ 65472 = 快照容
 # [zmodem] ZMODEM 文件传输 (shell `sz` 发送 / `rz` 接收)
 CFG_ZMODEM_TIMEOUT_MS = "10000"   # 帧/字节间等待超时 (毫秒, 对齐 lrzsz 默认 10s)
 CFG_ZMODEM_SUBPACKET = "1024"     # 发送子包长度 (字节, 32~1024)
-CFG_ZMODEM_RX_MAX = "65472"       # 接收文件大小上限 (字节, 快照容量 64KiB 减去开销)
+CFG_ZMODEM_RX_MAX = "16384"       # 接收文件大小上限 (字节, 快照容量 64KiB 减去开销)
 
 # [log] 应用日志 (可开关+分级+彩色, 与内核打印分离)
 CFG_LOG_ENABLE = "true" # 日志默认开关 (运行时可用 shell `log on|off` 切换)
@@ -154,10 +163,14 @@ CFG_LOG_COLOR = "true"  # 控制台 ANSI 颜色 (false=纯文本; 落盘文件�
 
 # [logfile] 日志自动保存到 /log/ (shell `log file on|off` 可运行时切换)
 CFG_LOG_FILE_ENABLE = "true"   # 落盘开关
-CFG_LOG_RING = "4096"          # RAM 日志缓冲 (字节; 满时丢最旧, 掉电丢失)
+CFG_LOG_RING = "16384"         # RAM 日志缓冲 (字节; 满时丢最旧, 掉电丢失)
 CFG_LOG_FILE_MAX = "4096"      # 单个日志文件上限 (字节; 超出则写入下一段文件)
-CFG_LOG_FILE_SLOTS = "8"       # 保留的日志文件数 (boot_<序号>[_<段号>].log)
-CFG_LOG_FLUSH_MS = "2000"      # 落盘线程刷新间隔 (毫秒; 越小越费 Flash)
+CFG_LOG_FILE_SLOTS = "4"       # 保留的日志文件数 (boot_<序号>[_<段号>].log)
+# 快照文件系统每次提交都重写整个快照并回收旧扇区 (含擦除), 刷新间隔
+# 即提交频率: 持续打日志时 2s 间隔约 5.4k~10.8k 次擦除/扇区/天 (数据手册
+# 表 3-56 最小 10k 次), 30s 间隔约 360~720 次/扇区/天。掉电丢失窗口
+# = 刷新间隔 + RAM 缓冲 (非 reboot 路径), 按现场可容忍度折中。
+CFG_LOG_FLUSH_MS = "30000"     # 落盘线程刷新间隔 (毫秒; 越小越费 Flash)
 CFG_APP_LOGFILE_STACK = "8192" # 落盘线程栈 (与 shell 同级: 文件系统写 + 格式化较深)
 CFG_APP_LOGFILE_PRIORITY = "3" # 低于 shell(1)/led(2), 高于 idle(31)
 CFG_APP_LOGFILE_TIMESLICE = "10"
@@ -194,7 +207,7 @@ CFG_MPU_STACK_GUARD = "32"
 # [app] 演示线程参数 (栈/优先级/时间片) 与周期定时器
 # 是否启用内核自检 (true/false); 编译期开关: false 时 selftest 命令与其
 # 全部代码不编译, 直接省 FLASH (soak 开启时自动随带编译, 见 build.rs)
-CFG_APP_SELFTEST_ENABLE = "true"
+CFG_APP_SELFTEST_ENABLE = "false"
 CFG_APP_SHELL_STACK = "8192"     # 自检在 shell 线程内同步执行, 需更大栈 (调试格式化机器栈较深)
 CFG_APP_SHELL_PRIORITY = "1"
 CFG_APP_SHELL_TIMESLICE = "10"
@@ -207,11 +220,15 @@ CFG_APP_LED_BLINK_MS = "500"
 # [soak] 长期稳定性测试 (shell `soak` 命令, 同步执行)
 # 编译期开关: false 时 soak 命令与其全部代码 (含 HTML 报告模板) 不编译,
 # 直接省 FLASH
-CFG_SOAK_ENABLE = "true"             # 命令开关 (false 时命令不注册)
+CFG_SOAK_ENABLE = "false"            # 命令开关 (false 时命令不注册; 业务运行不需)
 CFG_SOAK_MINUTES = "10"              # soak 无参数时的默认时长 (分钟, 0 = 直到 ESC)
 CFG_SOAK_REPORT_INTERVAL_MS = "30000" # 进度报告间隔 (毫秒)
 CFG_SOAK_HANG_GRACE_MS = "5000"      # 压力线程心跳停滞判定 (毫秒)
 CFG_SOAK_FLASH_INTERVAL_MS = "10000" # Flash 压力节流: 两次擦写循环的最小间隔 (毫秒)
+# 硬实时判定阈值 (实测峰值超过即 FAIL):
+# 最长关中断 (PRIMASK) 时间 / 最长 SysTick ISR 到达延迟 (不含 Flash bus hold)
+CFG_SOAK_MAX_CRITICAL_US = "50"
+CFG_SOAK_MAX_IRQ_LATENCY_US = "500"
 
 [target.thumbv7em-none-eabihf]
 rustflags = [

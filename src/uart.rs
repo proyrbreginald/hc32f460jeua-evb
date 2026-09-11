@@ -278,7 +278,7 @@ pub type Uart4 = Uart<4>;
 impl<const U: u8> Uart<U> {
     /// 获取 UART 句柄。`U` 越界 (非 1~4) 时:
     /// 以 `const` 方式使用会在编译期报错。
-    pub const fn take() -> Self {
+    pub(crate) const fn take() -> Self {
         assert!(U >= 1 && U <= 4, "USART 单元必须为 1..=4");
         Self { _private: () }
     }
@@ -333,7 +333,7 @@ impl<const U: u8> Uart<U> {
     ///
     /// 注意: 本方法只配置 USART 外设, 引脚复用 (PFSR.FSEL) 需按封装
     /// 引脚表另行配置 (见数据手册表 2-1)。
-    pub fn init(&self, config: UartConfig) -> Result<(), UartError> {
+    pub fn init(&self, clocks: &crate::clk::Clocks, config: UartConfig) -> Result<(), UartError> {
         if config.baudrate == 0 {
             return Err(UartError::InvalidBaudrate);
         }
@@ -342,7 +342,7 @@ impl<const U: u8> Uart<U> {
         crate::clk::fcg1_enable(fcg1_usart_bit(U));
 
         // 2. 计算波特率 (USART 时钟 = PCLK1 / 预分频, PCLK1 运行时查询)
-        let usart_clk = crate::clk::pclk1_hz() / config.clock_div.divisor();
+        let usart_clk = clocks.pclk1_hz() / config.clock_div.divisor();
         let (div_int, div_frac, fbme) = calc_brr(usart_clk, config.baudrate, config.oversample)?;
 
         // 3. CR1: 过采样 / 数据位 / 校验 / 噪声滤波 / 首字节 / 起始位极性
@@ -464,11 +464,15 @@ impl<const U: u8> Uart<U> {
     /// DDL 示例 usart_uart_dma 每次发送"先使能 DMA 通道, 再重新使能
     /// USART_TX"的序列。
     ///
+    /// `now` 由调用方注入的**单调毫秒时钟** (调用方传
+    /// [`crate::rtos::uptime_ms`]), 本裸驱动不依赖 RTOS 节拍, 且超时
+    /// 语义与节拍频率 (`CFG_TICKS_PER_SEC`) 解耦。
+    ///
     /// 返回 false = 等待 TC 超时 (TE 未动, 调用方应回退轮询, 不会死锁)。
-    pub(crate) fn dma_tx_arm(&self, timeout_ms: u32) -> bool {
-        let start = crate::rtos::tick();
+    pub(crate) fn dma_tx_arm(&self, timeout_ms: u32, now: impl Fn() -> u32) -> bool {
+        let start = now();
         while self.sr().read() & SR_TC == 0 {
-            if crate::rtos::tick().wrapping_sub(start) >= timeout_ms {
+            if now().wrapping_sub(start) >= timeout_ms {
                 return false;
             }
         }
@@ -515,11 +519,17 @@ impl<const U: u8> Uart<U> {
     /// - `line`: NVIC 中断线 (INT000~INT127, 见 [`crate::intc::Line`]),
     ///   事件源自动取本单元 USARTn_RI;
     /// - `priority`: NVIC 抢占优先级 (0~15, 值越小优先级越高)。
+    ///
+    /// CR1 的读-改-写在临界区内完成: ISR 错误清除路径
+    /// ([`rx_irq_handler`]) 对同一寄存器做读-改-写, 无保护时两者交错
+    /// 会丢失 RIE 位更新 (与 [`dma_tx_arm`] 同类的竞争防护)。
     pub fn enable_rx_interrupt(&self, line: crate::intc::Line, priority: u8) {
         crate::intc::register(ri_source(U), line, priority, rx_irq_handler::<U>)
             .expect("USART 接收中断注册失败 (中断线被占用)");
         // CR1.RIE: 接收满 + 接收错误中断使能 (对齐 USART_FuncCmd(USART_INT_RX))
-        self.cr1().modify(|v| v | CR1_RIE);
+        crate::critical_section::with(|_| {
+            self.cr1().modify(|v| v | CR1_RIE);
+        });
     }
 }
 
@@ -748,6 +758,13 @@ impl<const U: u8> Uart<U> {
 /// (配合 `core::fmt::write` / `write_fmt` 使用, 见 `console` 模块的
 /// `print!`/`println!` 宏)。
 impl<const U: u8> core::fmt::Write for Uart<U> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+impl<const U: u8> core::fmt::Write for &Uart<U> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.write(s.as_bytes());
         Ok(())

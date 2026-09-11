@@ -50,6 +50,15 @@ impl<const CAP: usize> CsLogRing<CAP> {
         }
     }
 
+    /// 临界区外: 等待进行中的条目提交 (原子标志有界轮询)。
+    ///
+    /// 等待必须在**临界区外**执行: 单核下若在关中断区间内自旋,
+    /// 写者线程无法推进, 只能跑满上限并长时间屏蔽 RX 中断。
+    fn wait_writer_idle(&self) -> bool {
+        // SAFETY: 原子标志读取, 不依赖临界区 (与 LogRing::wait_writer_idle 契约一致)
+        unsafe { (*self.inner.get()).wait_writer_idle() }
+    }
+
     fn with<R>(&self, f: impl FnOnce(&mut LogRing<CAP>) -> R) -> R {
         critical_section::with(|_| {
             // SAFETY: 临界区内唯一可变访问
@@ -79,11 +88,40 @@ pub fn set_file_enabled(on: bool) {
     FILE_ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// 把缓冲中的所有日志条目拷入 `out` (每条末尾补 `\n`) 并清空缓冲。
+/// 把"完整放得下"的前缀条目拷入 `out` (损耗/截断标记按序在前),
+/// 放不下的条目保留待下轮 (落盘按文件上限分块轮转用, 见 logfile)。
 ///
-/// 由日志落盘线程周期性调用; 返回拷贝的字节数 (0 = 无待落盘日志)。
-pub fn drain_into(out: &mut alloc::vec::Vec<u8>) -> usize {
-    RING.with(|ring| ring.drain_into(out))
+/// 等待进行中的条目在**临界区外**有界完成 (见 [`CsLogRing::wait_writer_idle`]);
+/// 进入临界区后若新写者已开始构建, 放弃本轮 (写者在打印锁内很快完成,
+/// 下轮排空即可), 关中断区间绝不自旋。
+///
+/// 返回拷贝的字节数 (0 = 无待落盘、首条放不下、或条目正在构建中)。
+pub fn drain_limited(out: &mut alloc::vec::Vec<u8>, limit: usize) -> usize {
+    if !RING.wait_writer_idle() {
+        return 0;
+    }
+    RING.with(|ring| {
+        if ring.is_writing() {
+            0
+        } else {
+            ring.drain_into_limited(out, limit)
+        }
+    })
+}
+
+/// 无条件排空首条 (超长条目比整个段还长时强制取出, 保证进度)。
+/// 等待语义同 [`drain_limited`]。
+pub fn drain_oldest(out: &mut alloc::vec::Vec<u8>) -> usize {
+    if !RING.wait_writer_idle() {
+        return 0;
+    }
+    RING.with(|ring| {
+        if ring.is_writing() {
+            0
+        } else {
+            ring.drain_oldest_entry(out)
+        }
+    })
 }
 
 /// 待落盘的日志字节数 (含条目头, 不含换行符)

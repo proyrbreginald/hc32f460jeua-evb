@@ -33,9 +33,15 @@ pub struct CriticalSection<'cs> {
 pub fn with<R>(f: impl FnOnce(CriticalSection<'_>) -> R) -> R {
     let interrupt_state = crate::arch::acquire_interrupt_lock();
 
+    // 硬实时指标: 实测 PRIMASK 保持时间 (见 latency 模块, 未初始化时
+    // 为无操作; 测量开销计入自身, 结果只高不低)
+    let latency_begin = crate::latency::critical_begin();
+
     let result = f(CriticalSection {
         _lifetime: PhantomData,
     });
+
+    crate::latency::critical_end(latency_begin);
 
     // 始终恢复入口状态；即使闭包内部改动中断状态也不会泄漏到外层。
     crate::arch::restore_interrupt_lock(interrupt_state);

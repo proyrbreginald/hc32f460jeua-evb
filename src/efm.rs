@@ -428,28 +428,35 @@ pub fn uid_hex(out: &mut [u8; UID_HEX_CAP]) -> &str {
 pub fn sector_erase(addr: u32) -> Result<(), EfmError> {
     check_addr(addr)?;
     let _operation = OperationGuard::acquire()?;
-    if !wait_ready() {
-        return Err(EfmError::Timeout);
-    }
-    unlock();
-    enable_program_mode();
-    clear_status(FSR_ERRORS | FSR_OPTEND);
-    // 关闭缓存 (对齐 DDL EFM_SectorErase: 擦除前保存并清除 CACHE)
-    let cache = disable_cache();
-    set_op_mode(OpMode::SectorErase);
+    // 硬实时指标: 窗口覆盖整个擦除业务 (bus hold + 收尾/回读),
+    // 期间排队的中断归入 Flash 桶 (见 latency 模块)
+    crate::latency::flash_window_begin();
+    let result = (|| -> Result<(), EfmError> {
+        if !wait_ready() {
+            return Err(EfmError::Timeout);
+        }
+        unlock();
+        enable_program_mode();
+        clear_status(FSR_ERRORS | FSR_OPTEND);
+        // 关闭缓存 (对齐 DDL EFM_SectorErase: 擦除前保存并清除 CACHE)
+        let cache = disable_cache();
+        set_op_mode(OpMode::SectorErase);
 
-    // 触发: 向目标地址写 0 (擦除 = 全 1, 任意值均可, DDL 用 0)
-    // MPU: FLASH 只读区域临时放开 (触发写是"写 Flash 地址")
-    crate::mpu::with_flash_writable(|| crate::mmio::Reg::new(addr as usize).write(0));
-    // 扇区擦除 ~ms 级, 超时按 HCLK 折算 ~20ms (对齐 DDL EFM_ERASE_TIMEOUT)
-    let result = wait_end(crate::clk::hclk_hz() / 50);
+        // 触发: 向目标地址写 0 (擦除 = 全 1, 任意值均可, DDL 用 0)
+        // MPU: FLASH 只读区域临时放开 (触发写是"写 Flash 地址")
+        crate::mpu::with_flash_writable(|| crate::mmio::Reg::new(addr as usize).write(0));
+        // 扇区擦除 ~ms 级, 超时按 HCLK 折算 ~20ms (对齐 DDL EFM_ERASE_TIMEOUT)
+        let result = wait_end(crate::clk::hclk_hz() / 50);
 
-    set_op_mode(OpMode::ReadOnly);
-    restore_cache(cache);
-    disable_program_mode();
-    lock();
-    result?;
-    map_error(status()).map_or(Ok(()), Err)
+        set_op_mode(OpMode::ReadOnly);
+        restore_cache(cache);
+        disable_program_mode();
+        lock();
+        result?;
+        map_error(status()).map_or(Ok(()), Err)
+    })();
+    crate::latency::flash_window_end();
+    result
 }
 
 // ============================== 编程 ==============================
@@ -469,41 +476,48 @@ pub fn program(addr: u32, data: &[u8]) -> Result<(), EfmError> {
         return Err(EfmError::InvalidAddr);
     }
     let _operation = OperationGuard::acquire()?;
-    if !wait_ready() {
-        return Err(EfmError::Timeout);
-    }
-    unlock();
-    enable_program_mode();
-    clear_status(FSR_ERRORS | FSR_OPTEND);
-    // 关闭缓存 (对齐 DDL EFM_Program: 编程前保存并清除 CACHE)
-    let cache = disable_cache();
-    set_op_mode(OpMode::Program);
-
-    let mut result = Ok(());
-    for (i, chunk) in data.chunks(4).enumerate() {
-        // 组装字: 实际字节 + 尾部 0xFF 填充
-        let mut word = 0xFFFF_FFFFu32;
-        for (j, &b) in chunk.iter().enumerate() {
-            word &= !(0xFFu32 << (8 * j));
-            word |= (b as u32) << (8 * j);
+    // 硬实时指标: 窗口覆盖整个编程业务 (bus hold + 收尾),
+    // 期间排队的中断归入 Flash 桶 (见 latency 模块)
+    crate::latency::flash_window_begin();
+    let result = (|| -> Result<(), EfmError> {
+        if !wait_ready() {
+            return Err(EfmError::Timeout);
         }
-        // 触发写 (MPU: FLASH 只读区域临时放开, 见 mpu::with_flash_writable)
-        crate::mpu::with_flash_writable(|| {
-            crate::mmio::Reg::new((addr + 4 * i as u32) as usize).write(word)
-        });
-        // 单字编程 ~µs 级, 超时按 HCLK 折算 ~53µs (对齐 DDL EFM_PGM_TIMEOUT)
-        result = wait_end(crate::clk::hclk_hz() / 20_000);
-        if result.is_err() {
-            break;
-        }
-    }
+        unlock();
+        enable_program_mode();
+        clear_status(FSR_ERRORS | FSR_OPTEND);
+        // 关闭缓存 (对齐 DDL EFM_Program: 编程前保存并清除 CACHE)
+        let cache = disable_cache();
+        set_op_mode(OpMode::Program);
 
-    set_op_mode(OpMode::ReadOnly);
-    restore_cache(cache);
-    disable_program_mode();
-    lock();
-    result?;
-    map_error(status()).map_or(Ok(()), Err)
+        let mut result = Ok(());
+        for (i, chunk) in data.chunks(4).enumerate() {
+            // 组装字: 实际字节 + 尾部 0xFF 填充
+            let mut word = 0xFFFF_FFFFu32;
+            for (j, &b) in chunk.iter().enumerate() {
+                word &= !(0xFFu32 << (8 * j));
+                word |= (b as u32) << (8 * j);
+            }
+            // 触发写 (MPU: FLASH 只读区域临时放开, 见 mpu::with_flash_writable)
+            crate::mpu::with_flash_writable(|| {
+                crate::mmio::Reg::new((addr + 4 * i as u32) as usize).write(word)
+            });
+            // 单字编程 ~µs 级, 超时按 HCLK 折算 ~53µs (对齐 DDL EFM_PGM_TIMEOUT)
+            result = wait_end(crate::clk::hclk_hz() / 20_000);
+            if result.is_err() {
+                break;
+            }
+        }
+
+        set_op_mode(OpMode::ReadOnly);
+        restore_cache(cache);
+        disable_program_mode();
+        lock();
+        result?;
+        map_error(status()).map_or(Ok(()), Err)
+    })();
+    crate::latency::flash_window_end();
+    result
 }
 
 /// 编程一个字 (4 字节, 对齐 DDL `EFM_ProgramWord`)

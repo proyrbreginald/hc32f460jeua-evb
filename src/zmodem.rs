@@ -1195,18 +1195,28 @@ fn receive_file<
                     }
                 }
                 ZDATA => {
-                    // 位置失配: 忽略 (发送方稍后会重传)
+                    // 位置失配: 请求从已收位置重传 (对齐 lrzsz `zrpos`;
+                    // 发送端按 ZRPOS 重新发送, 静默等待只能靠发送端
+                    // 20×超时收场, 恢复时间长)
                     errors += 1;
                     if errors > MAX_ERRORS {
                         return Err(ZmError::Protocol("ZDATA 位置失配"));
                     }
-                    continue 'top;
+                    send_hex_hdr(port, ZRPOS, &stohdr(received))?;
                 }
                 ZEOF if rclhdr(&header.bytes) == received => {
                     commit(name, declared_size, &buffer[..received as usize])?;
                     return Ok(());
                 }
-                ZEOF => continue,
+                ZEOF => {
+                    // ZEOF 位置失配: 同样以 ZRPOS 重同步 (发送端按已收
+                    // 位置重发尾部数据), 不再被动等待发送端超时
+                    errors += 1;
+                    if errors > MAX_ERRORS {
+                        return Err(ZmError::Protocol("ZEOF 位置持续失配"));
+                    }
+                    send_hex_hdr(port, ZRPOS, &stohdr(received))?;
+                }
                 ZFILE => {
                     // 发送方重新协商: 读取其信息块后重新同步
                     let mut info = [0u8; 256];

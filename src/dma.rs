@@ -303,6 +303,8 @@ pub enum DmaError {
     Timeout,
     /// DMA 上报传输/请求错误 (INTSTAT0)
     TransferError,
+    /// 源与目的切片长度不同。
+    LengthMismatch,
 }
 
 /// 中断回调 (中断上下文执行, 必须有界、无阻塞)
@@ -338,7 +340,7 @@ pub type Dma2Ch3 = Dma<2, 3>;
 impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
     /// 构造通道句柄 (不检查占用)。`UNIT`/`CH` 越界时:
     /// 以 const 方式使用会在编译期报错。
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         assert!(UNIT == 1 || UNIT == 2, "DMA 单元必须为 1~2");
         assert!(CH <= 3, "DMA 通道必须为 0~3");
         Self { _private: () }
@@ -347,7 +349,7 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
     /// 获取通道所有权 (全系统唯一, 防止同一通道被重复配置)。
     ///
     /// 一次调用成功, 后续调用返回 `None` (除非整系统复位)。
-    pub fn take() -> Option<Self> {
+    pub(crate) fn take() -> Option<Self> {
         let bit = 1 << slot(UNIT, CH);
         if CHANNELS_TAKEN.fetch_or(bit, Ordering::AcqRel) & bit == 0 {
             Some(Self::new())
@@ -393,12 +395,12 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
     /// - 未使能的完成/错误中断在配置时**屏蔽** (INTMASK 置位), 由
     ///   [`Dma::install_tc_irq`] / [`Dma::install_err_irq`] 取消屏蔽;
     /// - 应在通道失能状态调用。
-    pub fn configure(&self, cfg: &Config) -> Result<(), DmaError> {
+    pub(crate) unsafe fn configure(&self, cfg: &Config) -> Result<(), DmaError> {
         let align = |addr: usize| -> bool {
             match cfg.width {
                 Width::B8 => true,
-                Width::B16 => addr % 2 == 0,
-                Width::B32 => addr % 4 == 0,
+                Width::B16 => addr.is_multiple_of(2),
+                Width::B32 => addr.is_multiple_of(4),
             }
         };
         if !align(cfg.src_addr) || !align(cfg.dest_addr) {
@@ -438,12 +440,12 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
     }
 
     /// 设置源地址 (回读 MONSAR 确认, 对齐 DDL `DMA_SetSrcAddr`)。
-    pub fn set_src_addr(&self, addr: usize) -> Result<(), DmaError> {
+    pub(crate) unsafe fn set_src_addr(&self, addr: usize) -> Result<(), DmaError> {
         self.write_verify(self.ch_reg(SAR), self.ch_reg(MONSAR), addr as u32, u32::MAX)
     }
 
     /// 设置目的地址 (回读 MONDAR 确认, 对齐 DDL `DMA_SetDestAddr`)。
-    pub fn set_dest_addr(&self, addr: usize) -> Result<(), DmaError> {
+    pub(crate) unsafe fn set_dest_addr(&self, addr: usize) -> Result<(), DmaError> {
         self.write_verify(self.ch_reg(DAR), self.ch_reg(MONDAR), addr as u32, u32::MAX)
     }
 
@@ -497,8 +499,12 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
     ///
     /// 描述符为 8×u32 数组 (SAR/DAR/DTCTL/RPT/SNSEQ/DNSEQ/LLP/CHCTL,
     /// 对齐 DDL `stc_dma_llp_descriptor_t`), 由调用方持有。
-    pub fn llp_enable(&self, desc_addr: usize, auto_run: bool) -> Result<(), DmaError> {
-        if desc_addr % 4 != 0 {
+    pub(crate) unsafe fn llp_enable(
+        &self,
+        desc_addr: usize,
+        auto_run: bool,
+    ) -> Result<(), DmaError> {
+        if !desc_addr.is_multiple_of(4) {
             return Err(DmaError::BadAlign);
         }
         self.ch_reg(LLP).write((desc_addr as u32) & LLP_MASK);
@@ -513,7 +519,7 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
     }
 
     /// 更新链表指针地址 (运行中可改写)。
-    pub fn set_llp_addr(&self, desc_addr: usize) {
+    pub(crate) unsafe fn set_llp_addr(&self, desc_addr: usize) {
         self.ch_reg(LLP).write((desc_addr as u32) & LLP_MASK);
     }
 
@@ -579,14 +585,28 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
         Ok(())
     }
 
+    /// 确认通道停止后才返回。
+    ///
+    /// 安全切片 API 的异常路径必须满足此后置条件，否则 DMA 仍可能在借用
+    /// 结束后访问缓冲区。硬件无法停止时宁可停留在恢复路径，也不能返回。
+    fn stop_blocking(&self) {
+        while self.is_enabled() || self.is_busy() {
+            let _ = self.disable();
+        }
+    }
+
     /// 等待其他通道传输结束 (CHEN 写前置条件, 2ms 墙钟超时)。
+    ///
+    /// 判定源为 **CHEN 使能位** (对齐 DDL `DMA_ChCmd`: 写 CHEN 前等待
+    /// 其他通道的 CHEN 位清零)。通道"已使能但等待外设触发"时
+    /// `CHSTAT.CHACT` 可能为 0 而 CHEN 仍置位 —— 按 CHACT 判定会放行
+    /// 被硬件忽略的写入。超时时钟经 DWT 周期计数 (与 RTOS 节拍解耦,
+    /// 调度器启动前同样有效)。
     fn wait_other_channels_idle(&self) -> Result<(), DmaError> {
-        let own_bit = 1 << (16 + CH);
-        let mask = CHSTAT_CHACT;
-        let start = crate::rtos::tick();
-        while self.unit_reg(CHSTAT).read() & mask & !own_bit != 0 {
-            // 墙钟截止 (SysTick 1kHz, 与 uart_rtos 同模式, 回绕安全)
-            if crate::rtos::tick().wrapping_sub(start) >= 2 {
+        let mask = 0x0Fu32 & !(1u32 << (CH as u32));
+        let start = crate::arch::cycles_now();
+        while self.unit_reg(CHEN).read() & mask != 0 {
+            if elapsed_us_since(start) >= 2_000 {
                 return Err(DmaError::ChannelBusy);
             }
         }
@@ -633,18 +653,19 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
 
     /// 阻塞等待传输完成 (轮询 TC 标志, 墙钟超时)。
     ///
-    /// 截止时间取自 SysTick 节拍 (`rtos::tick`, 1kHz, 回绕安全), 与
-    /// 循环速度无关。返回 true = 传输完成 (TC 置位); false = 超时。
-    /// 超时后应检查 [`Dma::error_pending`] 区分错误与硬件停滞, 并
-    /// [`Dma::disable`] 中止残留传输。
+    /// 截止时间取自 DWT 周期计数 (见 [`elapsed_us_since`], 与 RTOS 节拍
+    /// 解耦, 调度器启动前同样有效, 回绕安全)。返回 true = 传输完成
+    /// (TC 置位); false = 超时。超时后应检查 [`Dma::error_pending`]
+    /// 区分错误与硬件停滞, 并 [`Dma::disable`] 中止残留传输。
+    ///
+    /// 注意: 超时值应远小于 DWT 32 位回绕周期 (200MHz 下约 21.5s)。
     pub fn wait_done(&self, timeout_us: u32) -> bool {
-        let timeout_ticks = (timeout_us / 1000).max(1);
-        let start = crate::rtos::tick();
+        let start = crate::arch::cycles_now();
         loop {
             if self.tc_pending() {
                 return true;
             }
-            if crate::rtos::tick().wrapping_sub(start) >= timeout_ticks {
+            if elapsed_us_since(start) >= timeout_us {
                 return false;
             }
         }
@@ -695,11 +716,33 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
     ///   (每块 `block_size=chunk, trans_count=1`: 单次 SW 请求搬完整块);
     /// - 全程阻塞等待完成 (CPU 可被更高优先级线程/中断抢占),
     ///   适用于把 CPU 从逐字节 memcpy 中解放的场景 (异步化后更佳)。
-    pub fn copy_blocking(&self, src: *const u8, dst: *mut u8, len: usize) -> Result<(), DmaError> {
+    pub fn copy_blocking(&self, src: &[u8], dst: &mut [u8]) -> Result<(), DmaError> {
+        if src.len() != dst.len() {
+            return Err(DmaError::LengthMismatch);
+        }
+        // The borrows remain live until the blocking transfer has stopped.
+        unsafe { self.copy_blocking_raw(src.as_ptr(), dst.as_mut_ptr(), src.len()) }
+    }
+
+    /// 裸地址阻塞拷贝。
+    ///
+    /// # Safety
+    ///
+    /// `src..src+len` 必须在整个调用期间可读，`dst..dst+len` 必须唯一可写，
+    /// 两个区域不得重叠；地址还必须可由当前 DMA 主设备访问。
+    pub(crate) unsafe fn copy_blocking_raw(
+        &self,
+        src: *const u8,
+        dst: *mut u8,
+        len: usize,
+    ) -> Result<(), DmaError> {
         if len == 0 {
             return Ok(());
         }
-        let (width, items) = if (src as usize) % 4 == 0 && (dst as usize) % 4 == 0 && len % 4 == 0 {
+        let (width, items) = if (src as usize).is_multiple_of(4)
+            && (dst as usize).is_multiple_of(4)
+            && len.is_multiple_of(4)
+        {
             (Width::B32, len / 4)
         } else {
             (Width::B8, len)
@@ -714,28 +757,30 @@ impl<const UNIT: u8, const CH: u8> Dma<UNIT, CH> {
             // BLKSIZE 项, 计数归零才置 TC 并自动失能通道 (对照 DDL
             // dmac_base 示例 BC=5/TC=4: 4 次软件触发各搬 5 项)。
             // 故每块配 count=1: 单次 SW 触发搬完整个块, 1→0 触发 TC。
-            self.configure(&Config {
-                width,
-                src_addr: s,
-                dest_addr: d,
-                block_size: chunk as u16,
-                trans_count: 1,
-                src_inc: AddrMode::Inc,
-                dest_inc: AddrMode::Inc,
-                int_tc: false,
-                int_err: false,
-            })?;
+            unsafe {
+                self.configure(&Config {
+                    width,
+                    src_addr: s,
+                    dest_addr: d,
+                    block_size: chunk as u16,
+                    trans_count: 1,
+                    src_inc: AddrMode::Inc,
+                    dest_inc: AddrMode::Inc,
+                    int_tc: false,
+                    int_err: false,
+                })?
+            };
             self.clear_tc();
             self.enable()?;
             self.sw_trigger();
             if !self.wait_done(COPY_CHUNK_TIMEOUT_US) {
-                let _ = self.disable();
+                self.stop_blocking();
                 if self.error_pending() {
                     return Err(DmaError::TransferError);
                 }
                 return Err(DmaError::Timeout);
             }
-            let _ = self.disable();
+            self.stop_blocking();
             self.clear_tc();
             s += chunk * width.bytes();
             d += chunk * width.bytes();
@@ -876,17 +921,19 @@ pub fn uart_tx_init() {
     route::<{ crate::config::DMA_TX_UNIT }, { crate::config::DMA_TX_CHANNEL }>(event::usart_ti(
         unit,
     ));
-    dma.configure(&Config {
-        width: Width::B8,
-        src_addr: 0,
-        dest_addr: crate::uart::tdr_addr(unit),
-        block_size: 1,
-        trans_count: 0,
-        src_inc: AddrMode::Inc,
-        dest_inc: AddrMode::Fix,
-        int_tc: false,
-        int_err: false,
-    })
+    unsafe {
+        dma.configure(&Config {
+            width: Width::B8,
+            src_addr: 0,
+            dest_addr: crate::uart::tdr_addr(unit),
+            block_size: 1,
+            trans_count: 0,
+            src_inc: AddrMode::Inc,
+            dest_inc: AddrMode::Fix,
+            int_tc: false,
+            int_err: false,
+        })
+    }
     .expect("控制台 DMA TX 通道配置失败");
     dma.clear_tc();
     dma.clear_errors();
@@ -937,11 +984,12 @@ pub fn uart_tx_try<const U: u8>(bytes: &[u8]) -> bool {
     let dma = UartTxDma::new();
     let uart = crate::uart::Uart::<U>::take();
     let mut consumed = true;
-    if dma.set_src_addr(bytes.as_ptr() as usize).is_ok() && dma.set_trans_count(len as u16).is_ok()
+    if unsafe { dma.set_src_addr(bytes.as_ptr() as usize) }.is_ok()
+        && dma.set_trans_count(len as u16).is_ok()
     {
         dma.clear_tc();
         // 启动边沿: 空闲 → TE 停 → 使能通道 → TE 起 (见函数文档)
-        if uart.dma_tx_arm(UART_TX_ARM_TIMEOUT_MS) {
+        if uart.dma_tx_arm(UART_TX_ARM_TIMEOUT_MS, monotonic_ms) {
             if dma.enable().is_ok() {
                 uart.dma_tx_fire();
                 // 超时 = 波特率耗时 ×2 + 1ms 余量 (u64 防长包溢出; 墙钟
@@ -954,13 +1002,8 @@ pub fn uart_tx_try<const U: u8>(bytes: &[u8]) -> bool {
                 if !dma.wait_done(timeout_us) {
                     UART_TX_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 }
-                // 中止残留传输: 通道可能仍使能 (触发停滞时), 反复失能直到生效
-                for _ in 0..8 {
-                    if !dma.is_enabled() {
-                        break;
-                    }
-                    let _ = dma.disable();
-                }
+                // 返回前必须确认 DMA 已停止，维持 `bytes` 借用的安全边界。
+                dma.stop_blocking();
             } else {
                 uart.dma_tx_fire(); // 恢复发射器后回退轮询
                 consumed = false;
@@ -1001,14 +1044,14 @@ static COPY_FALLBACKS: AtomicU32 = AtomicU32::new(0);
 /// RAM→RAM 搬运。Flash 内存映射读带等待周期, DMA 32 位传输比逐字节
 /// 循环快约一个数量级; 源/目的未对齐时自动降为 8 位宽度
 /// (见 [`Dma::copy_blocking`])。
-pub fn copy_try(src: *const u8, dst: *mut u8, len: usize) -> bool {
+pub fn copy_try(src: &[u8], dst: &mut [u8]) -> bool {
     if !crate::config::DMA_ENABLE || CLOCKS_READY.load(Ordering::Acquire) == 0 {
         return false;
     }
     if crate::critical_section::in_isr() {
         return false;
     }
-    if len < crate::config::DMA_COPY_MIN {
+    if src.len() != dst.len() || src.len() < crate::config::DMA_COPY_MIN {
         return false;
     }
     if COPY_BUSY
@@ -1018,7 +1061,7 @@ pub fn copy_try(src: *const u8, dst: *mut u8, len: usize) -> bool {
         COPY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    let ok = CopyDma::new().copy_blocking(src, dst, len).is_ok();
+    let ok = CopyDma::new().copy_blocking(src, dst).is_ok();
     COPY_BUSY.store(false, Ordering::Release);
     if !ok {
         COPY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
@@ -1029,4 +1072,24 @@ pub fn copy_try(src: *const u8, dst: *mut u8, len: usize) -> bool {
 /// copy_try 回退计数 (诊断用)。
 pub fn copy_fallback_count() -> u32 {
     COPY_FALLBACKS.load(Ordering::Relaxed)
+}
+
+// ============================== 单调时钟 (与 RTOS 节拍解耦) ==============================
+
+/// 自 `start` (CYCCNT) 起的微秒数。
+///
+/// 按当前 HCLK 换算周期数; DWT 与 SysTick/调度器无关, 启动阶段
+/// (单执行流) 同样有效, 差值回绕安全。仅用于毫秒/微秒级超时窗口
+/// (须远小于 DWT 32 位回绕周期: 200MHz 下约 21.5s)。
+fn elapsed_us_since(start: u32) -> u32 {
+    let hz = crate::clk::hclk_hz().max(1);
+    (u64::from(crate::arch::cycles_now().wrapping_sub(start)) * 1_000_000 / u64::from(hz)) as u32
+}
+
+/// 单调毫秒时钟 (DWT 按 HCLK 换算; 语义同 [`crate::rtos::uptime_ms`] 的
+/// 差分用法, 但调度器启动前同样有效)。供外部注入 [`crate::uart`]
+/// 的等待时钟使用。
+pub fn monotonic_ms() -> u32 {
+    let hz = crate::clk::hclk_hz().max(1);
+    (u64::from(crate::arch::cycles_now()) * 1_000 / u64::from(hz)) as u32
 }

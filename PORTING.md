@@ -43,9 +43,12 @@ SoC drivers                  RTOS core
    定时器回绕窗口均有明确约束。
 6. 定时器在 PRIMASK 临界区内完成摘链/状态迁移，在临界区外执行 ISR
    回调，缩短全局关中断时间并允许回调自停或重启。
-7. 堆分配器按任意 2 的幂 `Layout` 对齐 payload，在 payload 前记录原块
-   地址并以 checked 算术关闭溢出路径；纯布局规划拆到 `heap_layout`，可在
-   主机测试高对齐 padding、空间不足、整数溢出和零大小布局。
+7. 堆分配器为 **TLSF 两级隔离结构** (O(1) 分配/释放, 关中断时间有界);
+   按任意 2 的幂 `Layout` 对齐 payload, 在 payload 前记录原块地址并以
+   checked 算术关闭溢出路径；纯布局规划与 TLSF 尺寸级映射拆到
+   `heap_layout`, 可在主机测试高对齐 padding、空间不足、整数溢出、
+   零大小布局与尺寸级边界不变量。邮箱/消息队列池在临界区外经 CAS
+   一次性发布, 关中断区间无 malloc。
 8. `Thread` 收敛为 `Arc<Thread>` 不可变外壳和唯一
    `UnsafeCell<ThreadInner>`。内核状态仅在单核关中断临界区访问，
    `kernel_self` 保证 TCB 的原始指针、侵入式节点和内建 Timer 活动期间
@@ -109,21 +112,27 @@ MPU 最小区域或栈增长方向。当前内核是单核 UP 设计，多核目
 
 ## 后续抽象顺序
 
-### P0：所有权与时钟能力
+### ✅ P0：所有权与时钟能力 (已落地)
 
-1. 引入唯一 `Peripherals::take() -> Option<Peripherals>`，由 `Board` 消费并
-   拆分资源；把当前板级持有的 CAN 句柄纳入统一所有权，并收紧
-   `Uart::take()`、`Gpio::take()`、`Pin::new()` 等可重复构造入口。
-2. 将时钟配置改为 `ClockController::freeze(config) -> Clocks`。`Clocks`
-   是初始化成功后的频率 token；驱动接收对应 bus clock，不再查询全局
-   `clk::*_hz()` 或读取工程配置。
-
-这两项是后续接口的基础，应先于大规模驱动 trait 化。
+1. **唯一 `Peripherals::take() -> Option<Peripherals>`** (`src/peripherals.rs`):
+   由 `Board::take()` 消费并拆分为板级资源; CAN 句柄纳入
+   `BoardResources` 统一持有; DMA 通道占用位图 (`Dma::take`) + 各构造
+   入口收紧为 `pub(crate)`。模块内运行路径 (dma 卸载) 按编译期配置
+   重建等价 ZST 句柄 —— 唯一性由入口一次获取固化, 句柄类型不阻止
+   同 crate 重建。
+2. **`ClockController::freeze() -> Clocks`** (`src/clk.rs`): `Clocks`
+   是初始化成功后的频率 token (含错误快照), 驱动接收 `&Clocks` 计算
+   分频, 不再查询全局 `clk::*_hz()` 或读取工程配置; 各外设
+   (systick/uart/can/rtc/wdt) 已接入。
 
 ### P1：IRQ、驱动依赖与 RTOS port
 
 1. 把中断拆成 CPU `Nvic`、HC32 `InterruptRouter<Event, Line>` 和 BSP
    `InterruptBinding` 三层。驱动只处理自身状态，不选择 NVIC line。
+   现状: 注册 API (`intc::register(source, line, priority, handler)` +
+   `intc::Line` 类型) 与 BSP 绑定 (`Board::enable_console_rx_interrupt`)
+   已就位, 但仍是模块级函数而非三组独立类型 —— 迁移到目标芯片时
+   保留 `Line` 编码层即可。
 2. 以 UART 为样板，构造时注入 peripheral clock、pins 和 IRQ binding；
    RX buffer 容量改为 const generic 或由 adapter 提供静态存储。
 3. 将 `rtos/context.rs` 移入 CPU port，把当前守卫大小/对齐常量升级为完整

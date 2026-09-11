@@ -6,6 +6,15 @@
 // (rtos/heap 等以"模块级契约 + 整模块 allow"设计的模块单独豁免)
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//! HC32F460JEUA-EVB 固件 crate 根。
+//!
+//! 本文件只声明系统组成并编排启动后的顶层资源：硬件复位和 RAM 初始化在
+//! [`startup`]，板级外设顺序在 [`board`]，线程/IPC 在 [`rtos`]。可由宿主机
+//! 测试的纯逻辑以同源模块从 `src/lib.rs` 导出，避免目标板实现与测试替身分叉。
+//!
+//! `main` 创建静态应用拓扑后启动调度器；业务线程不得绕过 [`peripherals`] 或
+//! [`board`] 自行复制外设所有权，也不得在 ISR/定时器回调中调用阻塞 API。
+
 // 使用 Rust 堆数据结构 (Vec/Box/String 等), 分配器见 heap 模块
 extern crate alloc;
 
@@ -15,12 +24,16 @@ mod config;
 
 // ---- 板级支持 (HC32F460JEUA-EVB 资源与初始化编排) ----
 mod board;
+mod peripherals;
 
 // ---- 内核基础设施 ----
 mod arch; // CPU 架构原语 facade (PRIMASK / WFI / DSB / 系统复位)
 mod critical_section; // PRIMASK 临界区 + 中断上下文检测 (ISR 误用防护)
-mod heap; // 全局堆分配器 (边界标记 + 首次适配)
-mod heap_layout; // 堆分配布局规划 (纯逻辑, 可在主机测试)
+mod exception_frame; // ARMv7-M 异常压栈帧纯解码契约 (与 lib 同源, 主机回归单测)
+mod heap; // 全局堆分配器适配层 (临界区 + 链接脚本边界, 状态机见 lib)
+mod heap_layout; // 堆分配布局规划 + TLSF 尺寸级映射 (纯逻辑, 主机测试)
+mod heap_tlsf; // TLSF 两级隔离状态机 (与 lib 同源, 主机压力测试)
+mod latency; // 硬实时指标: 最长关中断 + SysTick 到达延迟 (DWT)
 mod mmio; // 内存映射寄存器访问原语 (各外设驱动共用)
 mod notify; // 原子回调槽: ISR → 应用无锁通知 (可在主机测试)
 mod panic; // panic/fault 诊断: 寄存器解码 + 栈回溯 + 停机/复位策略
@@ -85,6 +98,9 @@ static TIMER_COUNT: AtomicU32 = AtomicU32::new(0);
 /// 节拍驱动: 节拍递增 → 时间片轮转 → 定时器检查 → 调度。
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_tick_handler() {
+    // 硬实时指标: 记录节拍中断实际到达时刻 (相对硬件期望的偏差,
+    // Flash 擦写窗口单独归类, 见 latency 模块) —— 必须是入口第一条。
+    crate::latency::tick_entry();
     rtos::tick_increase();
     // Arm Errata 838869: ISR 末尾加 DSB, 确保中断唤醒低功耗模式的行为可靠
     arch::data_sync_barrier();
@@ -99,7 +115,9 @@ pub(crate) fn main() -> ! {
     rtos::init();
 
     // 创建应用线程 (栈/优先级/时间片来自 .cargo/config.toml)。默认配置下
-    // shell 优先级最高，首次运行时先启动并独占文件系统，再进入登录流程。
+    // shell 优先级 (1) 仅低于 WDT supervisor (0) —— 喂狗线程必须先于一切
+    // 应用线程被调度, 因此用 0 级优先级保底; shell 首次运行时先启动并
+    // 独占文件系统, 再进入登录流程。
     // selftest 不在此运行, 由 shell 命令 `selftest` 同步执行。
     rtos::thread_create(
         "led",

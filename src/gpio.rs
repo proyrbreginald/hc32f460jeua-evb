@@ -374,7 +374,7 @@ impl<P: Port, const N: u8> Pin<P, N> {
     ///
     /// 当以 `const` 方式使用 (如 `const LED: Pin<PortC, 13> = Pin::new();`)
     /// 时, 引脚不存在于 JEUA 封装会在编译期报错。
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         assert!(
             P::VALID_PINS[N as usize],
             "pin does not exist on the JEUA package"
@@ -652,7 +652,7 @@ pub struct Gpio {
 
 impl Gpio {
     /// 获取 GPIO 句柄
-    pub fn take() -> Self {
+    pub(crate) fn take() -> Self {
         Self { _private: () }
     }
 

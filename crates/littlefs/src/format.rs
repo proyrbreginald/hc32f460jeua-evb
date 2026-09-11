@@ -16,6 +16,12 @@ pub const MAGIC: u32 = 0x3153_4652;
 /// Alias that makes the kind of [`MAGIC`] explicit at call sites.
 pub const SNAPSHOT_MAGIC: u32 = MAGIC;
 /// On-disk format version 1.1 (adds the per-block wear table to the payload).
+///
+/// Wear-entry semantics (v1.1, unchanged on disk): one little-endian `u16`
+/// per block — low 15 bits are the erase counter, bit 15 marks the block as
+/// **permanently unusable (bad)**. Legacy tables without the flag decode
+/// identically for counters below 2^15; new firmwares rescan (halve) counters
+/// before they reach saturation, so legacy saturation values are not expected.
 pub const DISK_VERSION: u32 = 0x0001_0001;
 /// The word programmed last to make a snapshot visible to recovery.
 pub const COMMIT_MARKER: u32 = 0xc35a_6f91;
@@ -50,6 +56,15 @@ pub const SUPPORTED_RECORD_FLAGS: u16 = RECORD_FLAG_DIRECTORY;
 
 /// Width in bytes of one on-disk per-block erase counter.
 pub const WEAR_ENTRY_SIZE: usize = 2;
+/// Wear-table entry bit 15: the block is permanently unusable (bad).
+///
+/// Bad blocks are excluded from snapshot placement forever (no remapping —
+/// the block is skipped). The flag persists in every committed snapshot's
+/// wear table; a failed commit still records the flag in RAM and persists it
+/// with the next successful commit.
+pub const WEAR_BAD_BIT: u16 = 1 << 15;
+/// Wear-table entry counter mask (low 15 bits).
+pub const WEAR_COUNT_MASK: u16 = 0x7FFF;
 /// Upper bound on device block count accepted by the wear-leveling codec.
 pub const MAX_WEAR_BLOCKS: usize = 64;
 /// Maximum on-disk wear-table size in bytes.
@@ -120,6 +135,18 @@ pub trait BlockDevice {
     fn erase(&mut self, block: u32) -> Result<(), Self::Error>;
 
     fn sync(&mut self) -> Result<(), Self::Error>;
+
+    /// Whether `error` indicates a **permanent failure of one specific
+    /// block** (a dead block, with power and bus still functional).
+    ///
+    /// Only when this returns `true` may the filesystem mark the failing
+    /// block as bad and retry the commit at a different location. Any other
+    /// error (power loss, timeout, torn bus cycle, ...) must be treated as
+    /// fatal: the durable outcome of the commit is unknown and the caller
+    /// has to remount. The default is `false` (conservative).
+    fn permanent_block_failure(&self, _error: &Self::Error) -> bool {
+        false
+    }
 
     fn geometry(&self) -> Geometry {
         Geometry::new(self.block_size(), self.block_count())
@@ -272,10 +299,6 @@ impl SnapshotHeader {
         Geometry::new(self.block_size, self.block_count)
     }
 
-    /// Logical offset of the record area within the snapshot segment.
-    ///
-    /// The payload begins with the fixed wear table (see [`wear_table_size`])
-    /// immediately after the snapshot header; entry records follow it.
     /// Logical offset of the entry-record area within the snapshot segment.
     ///
     /// The payload begins at [`HEADER_SIZE`] with the fixed wear table (see
