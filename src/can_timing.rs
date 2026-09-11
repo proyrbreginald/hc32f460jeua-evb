@@ -233,6 +233,29 @@ mod tests {
     use super::{BitTiming, MAX_CLASSIC_BITRATE, calculate};
 
     const CANONICAL_500K: Option<BitTiming> = calculate(8_000_000, 500_000, 750, 2, 0);
+    /// 工程默认位速率 (CFG_CAN_BITRATE=1M, CFG_CAN_SJW=1, XTAL=8MHz)。
+    const CANONICAL_1M: Option<BitTiming> = calculate(8_000_000, 1_000_000, 750, 1, 10_000);
+
+    #[test]
+    fn canonical_8mhz_1m_timing_and_sbt_encoding_are_stable() {
+        let timing = CANONICAL_1M.unwrap();
+
+        // 8MHz CANCLK / 1Mbit/s => 一位恰好 8 个 CANCLK; 实际分频只能从 2
+        // 起步, 因此一位 4 TQ (PRESC=2), 采样点 75% 落在 SEG1=3/SEG2=1。
+        assert_eq!(timing.prescaler, 2);
+        assert_eq!(timing.time_seg1, 3);
+        assert_eq!(timing.time_seg2, 1);
+        assert_eq!(timing.sjw, 1);
+        assert_eq!(timing.total_time_quanta(), 4);
+        assert_eq!(timing.actual_bitrate(8_000_000), 1_000_000);
+        assert_eq!(timing.sample_point_permille(), 750);
+        assert_eq!(timing.error_ppm(8_000_000, 1_000_000), 0);
+        assert_eq!(timing.register_value(), 0x0100_0001);
+
+        // SJW > 1 时一位至少 5 TQ, 无法整除 8 个 CANCLK: 1Mbit/s 下
+        // CFG_CAN_SJW 必须为 1, 否则编译期位时序搜索失败。
+        assert_eq!(calculate(8_000_000, 1_000_000, 750, 2, 10_000), None);
+    }
 
     #[test]
     fn canonical_8mhz_500k_timing_and_sbt_encoding_are_stable() {

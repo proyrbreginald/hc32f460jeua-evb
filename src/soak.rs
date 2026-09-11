@@ -1089,9 +1089,16 @@ fn wait_can_tx(can: &crate::can::Can, buffer: crate::can::TxBuffer) -> bool {
 /// CAN 压力: 内部回环持续收发, 校验帧内容与错误计数
 extern "C" fn can_worker(param: usize) {
     let w = &WORKERS[param];
-    let can = crate::board::BoardResources::get().can();
-    let clocks = crate::board::BoardResources::get().clocks();
+    let board = crate::board::BoardResources::get();
+    let can = board.can();
+    let clocks = board.clocks();
     let xtal_was_enabled = crate::clk::xtal_enabled();
+    // 应用 CAN / shell `can init` 已占用控制器时临时接管 (RESET 清空收发
+    // 队列), 压力结束后按原工作模式恢复。
+    let previous_mode = board.can_takeover();
+    if previous_mode.is_some() {
+        crate::log_debug!("[soak] CAN: 临时接管控制器, 结束后按原模式恢复");
+    }
     let mut ok = true;
 
     if can
@@ -1190,8 +1197,12 @@ extern "C" fn can_worker(param: usize) {
             w.beat();
         }
     }
-    can.deinit();
-    if !xtal_was_enabled {
+    // 结束接管: 原本已初始化时按原工作模式恢复应用 CAN; 原本空闲则保持
+    // 未初始化, 并还原测试前的 XTAL 电源状态。
+    if board.can_release(previous_mode).is_err() {
+        ok = false;
+    }
+    if previous_mode.is_none() && !xtal_was_enabled {
         let _ = crate::clk::xtal_cmd(false);
     }
     if !ok {
@@ -1335,12 +1346,13 @@ fn parse_args(args: &str) -> Option<(u32, Option<Vec<Selection>>)> {
 // ============================== 监控器 ==============================
 
 /// 可选的 CAN 压力跳过原因 (None = 可运行)
+///
+/// 应用 CAN 已初始化时由 [`can_worker`] 临时接管控制器 (RESET 清空收发队列)
+/// 并在压力结束后按原工作模式恢复, 因此只有显式关闭自检或 IRQ 消费者仍
+/// 注册时才跳过。
 fn can_skip_reason() -> Option<&'static str> {
     if !crate::config::CAN_SELFTEST_ENABLE {
         return Some("CFG_CAN_SELFTEST_ENABLE=false");
-    }
-    if crate::config::CAN_ENABLE {
-        return Some("应用 CAN 已启用 (会清空收发队列)");
     }
     if crate::board::BoardResources::get().can().irq_registered() {
         return Some("CAN IRQ consumer 仍已注册");

@@ -62,18 +62,27 @@ can listen 30 normal              # 连续监听 30s（normal 会发 ACK；silen
   SN65HVD230 等），不能直接接 CANH/CANL；总线两端各 120Ω 终端电阻，两端共地；
 - XTAL 必须起振：CAN 是全工程唯一以 XTAL 为通信时钟的模块，`can init` 失败时
   会返回 `XtalNotReady`；
-- 板端与适配器的位速率/采样点必须一致（默认 500 kbps、75%、SJW=2，
-  `CFG_CAN_BITRATE`/`CFG_CAN_SAMPLE_POINT_PERMILLE`/`CFG_CAN_SJW`）；
+- 板端与适配器的位速率/采样点/SJW 必须一致（默认 1 Mbps、75%、SJW=1，
+  `CFG_CAN_BITRATE`/`CFG_CAN_SAMPLE_POINT_PERMILLE`/`CFG_CAN_SJW`）。8 MHz
+  XTAL 下 1 Mbit/s 的一位只有 8 个 CANCLK：搜索结果为 PRESC=2、SEG1=3、
+  SEG2=1（4 TQ/位，误差 0 ppm），且 SJW 只能是 1（SJW=2 时一位至少 5 TQ，
+  不能整除），改大 SJW 会直接编译报错；
+- 位速率越高总线越短：1 Mbit/s 按 ISO 11898-2 建议不超过约 40 m（500 kbps
+  约 100 m），两端各 120Ω 终端电阻、共地，支线尽量短；
 - `can` 命令是**编译期开关**：需 `CFG_CAN_ENABLE=true` 才会编译（该开关同时
   决定开机是否自动初始化应用 CAN；默认 false 时 CAN 驱动与命令都不参与链接，
-  省 ~11.5 KiB）。开机已初始化时 `selftest can` 会自动跳过（RESET 会清空收发
-  队列），要跑内部回环自检先 `can deinit`。
+  省 ~11.5 KiB）。`selftest can` / `selftest` / `soak can` 在应用 CAN 已占用
+  控制器时**自动临时接管**（RESET 会清空收发队列），结束后按原工作模式恢复；
+  selftest 的接管只持续一次自检（约数十 ms），`soak can` 的接管则持续整个
+  压力测试期间——期间本节点不参与外部总线（内部回环不驱动 TX 引脚）。只有
+  CAN IRQ 消费者仍注册（`can::Can::register_irq`，接管会架空其中断路由）时
+  才跳过该测试项。
 
 主机侧（CANable/slcan，Linux）：
 
 ```bash
-sudo slcand -o -c -s6 /dev/ttyACM0 can0
-sudo ip link set can0 up type can bitrate 500000 sample-point 0.75 sjw 2
+sudo slcand -o -c -s8 /dev/ttyACM0 can0
+sudo ip link set can0 up type can bitrate 1000000 sample-point 0.75 sjw 1
 candump can0                      # 收（配合板端 can send）
 cansend can0 123#DEADBEEF         # 发（配合板端 can recv / can listen）
 cangen can0 -g 10 -I 5            # 周期压测（配合 can listen 观察错误计数）

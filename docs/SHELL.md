@@ -52,8 +52,11 @@ shell 运行在独立 RTOS 线程中，经控制台 UART 的中断接收环获�
 ## 自检与 soak
 
 `selftest` 在 shell 线程内同步执行，按 ESC 可中断剩余项目；覆盖 RTOS IPC、线程
-延时/退出、Flash、CRC 和 CAN 内部回环。`soak [分钟] [basic|periph|can|flash]`
-运行压力线程，控制台只显示进度，完整结果写入 `/test/soak_<时间戳>.html`。
+延时/退出、Flash、CRC 和 CAN 内部回环。CAN 项在应用 CAN 已占用控制器时自动临时
+接管（清空收发队列）并在结束时按原工作模式恢复，只有 CAN IRQ 消费者仍注册时才
+跳过。`soak [分钟] [basic|periph|can|flash]` 运行压力线程，CAN 压力项同样支持
+接管/恢复（接管持续整个压力测试期间，期间本节点不参与外部总线）；控制台只显示
+进度，完整结果写入 `/test/soak_<时间戳>.html`。
 压力测试的阈值、报告槽数和 Flash 节流参数见 [配置参考](CONFIGURATION.md) 与
 [实时性文档](REALTIME.md)。
 

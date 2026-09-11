@@ -414,9 +414,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             mode: WorkMode::Normal,
-            bitrate: 500_000,
+            // 与 .cargo/config.toml 的默认位速率一致: 1 Mbit/s 需要与
+            // SJW=1 搭配才能在 8MHz CANCLK 上整除一位 (4 TQ)。
+            bitrate: 1_000_000,
             sample_point_permille: 750,
-            sjw: 2,
+            sjw: 1,
             max_bitrate_error_ppm: 10_000,
             filters: &ACCEPT_ALL_FILTER,
             ptb_single_shot: false,

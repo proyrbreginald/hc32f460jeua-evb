@@ -37,7 +37,7 @@ bash scripts/verify.sh --quick
 | UART/DMA/console | 登录、长行、并发日志、RX 溢出、ZMODEM 双向传输 |
 | EFM/文件系统 | `mkfs`/`mount`/`fsck`、跨块文件、复位恢复、坏块和容量错误 |
 | RTOS/IPC | `selftest`、超时、优先级继承、线程退出回收、持续负载 |
-| CAN | 内部回环（`selftest can`）；外部总线用 shell `can` 命令 + CAN 转 USB 适配器（外接 PHY、终端电阻、位速率一致），步骤见 [驱动参考](DRIVERS.md) |
+| CAN | 内部回环（`selftest can` 或 `selftest` 末项；应用 CAN 已占用控制器时自动临时接管并按原模式恢复，期间会清空收发队列）；外部总线用 shell `can` 命令 + CAN 转 USB 适配器（外接 PHY、终端电阻、位速率一致），步骤见 [驱动参考](DRIVERS.md) |
 | 实时性 | soak 报告中的软件指标、Flash 窗口样本、WDT 状态 |
 
 ## 已有验证记录

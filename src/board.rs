@@ -305,6 +305,41 @@ impl BoardResources {
         &self.can
     }
 
+    /// 临时接管 CAN 控制器 (内部回环自检 / soak CAN 压力项共用)。
+    ///
+    /// 应用 CAN (`CFG_CAN_ENABLE`) 或 shell `can init` 已占用控制器时, 内部
+    /// 回环测试必须以 RESET 清空收发队列为前提才能独占控制器。返回接管前的
+    /// 工作模式 (`None` = 接管前未初始化), 测试结束必须用
+    /// [`Self::can_release`] 恢复。调用方必须先确认
+    /// [`crate::can::Can::irq_registered`] 为 `false` —— 接管会 RESET 控制器,
+    /// 已注册的 IRQ 消费者会被架空。
+    #[cfg(any(shell_selftest, shell_soak))]
+    pub(crate) fn can_takeover(&self) -> Option<crate::can::WorkMode> {
+        let previous = self.can.work_mode();
+        if previous.is_some() {
+            self.can.deinit();
+        }
+        previous
+    }
+
+    /// 结束 CAN 接管: 恢复接管前状态。
+    ///
+    /// 控制器原本已初始化时按原工作模式重新应用应用配置 (`CAN_CONFIG`),
+    /// 原本未初始化时保持未初始化 (调用方负责按需关闭 XTAL)。
+    #[cfg(any(shell_selftest, shell_soak))]
+    pub(crate) fn can_release(
+        &self,
+        previous: Option<crate::can::WorkMode>,
+    ) -> Result<(), crate::can::CanError> {
+        self.can.deinit();
+        let Some(mode) = previous else {
+            return Ok(());
+        };
+        self.can
+            .init(&self.clocks, can_config_for_mode(mode))
+            .map(|_| ())
+    }
+
     /// 注册并使能控制台 UART 接收中断。
     pub fn enable_console_rx_interrupt(&self) {
         self.console.enable_rx_interrupt(
@@ -350,6 +385,22 @@ impl BoardResources {
                 crate::config::WDT_FEED_INTERVAL_MS
             );
         }
+    }
+}
+
+/// 应用 CAN 配置 + 指定工作模式 (shell `can init` 与接管恢复共用)。
+///
+/// 模式语义: 仅外部回环按 `CFG_CAN_SELF_ACK` 决定自应答 (内部回环由控制器
+/// 自动 ACK), 其余字段取自 [`crate::config::CAN_CONFIG`]。
+#[cfg(any(shell_selftest, shell_soak, can_enabled))]
+pub(crate) fn can_config_for_mode(mode: crate::can::WorkMode) -> crate::can::Config {
+    crate::can::Config {
+        mode,
+        self_ack: matches!(
+            mode,
+            crate::can::WorkMode::ExternalLoopback | crate::can::WorkMode::ExternalLoopbackSilent
+        ) && crate::config::CAN_SELF_ACK,
+        ..crate::config::CAN_CONFIG
     }
 }
 

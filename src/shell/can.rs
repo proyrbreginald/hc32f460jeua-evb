@@ -17,11 +17,12 @@
 //! (CFG_CAN_ENABLE=true), `can status` 直接可用; `can init` 会先 deinit
 //! 再按指定模式重建 (会清空硬件收发队列)。
 //!
-//! 注意: `selftest can` 在已初始化时会跳过 (它要求独占控制器), 因此
-//! 本命令初始化后若要跑自检, 先 `can deinit`。
+//! 注意: `selftest can` / `soak can` 在控制器已初始化时会**临时接管**
+//! (RESET 清空收发队列), 结束后按原工作模式恢复, 因此本命令初始化后
+//! 仍可直接跑自检。
 
 use super::{CmdResult, ShellState};
-use crate::can::{self, Can, Config, ErrorKind, Id, RxFrame, TxBuffer, TxFrame, WorkMode};
+use crate::can::{self, Can, ErrorKind, Id, RxFrame, TxBuffer, TxFrame, WorkMode};
 use crate::println;
 
 /// 接收/监听轮询间隔 (毫秒): 兼顾响应与 CPU 占用
@@ -138,20 +139,6 @@ fn parse_mode(arg: Option<&str>) -> Result<WorkMode, &'static str> {
     }
 }
 
-/// 按模式构造初始化参数: 基础参数取配置, 仅覆盖模式与自 ACK
-/// (自 ACK 只对外部回环有意义, 且由 `CFG_CAN_SELF_ACK` 决定)
-fn config_for(mode: WorkMode) -> Config {
-    let external_loopback = matches!(
-        mode,
-        WorkMode::ExternalLoopback | WorkMode::ExternalLoopbackSilent
-    );
-    Config {
-        mode,
-        self_ack: external_loopback && crate::config::CAN_SELF_ACK,
-        ..crate::config::CAN_CONFIG
-    }
-}
-
 fn print_usage() {
     println!("CAN 测试命令 (外部总线需经收发器接入, 板端 PB7=TX/PB6=RX):");
     println!("  can status                        状态/位时序/错误计数/FIFO");
@@ -232,7 +219,7 @@ fn cmd_init(mode_arg: Option<&str>) {
     if can.is_initialized() {
         can.deinit();
     }
-    match can.init(board_clocks(), config_for(mode)) {
+    match can.init(board_clocks(), crate::board::can_config_for_mode(mode)) {
         Ok(timing) => {
             let hz = board_clocks().xtal_hz();
             println!(
@@ -454,7 +441,7 @@ fn cmd_listen<'a>(mut words: impl Iterator<Item = &'a str>) {
         if can.is_initialized() {
             can.deinit();
         }
-        match can.init(board_clocks(), config_for(mode)) {
+        match can.init(board_clocks(), crate::board::can_config_for_mode(mode)) {
             Ok(_) => {}
             Err(error) => {
                 println!("can listen: 初始化失败: {error:?}");
