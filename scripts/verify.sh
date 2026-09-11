@@ -70,11 +70,12 @@ fi
 #    经环境变量覆盖 .cargo/config.toml [env] 的默认值 (未设置 force 时
 #    现有环境变量优先)。soak 依赖的 selftest 由 build.rs 自动随带。
 # ---------------------------------------------------------------------------
-step "cargo build (release, 全开配置: nano+selftest+soak+zmodem)"
+step "cargo build (release, 全开配置: nano+selftest+soak+zmodem+can)"
 CFG_SHELL_NANO_ENABLE=true \
 CFG_SHELL_ZMODEM_ENABLE=true \
 CFG_APP_SELFTEST_ENABLE=true \
 CFG_SOAK_ENABLE=true \
+CFG_CAN_ENABLE=true \
     cargo build --release --target "${TARGET}"
 
 if [[ -n "${SIZE_BIN}" ]]; then
@@ -87,6 +88,7 @@ CFG_SHELL_NANO_ENABLE=true \
 CFG_SHELL_ZMODEM_ENABLE=true \
 CFG_APP_SELFTEST_ENABLE=true \
 CFG_SOAK_ENABLE=true \
+CFG_CAN_ENABLE=true \
     cargo clippy --workspace --target "${TARGET}" -- -D warnings
 
 step "cargo build (debug, 全开配置, 与 release 全开同源验证)"
@@ -94,6 +96,7 @@ CFG_SHELL_NANO_ENABLE=true \
 CFG_SHELL_ZMODEM_ENABLE=true \
 CFG_APP_SELFTEST_ENABLE=true \
 CFG_SOAK_ENABLE=true \
+CFG_CAN_ENABLE=true \
     cargo build --target "${TARGET}"
 
 if [[ -z "${SIZE_BIN}" ]]; then

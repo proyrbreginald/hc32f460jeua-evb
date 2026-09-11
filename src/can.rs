@@ -9,7 +9,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::can_timing::BitTiming;
 
@@ -200,6 +200,30 @@ pub enum WorkMode {
     InternalLoopback,
     ExternalLoopback,
     ExternalLoopbackSilent,
+}
+
+impl WorkMode {
+    /// 模式名 (诊断/`can` 命令显示)
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Silent => "silent",
+            Self::InternalLoopback => "int-loopback",
+            Self::ExternalLoopback => "ext-loopback",
+            Self::ExternalLoopbackSilent => "ext-loopback-silent",
+        }
+    }
+}
+
+/// 工作模式 → u8 编码 (持久于 [`Can::mode`])
+const fn mode_code(mode: WorkMode) -> u8 {
+    match mode {
+        WorkMode::Normal => 0,
+        WorkMode::Silent => 1,
+        WorkMode::InternalLoopback => 2,
+        WorkMode::ExternalLoopback => 3,
+        WorkMode::ExternalLoopbackSilent => 4,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,13 +454,41 @@ pub enum CanError {
 /// The board-owned handle for the chip's single CAN instance.
 pub struct Can {
     irq_line: AtomicU8,
+    /// 控制器是否已初始化 (init 置位 / deinit 清除)
+    initialized: AtomicBool,
+    /// 最近一次 init 的工作模式编码 (u8, 见 `work_mode`)
+    mode: AtomicU8,
 }
 
 impl Can {
     pub(crate) const fn new() -> Self {
         Self {
             irq_line: AtomicU8::new(IRQ_UNREGISTERED),
+            initialized: AtomicBool::new(false),
+            mode: AtomicU8::new(0),
         }
+    }
+
+    /// 控制器当前是否已初始化 (含板级开机初始化与 shell `can init`)。
+    ///
+    /// 未初始化时外设时钟被门控, 状态寄存器读取不可靠 —— 调用方应先
+    /// 查本方法再访问控制器。
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::Acquire)
+    }
+
+    /// 最近一次 [`Can::init`] 使用的工作模式 (未初始化时为 `None`)。
+    pub fn work_mode(&self) -> Option<WorkMode> {
+        if !self.is_initialized() {
+            return None;
+        }
+        Some(match self.mode.load(Ordering::Relaxed) {
+            1 => WorkMode::Silent,
+            2 => WorkMode::InternalLoopback,
+            3 => WorkMode::ExternalLoopback,
+            4 => WorkMode::ExternalLoopbackSilent,
+            _ => WorkMode::Normal,
+        })
     }
 
     /// Initialize classic CAN and return the selected, effective bit timing.
@@ -535,6 +587,8 @@ impl Can {
             write8(ERRINT, cfg.interrupts.errint() | ERRINT_FLAG_MASK);
             write8(RTIE, cfg.interrupts.rtie());
         });
+        self.mode.store(mode_code(cfg.mode), Ordering::Relaxed);
+        self.initialized.store(true, Ordering::Release);
         Ok(timing)
     }
 
@@ -556,6 +610,7 @@ impl Can {
             }
             clock_cmd(false);
         });
+        self.initialized.store(false, Ordering::Release);
     }
 
     pub fn enter_local_reset(&self) {

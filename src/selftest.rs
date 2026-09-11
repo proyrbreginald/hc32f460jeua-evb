@@ -213,10 +213,11 @@ fn restore_can(can: &crate::can::Can, xtal_was_enabled: bool) -> Result<(), CanS
 /// is safe on this board without a PHY. The test still exercises both TX buffer
 /// classes and the receive acceptance path used in normal operation.
 fn can_loopback_test() -> Result<crate::can_timing::BitTiming, CanSelftestError> {
-    if crate::config::CAN_ENABLE {
+    let can = crate::board::BoardResources::get().can();
+    // 应用 CAN 或 shell `can init` 已占用控制器时不得接管 (RESET 会清空队列)
+    if crate::config::CAN_ENABLE || can.is_initialized() {
         return Err(CanSelftestError::ApplicationCanEnabled);
     }
-    let can = crate::board::BoardResources::get().can();
     let clocks = crate::board::BoardResources::get().clocks();
     if can.irq_registered() {
         return Err(CanSelftestError::IrqConsumerRegistered);
@@ -330,8 +331,9 @@ pub(crate) fn run_can() {
         crate::println!("[selftest] CAN 已跳过 (CFG_CAN_SELFTEST_ENABLE=false)");
         return;
     }
-    if crate::config::CAN_ENABLE {
-        crate::println!("[selftest] CAN 已跳过 (应用 CAN 已启用，测试会清空收发队列)");
+    if crate::config::CAN_ENABLE || crate::board::BoardResources::get().can().is_initialized() {
+        // is_initialized 覆盖 shell `can init` 已占用控制器的情况
+        crate::println!("[selftest] CAN 已跳过 (应用/`can` 命令已占用控制器，测试会清空收发队列)");
         return;
     }
     if crate::board::BoardResources::get().can().irq_registered() {
@@ -670,8 +672,9 @@ pub(crate) fn run() {
         let can = crate::board::BoardResources::get().can();
         if !crate::config::CAN_SELFTEST_ENABLE {
             crate::println!("[SKIP] CAN (CFG_CAN_SELFTEST_ENABLE=false)");
-        } else if crate::config::CAN_ENABLE {
-            crate::println!("[SKIP] CAN (应用 CAN 已启用，测试会清空收发队列)");
+        } else if crate::config::CAN_ENABLE || can.is_initialized() {
+            // 含 shell `can init` 已占用控制器的情况 (同样会被 RESET 清空)
+            crate::println!("[SKIP] CAN (应用/`can` 命令已占用控制器，测试会清空收发队列)");
         } else if can.irq_registered() {
             crate::println!("[SKIP] CAN (CAN IRQ consumer 仍已注册)");
         } else {

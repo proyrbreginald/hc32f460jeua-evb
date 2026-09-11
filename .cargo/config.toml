@@ -93,7 +93,8 @@ CFG_DMA_COPY_MIN = "256"             # 触发 DMA 整块拷贝的最小长度 (�
 # 本板仅将 PB7(TX)/PB6(RX) 引到 JP2，没有板载 CAN 收发器；正常模式需外接 PHY。
 # CANCLK 固定为 XTAL；编译期校验 EXCLK>=1.5*CANCLK、<=1Mbit/s 位时序，
 # 且按 RM 建议不使用 SBT.PRESC=0 (实际预分频 1)。
-CFG_CAN_ENABLE = "false"                 # true: 启动时初始化应用 CAN
+CFG_CAN_ENABLE = "true"                 # true: 启动时初始化应用 CAN, 并编译 shell `can` 测试命令
+                                         # (关闭时 CAN 驱动与 `can` 命令都不参与链接, 省 ~11.5 KiB)
 CFG_CAN_SELFTEST_ENABLE = "true"         # 应用 CAN 启用时内部回环项会安全跳过
 CFG_CAN_TX_PIN = "7"                     # PortB Func_Grp2，默认 PB7 Func50
 CFG_CAN_TX_FSEL = "50"
@@ -129,7 +130,7 @@ CFG_SHELL_LOGIN_TRIES = "3"    # 登录失败允许次数
 CFG_SHELL_LINE_BUF = "128"     # 输入行缓冲区 (字节)
 CFG_SHELL_HISTORY_SIZE = "8"   # RAM 中保留的历史命令条数 (重启后清空)
 # 启用的命令列表 (逗号分隔, 见 src/shell.rs 命令表; 未列出的命令提示未启用)
-CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,rm,mv,stat,df,fsck,level,mount,mkfs,led,log,sz,rz,clear,whoami,reboot,logout"
+CFG_SHELL_COMMANDS = "help,sysinfo,uptime,ps,free,echo,history,pwd,cd,ls,mkdir,rmdir,cat,write,rm,mv,stat,df,fsck,level,mount,mkfs,led,can,log,sz,rz,clear,whoami,reboot,logout"
 
 # 功能编译期开关 (true/false): false 时对应命令与其全部代码不编译, 直接省
 # FLASH。注意: soak 依赖 selftest 的 ESC 中断支持, soak=true 时 selftest

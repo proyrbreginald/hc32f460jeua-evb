@@ -24,8 +24,8 @@
 //! 当前命令: `help` / `sysinfo` / `uptime` / `ps` / `free` /
 //! `echo` / `history` / `pwd` / `cd` / `ls` / `mkdir` / `rmdir` / `cat` /
 //! `write` / `nano` / `sz` / `rz` / `rm` / `mv` / `stat` / `df` /
-//! `fsck` / `mount` / `mkfs` / `led` / `log` / `selftest` / `soak` / `clear` /
-//! `whoami` / `reboot` / `logout`。
+//! `fsck` / `mount` / `mkfs` / `led` / `can` / `log` / `selftest` / `soak` /
+//! `clear` / `whoami` / `reboot` / `logout`。
 //!
 //! # 输入处理
 //!
@@ -38,6 +38,10 @@ mod editor;
 mod path;
 #[cfg(shell_zmodem)]
 mod zmodem;
+
+/// CAN 真机测试命令 (外部总线, 配合 CAN 转 USB 适配器; 随 CFG_CAN_ENABLE 编译)
+#[cfg(can_enabled)]
+mod can;
 
 use crate::config;
 use crate::heap;
@@ -373,6 +377,12 @@ static COMMANDS: &[Command] = &[
     cmd("mount", "重新挂载", cmd_mount),
     cmd("mkfs", "清空: mkfs --force", cmd_mkfs),
     cmd("led", "LED on|off", cmd_led),
+    #[cfg(can_enabled)]
+    cmd(
+        "can",
+        "CAN 测试: status|init|send|recv|listen",
+        can::cmd_can,
+    ),
     #[cfg(shell_selftest)]
     cmd("selftest", "自检: selftest [all|can]", cmd_selftest),
     #[cfg(shell_soak)]

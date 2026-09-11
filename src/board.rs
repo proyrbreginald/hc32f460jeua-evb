@@ -273,8 +273,8 @@ impl BoardResources {
     }
 
     /// 冻结后的实际时钟快照 (驱动/测试恢复路径按实测频率计算;
-    /// selftest/soak 的 CAN 回环等路径消费)。
-    #[cfg(any(shell_selftest, shell_soak))]
+    /// selftest/soak/`can` 命令的 CAN 初始化等路径消费)。
+    #[cfg(any(shell_selftest, shell_soak, can_enabled))]
     pub(crate) fn clocks(&self) -> &crate::clk::Clocks {
         &self.clocks
     }
@@ -299,8 +299,8 @@ impl BoardResources {
         esc
     }
 
-    /// 板级唯一 CAN 控制器句柄。
-    #[cfg(any(shell_selftest, shell_soak))]
+    /// 板级唯一 CAN 控制器句柄 (selftest/soak 回环与 shell `can` 命令)。
+    #[cfg(any(shell_selftest, shell_soak, can_enabled))]
     pub(crate) fn can(&self) -> &crate::can::Can {
         &self.can
     }

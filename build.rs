@@ -33,6 +33,9 @@ fn main() {
         ("CFG_APP_SELFTEST_ENABLE", "shell_selftest"),
         ("CFG_SOAK_ENABLE", "shell_soak"),
         ("CFG_PANIC_VERBOSE", "panic_verbose"),
+        // CAN 启用时一并编译 shell `can` 测试命令与 CAN 驱动
+        // (默认裁剪配置下两者都不参与链接, 省 ~11.5 KiB)
+        ("CFG_CAN_ENABLE", "can_enabled"),
     ] {
         let configured = match std::env::var(env).as_deref() {
             Ok("true") => true,
@@ -63,6 +66,7 @@ fn main() {
         "shell_soak",
         "panic_verbose",
         "dev_profile",
+        "can_enabled",
     ] {
         println!("cargo:rustc-check-cfg=cfg({flag})");
     }
