@@ -218,7 +218,7 @@ CFG_WDT_FEED_MS = "500"
 CFG_HWDT_ENABLE = "false"
 CFG_HWDT_ENABLE_PIN = "4"    # PB4 使能控制 (高=禁用, 低=使能)
 CFG_HWDT_FEED_PIN = "5"      # PB5 喂狗 (每次喂狗翻转一次电平)
-CFG_HWDT_FEED_MS = "1000"    # 喂狗周期 (硬件要求 ≤1000ms; 余量不足可用 500)
+CFG_HWDT_FEED_MS = "1500"    # 喂狗周期 (硬件要求 ≤1500ms; 余量不足可用 500)
 CFG_HWDT_STACK = "512"       # 喂狗线程栈
 CFG_HWDT_PRIORITY = "0"      # 喂狗线程优先级 (须高于所有应用线程)
 
