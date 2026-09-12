@@ -203,7 +203,7 @@ CFG_RTC_ENABLE = "true" # 启用时开机初始化并走时
 
 # [wdt] MCU **内部**看门狗 (最高优先级 supervisor 周期喂狗; 调试/烧录期建议关闭)
 # 注意: 内部 WDT 在调试器停机期间继续计数, 长时间擦除会被它复位打断烧录。
-CFG_WDT_ENABLE = "true"
+CFG_WDT_ENABLE = "false"
 CFG_WDT_STACK = "512"
 CFG_WDT_PRIORITY = "0"
 CFG_WDT_FEED_MS = "500"
