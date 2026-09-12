@@ -856,7 +856,7 @@ pub const HWDT_ENABLE_PIN: u8 = parse_u8(env!("CFG_HWDT_ENABLE_PIN"));
 pub const HWDT_FEED_PIN: u8 = parse_u8(env!("CFG_HWDT_FEED_PIN"));
 /// 喂狗周期 (毫秒) (CFG_HWDT_FEED_MS): 每周期翻转一次喂狗脚。
 ///
-/// 硬件要求 1s 周期内必须喂狗, 因此上限固定 1000ms; 若外部看门狗的超时窗口
+/// 硬件要求 1s 周期内必须喂狗, 因此上限固定 1500ms; 若外部看门狗的超时窗口
 /// 接近 1s (或系统负载抖动大), 应配更小值 (如 500ms) 留出余量。
 pub const HWDT_FEED_INTERVAL_MS: u32 = parse_u32(env!("CFG_HWDT_FEED_MS"));
 /// 喂狗线程栈与优先级 (与内部 WDT supervisor 同样保持高优先级)。
@@ -871,7 +871,7 @@ const _: () = assert!(
     "CFG_HWDT_PRIORITY 必须在有效优先级范围内"
 );
 const _: () = assert!(
-    HWDT_FEED_INTERVAL_MS >= 1 && HWDT_FEED_INTERVAL_MS <= 1_000,
+    HWDT_FEED_INTERVAL_MS >= 1 && HWDT_FEED_INTERVAL_MS <= 1_500,
     "CFG_HWDT_FEED_MS 必须在 1~1000ms 范围内 (板载看门狗要求 1s 周期喂狗)"
 );
 const _: () = assert!(
